@@ -141,27 +141,48 @@ export function createCampaignRepository(ctx) {
     }
   }
 
-  async function syncSubcollection(campaignId, key, items) {
+  async function syncSubcollection(campaignId, key, items, options = {}) {
     const previous = campaignSaveCache.get(campaignId)?.[key] || [];
+    const canWrite = options.canWrite || (() => true);
+    const canDelete = options.canDelete || (() => true);
     const previousIds = new Set(previous.map(item => String(item.id)));
     const nextIds = new Set(items.map(item => String(item.id)));
-    const previousJsonById = new Map(previous.map(item => [String(item.id), JSON.stringify(item)]));
+    const previousById = new Map(previous.map((item, index) => [String(item.id), {
+      clean: cleanSubDoc(item, index),
+      item
+    }]));
     const writes = [];
 
     items.forEach((item, index) => {
       const id = String(item.id);
-      const comparable = JSON.stringify({ ...item, id });
-      if (previousJsonById.get(id) !== comparable) {
-        writes.push(() => api.setDoc(
+      const nextClean = cleanSubDoc(item, index);
+      const previousEntry = previousById.get(id);
+      if (canWrite(item, previousEntry?.item) && JSON.stringify(previousEntry?.clean) !== JSON.stringify(nextClean)) {
+        if (!previousEntry) {
+          writes.push(() => api.setDoc(
+            api.doc(db, "campaigns", campaignId, key, id),
+            nextClean,
+            { merge: false }
+          ));
+          return;
+        }
+
+        const changedFields = {};
+        const fieldNames = new Set([...Object.keys(previousEntry.clean), ...Object.keys(nextClean)]);
+        fieldNames.forEach(field => {
+          if (JSON.stringify(previousEntry.clean[field]) === JSON.stringify(nextClean[field])) return;
+          changedFields[field] = field in nextClean ? nextClean[field] : api.deleteField();
+        });
+        writes.push(() => api.updateDoc(
           api.doc(db, "campaigns", campaignId, key, id),
-          cleanSubDoc(item, index),
-          { merge: false }
+          changedFields
         ));
       }
     });
 
     previousIds.forEach(id => {
-      if (!nextIds.has(id)) {
+      const previousItem = previousById.get(id)?.item;
+      if (!nextIds.has(id) && canDelete(previousItem)) {
         writes.push(() => api.deleteDoc(api.doc(db, "campaigns", campaignId, key, id)));
       }
     });
@@ -187,14 +208,20 @@ export function createCampaignRepository(ctx) {
     const bases = new Map();
     const subcollections = new Map();
     const subUnsubs = new Map();
+    const subReady = new Map();
     let latestMeta = { fromCache: false, hasPendingWrites: false };
     let lastPayload = "";
+    let lastMetaPayload = "";
 
     function emit() {
-      const campaigns = Array.from(bases.values()).map(base => mergeCampaign(base, subcollections.get(base.id) || {}));
+      const baseCampaigns = Array.from(bases.values());
+      if (baseCampaigns.some(base => subReady.get(base.id)?.size !== SUBCOLLECTION_KEYS.length)) return;
+      const campaigns = baseCampaigns.map(base => mergeCampaign(base, subcollections.get(base.id) || {}));
       const payload = JSON.stringify(campaigns);
-      if (payload === lastPayload) return;
+      const metaPayload = JSON.stringify(latestMeta);
+      if (payload === lastPayload && metaPayload === lastMetaPayload) return;
       lastPayload = payload;
+      lastMetaPayload = metaPayload;
       campaigns.forEach(c => campaignSaveCache.set(c.id, cloneCollections(subcollections.get(c.id))));
       callback(campaigns, latestMeta);
     }
@@ -202,6 +229,7 @@ export function createCampaignRepository(ctx) {
     function watchCampaignSubcollections(campaignId) {
       if (subUnsubs.has(campaignId)) return;
       subcollections.set(campaignId, Object.fromEntries(SUBCOLLECTION_KEYS.map(key => [key, []])));
+      subReady.set(campaignId, new Set());
       const unsubs = SUBCOLLECTION_KEYS.map(key => api.onSnapshot(
         api.collection(db, "campaigns", campaignId, key),
         { includeMetadataChanges: true },
@@ -210,6 +238,7 @@ export function createCampaignRepository(ctx) {
           const current = subcollections.get(campaignId) || {};
           current[key] = sortSubDocs(snap.docs.map(d => ({ id: d.id, ...d.data() })));
           subcollections.set(campaignId, current);
+          subReady.get(campaignId)?.add(key);
           emit();
         },
         onError
@@ -231,6 +260,7 @@ export function createCampaignRepository(ctx) {
         if (!activeIds.has(id)) {
           bases.delete(id);
           subcollections.delete(id);
+          subReady.delete(id);
           campaignSaveCache.delete(id);
           (subUnsubs.get(id) || []).forEach(unsub => unsub());
           subUnsubs.delete(id);
@@ -243,6 +273,7 @@ export function createCampaignRepository(ctx) {
       unsubBase();
       subUnsubs.forEach(unsubs => unsubs.forEach(unsub => unsub()));
       subUnsubs.clear();
+      subReady.clear();
     };
   }
 
@@ -258,8 +289,11 @@ export function createCampaignRepository(ctx) {
       base = await restGetDoc(`campaigns/${campaignId}`);
       if (!base) return null;
     }
-    const collections = {};
-    for (const key of SUBCOLLECTION_KEYS) collections[key] = await getSubcollection(campaignId, key);
+    const collectionEntries = await Promise.all(SUBCOLLECTION_KEYS.map(async key => [
+      key,
+      await getSubcollection(campaignId, key)
+    ]));
+    const collections = Object.fromEntries(collectionEntries);
     const campaign = mergeCampaign(base, collections);
     campaignSaveCache.set(campaign.id, cloneCollections(collections));
     return campaign;
@@ -296,6 +330,12 @@ export function createCampaignRepository(ctx) {
     const user = auth.currentUser;
     const base = await getCampaignForJoin(campaignId);
     if (!base || base.password !== campaignPass) return null;
+    const normalizedEmail = String(user.email || profile?.email || "").trim().toLowerCase();
+    if (Array.isArray(base.readyPlayerEmails) && !base.readyPlayerEmails.includes(normalizedEmail)) {
+      const error = new Error("O Mestre ainda nao preparou e vinculou um personagem para este e-mail.");
+      error.code = "campaign/player-not-ready";
+      throw error;
+    }
 
     await addCampaignMember(campaignId, user.uid);
     let players = [];
@@ -306,20 +346,33 @@ export function createCampaignRepository(ctx) {
       console.warn("SDK Firestore falhou ao listar jogadores; usando REST.", err);
       players = sortSubDocs(await restListCollection(`campaigns/${campaignId}/players`));
     }
-    let player = players.find(p => p.authUid === user.uid || p.email === user.email);
+    let player = players.find(p => p.authUid === user.uid)
+      || players.find(p => !p.authUid && String(p.emailNormalized || p.email || "").trim().toLowerCase() === normalizedEmail);
     const isNewPlayer = !player;
+    const isFirstJoin = !player?.authUid;
+    const nowIso = new Date().toISOString();
 
     player = player ? {
       ...player,
-      name: name || player.name || profile?.name || user.displayName || user.email,
+      name: player.name || name || profile?.name || user.displayName || user.email,
       email: user.email,
-      authUid: user.uid
+      emailNormalized: normalizedEmail,
+      authUid: user.uid,
+      status: "claimed",
+      joinedAt: player.joinedAt || nowIso,
+      lastSeen: nowIso,
+      online: true
     } : {
       id: makeId(),
       name: name || profile?.name || user.displayName || user.email,
       email: user.email,
+      emailNormalized: normalizedEmail,
       authUid: user.uid,
-      characterId: null
+      characterId: null,
+      status: "claimed",
+      joinedAt: nowIso,
+      lastSeen: nowIso,
+      online: true
     };
 
     const playerOrder = isNewPlayer ? players.length : Math.max(0, players.findIndex(p => p.id === player.id));
@@ -334,12 +387,12 @@ export function createCampaignRepository(ctx) {
       await restPatchDoc(`campaigns/${campaignId}/players/${String(player.id)}`, cleanSubDoc(player, playerOrder));
     }
 
-    if (isNewPlayer) {
+    if (isFirstJoin) {
       const now = new Date();
       const message = {
         id: makeId(),
         author: "Sistema",
-        authorId: "system",
+        authorId: user.uid,
         text: `${player.name} entrou na campanha.`,
         time: `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`
       };
@@ -358,15 +411,97 @@ export function createCampaignRepository(ctx) {
     return { campaign: await getCampaign(campaignId), player };
   }
 
-  async function saveCampaign(campaign) {
+  async function setPlayerPresence(campaignId, playerId, online) {
+    if (!campaignId || !playerId || !auth.currentUser) return;
+    const presence = {
+      online: Boolean(online),
+      lastSeen: new Date().toISOString()
+    };
+    try {
+      await withRetry(() => api.updateDoc(
+        api.doc(db, "campaigns", campaignId, "players", String(playerId)),
+        presence
+      ), ctx);
+    } catch (err) {
+      console.warn("SDK Firestore falhou ao atualizar presenca; usando REST.", err);
+      await restPatchDoc(`campaigns/${campaignId}/players/${String(playerId)}`, presence);
+    }
+  }
+
+  async function syncPlayerSubcollection(campaignId, key, items, playerId, userId) {
+    const previous = campaignSaveCache.get(campaignId)?.[key] || [];
+    const previousById = new Map(previous.map(item => [String(item.id), item]));
+
+    if (key === "characters") {
+      const character = items.find(item => String(item.controllerPlayerId || "") === String(playerId));
+      if (!character) return;
+      const prior = previousById.get(String(character.id)) || {};
+      const writable = {
+        controllerPlayerId: String(playerId),
+        health: character.health,
+        sanity: character.sanity,
+        skills: character.skills || []
+      };
+      const priorWritable = {
+        controllerPlayerId: prior.controllerPlayerId || null,
+        health: prior.health,
+        sanity: prior.sanity,
+        skills: prior.skills || []
+      };
+      if (JSON.stringify(writable) !== JSON.stringify(priorWritable)) {
+        await withRetry(() => api.setDoc(
+          api.doc(db, "campaigns", campaignId, key, String(character.id)),
+          stripUndefined(writable),
+          { merge: true }
+        ), ctx);
+      }
+      return;
+    }
+
+    if (!["messages", "diceLogs", "itemTransfers"].includes(key)) return;
+    const newItems = items.filter(item => {
+      if (previousById.has(String(item.id))) return false;
+      if (key === "itemTransfers") return String(item.fromPlayerId || "") === String(playerId);
+      return item.authorId === userId;
+    });
+
+    for (const item of newItems) {
+      const order = Math.max(0, items.findIndex(entry => String(entry.id) === String(item.id)));
+      await withRetry(() => api.setDoc(
+        api.doc(db, "campaigns", campaignId, key, String(item.id)),
+        cleanSubDoc(item, order),
+        { merge: false }
+      ), ctx);
+    }
+  }
+
+  async function saveCampaign(campaign, options = {}) {
     if (!campaign?.id) return;
     const { base, collections } = splitCampaign(campaign);
-    const cleaned = {
-      ...stripUndefined({ ...base, updatedAt: new Date().toISOString() })
-    };
-    SUBCOLLECTION_KEYS.forEach(key => { cleaned[key] = api.deleteField(); });
-    await withRetry(() => api.setDoc(api.doc(db, "campaigns", campaign.id), cleaned, { merge: true }), ctx);
-    for (const key of SUBCOLLECTION_KEYS) await syncSubcollection(campaign.id, key, collections[key]);
+    const updatedAt = new Date().toISOString();
+    const isPlayer = options.role === "player";
+
+    if (isPlayer) {
+      await withRetry(() => api.updateDoc(api.doc(db, "campaigns", campaign.id), { updatedAt }), ctx);
+    } else {
+      base.readyPlayerEmails = Array.from(new Set(collections.players
+        .filter(player => player.characterId && (player.emailNormalized || player.email))
+        .map(player => String(player.emailNormalized || player.email).trim().toLowerCase())
+        .filter(Boolean)));
+      const cleaned = {
+        ...stripUndefined({ ...base, updatedAt })
+      };
+      SUBCOLLECTION_KEYS.forEach(key => { cleaned[key] = api.deleteField(); });
+      await withRetry(() => api.setDoc(api.doc(db, "campaigns", campaign.id), cleaned, { merge: true }), ctx);
+    }
+
+    for (const key of SUBCOLLECTION_KEYS) {
+      if (isPlayer) {
+        await syncPlayerSubcollection(campaign.id, key, collections[key], options.playerId, auth.currentUser?.uid);
+      } else {
+        await syncSubcollection(campaign.id, key, collections[key]);
+      }
+    }
     campaignSaveCache.set(campaign.id, cloneCollections(collections));
   }
 
@@ -384,6 +519,7 @@ export function createCampaignRepository(ctx) {
     getCampaignForJoin,
     joinCampaign,
     saveCampaign,
+    setPlayerPresence,
     watchCampaigns
   };
 }

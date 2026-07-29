@@ -23,6 +23,7 @@ function disabledService() {
     getCampaignForJoin: () => Promise.resolve(null),
     joinCampaign: () => Promise.resolve(null),
     saveCampaign: () => Promise.resolve(),
+    setPlayerPresence: () => Promise.resolve(),
     addCampaignMember: () => Promise.resolve(),
     deleteCampaign: () => Promise.resolve(),
     uploadImage: () => Promise.resolve("")
@@ -51,6 +52,7 @@ function composeService(ctx) {
     getCampaignForJoin: campaigns.getCampaignForJoin,
     joinCampaign: campaigns.joinCampaign,
     saveCampaign: campaigns.saveCampaign,
+    setPlayerPresence: campaigns.setPlayerPresence,
     addCampaignMember: campaigns.addCampaignMember,
     deleteCampaign: campaigns.deleteCampaign,
     uploadImage: (_path, blob) => media.uploadImage(blob, { tags: "site-rpg" })

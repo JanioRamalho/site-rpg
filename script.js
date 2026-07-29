@@ -15,6 +15,7 @@ const OFFICIAL_SKILLS = [
 ];
 
 const ICONS_LIST = ["🗡️", "🛡️", "🔮", "🔥", "⚡", "📜", "🗝️", "🎯", "🧬", "🧪", "🕵️", "💣", "🩸", "🕯️", "👻"];
+const tabletop = window.CDITabletop;
 
 // Estado Global
 let state = JSON.parse(localStorage.getItem("cdi_fase1_full")) || { masters: [], campaigns: [] };
@@ -41,15 +42,19 @@ let lastRemoteCampaignJson = "";
 let isCampaignSaveInFlight = false;
 let saveAgainAfterCurrent = false;
 let syncStatus = "Carregando Firebase...";
+let presenceTimer = null;
+let presenceContext = null;
 
 const root = document.getElementById("root");
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const usingFirebase = () => Boolean(window.CDIFirebase?.enabled);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
+const jsArg = value => esc(JSON.stringify(String(value ?? "")));
 const imgInput = (id, label) => `<label>${label}</label><input id="${id}" type="file" accept="image/*">`;
 
 function normalizeCampaign(c) {
   if (!c) return c;
+  tabletop?.normalizeCampaign(c, uid);
   c.masterId ??= "m1";
   c.players ??= [];
   c.characters ??= [];
@@ -100,7 +105,10 @@ async function flushCampaignSave() {
   isCampaignSaveInFlight = true;
   setSyncStatus("Sincronizando...");
   try {
-    await window.CDIFirebase.saveCampaign(session.campaign);
+    await window.CDIFirebase.saveCampaign(session.campaign, {
+      role: session.role,
+      playerId: session.player?.id || null
+    });
     lastSavedCampaignJson = payload;
     setSyncStatus("Online em tempo real");
   } catch (err) {
@@ -202,11 +210,60 @@ function firebaseErrorMessage(err) {
     "auth/invalid-credential": "E-mail ou senha incorretos.",
     "auth/weak-password": "A senha precisa ter pelo menos 6 caracteres.",
     "auth/requires-recent-login": "Entre novamente antes de executar esta acao.",
+    "campaign/player-not-ready": "O Mestre ainda nao preparou e vinculou um personagem para este e-mail.",
     "permission-denied": "Permissao negada no Firebase. Publique as regras atualizadas do Firestore e tente novamente.",
     "unavailable": "Nao foi possivel conectar ao Firestore. Verifique sua internet, bloqueadores do navegador e se o Firestore esta ativo no Firebase Console."
   };
   return messages[code] || err?.message || "Erro ao acessar o Firebase.";
 }
+
+function updateLocalPlayerPresence(online) {
+  if (!session.campaign || !session.player) return;
+  const player = session.campaign.players.find(p => p.id === session.player.id) || session.player;
+  player.online = Boolean(online);
+  player.lastSeen = new Date().toISOString();
+  session.player = player;
+}
+
+async function publishPlayerPresence(online, context = presenceContext) {
+  if (!context || !usingFirebase() || !window.CDIFirebase?.setPlayerPresence) return;
+  if (session.player?.id === context.playerId) updateLocalPlayerPresence(online);
+  try {
+    await window.CDIFirebase.setPlayerPresence(context.campaignId, context.playerId, online);
+  } catch (err) {
+    console.warn("Nao foi possivel atualizar a presenca do jogador.", err);
+  }
+}
+
+function startPlayerPresence() {
+  clearInterval(presenceTimer);
+  presenceTimer = null;
+  if (!usingFirebase() || session.role !== "player" || !session.campaign?.id || !session.player?.id) return;
+  presenceContext = { campaignId: session.campaign.id, playerId: session.player.id };
+  publishPlayerPresence(true);
+  presenceTimer = setInterval(() => publishPlayerPresence(true), 45000);
+}
+
+async function stopPlayerPresence(markOffline = false) {
+  clearInterval(presenceTimer);
+  presenceTimer = null;
+  const context = presenceContext;
+  presenceContext = null;
+  if (markOffline && context) await publishPlayerPresence(false, context);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!presenceContext) return;
+  publishPlayerPresence(document.visibilityState === "visible");
+});
+
+window.addEventListener("pagehide", () => {
+  if (presenceContext) publishPlayerPresence(false, presenceContext);
+});
+
+setInterval(() => {
+  if (session.role && session.view === "room") render();
+}, 30000);
 
 function playerRegisterModal() {
   if (!usingFirebase()) return playerLogin();
@@ -272,6 +329,7 @@ async function initFirebaseBridge() {
     unsubscribeCampaigns = null;
 
     if (!user) {
+      await stopPlayerPresence(false);
       session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
       state.campaigns = [];
       lastSavedCampaignJson = "";
@@ -281,7 +339,10 @@ async function initFirebaseBridge() {
 
     unsubscribeCampaigns = window.CDIFirebase.watchCampaigns(user.uid, (campaigns, meta = {}) => {
       const remoteJson = JSON.stringify(campaigns);
-      if (remoteJson === lastRemoteCampaignJson) return;
+      if (remoteJson === lastRemoteCampaignJson) {
+        setSyncStatus(meta.hasPendingWrites ? "Sincronizando..." : (meta.fromCache ? "Usando cache local" : "Online em tempo real"));
+        return;
+      }
       lastRemoteCampaignJson = remoteJson;
 
       isApplyingRemoteState = true;
@@ -366,7 +427,7 @@ function openImageModal(imgSrc, title = "Visualizar Imagem") {
 // --- TELAS DE AUTENTICAÇÃO E HOME ---
 function home() {
   root.innerHTML = `
-    <div class="modal"><div class="modalbox">
+    <div class="modal home-screen"><div class="modalbox">
       <h1>🌑 Crônicas do Infinito</h1>
       <p class="muted">Gerenciador de RPG de Mesa Online</p>
       <div class="grid" style="margin-top:15px;">
@@ -553,6 +614,7 @@ async function doPlayerLogin() {
       state.campaigns = [c, ...state.campaigns.filter(x => x.id !== c.id)];
       session = { role: "player", campaign: c, player: p, currentMaster: null, view: "sheet" };
       lastSavedCampaignJson = JSON.stringify(c);
+      startPlayerPresence();
       toast(`Voce entrou na campanha ${c.name}.`);
       render();
     } catch (err) {
@@ -568,7 +630,12 @@ async function doPlayerLogin() {
   const p = c?.players.find(x => x.password === pp);
 
   if (!c || c.password !== pw || !p) return alert("Acesso inválido.");
+  p.authUid ??= `local-${p.id}`;
+  p.status = "claimed";
+  p.online = true;
+  p.lastSeen = new Date().toISOString();
   session = { role: "player", campaign: c, player: p, currentMaster: null, view: "sheet" };
+  save();
   render();
 }
 
@@ -590,12 +657,14 @@ function nav() {
   const m = session.role === "master";
   const items = m ? [
     ["messages","Mensagens"],
+    ["room","Sala"],
     ["home","🏠 Visão Geral"], ["campaigns","📚 Campanhas"], ["characters","👤 Personagens"],
     ["skills","🎯 Habilidades"], ["diceLogs","🎲 Histórico"], ["cases","📁 Casos"],
     ["creatures","👹 Criaturas"], ["items","🎒 Itens"], ["evidence","🔎 Evidências"],
     ["marks","🏷️ Marcas"], ["transfers", "🤝 Permissões / Trocas"], ["players","🔐 Jogadores"], ["settings","⚙️ Configurações"]
   ] : [
     ["messages","Mensagens"],
+    ["room","Sala"],
     ["sheet","👤 Meu Personagem"], ["inventory","🎒 Inventário"], ["evidencePlayer","🔎 Evidências"], ["transferPlayer","🤝 Dar Item/Evidência"]
   ];
 
@@ -611,6 +680,11 @@ function nav() {
 }
 
 async function logout() {
+  if (!usingFirebase() && session.role === "player" && session.player) {
+    updateLocalPlayerPresence(false);
+    save();
+  }
+  await stopPlayerPresence(true);
   if (unsubscribeCampaigns) unsubscribeCampaigns();
   unsubscribeCampaigns = null;
   lastSavedCampaignJson = "";
@@ -640,7 +714,7 @@ function render() {
       <section class="content">
         <div class="top">
           <div><h1>${esc(c ? c.name : "Configurações")}</h1><span class="muted">${session.role === "master" ? "Mestre" : "Jogador"}</span></div>
-          <button class="secondary" onclick="session.role==='master'?masterMenu():playerLogin()">Trocar Acesso</button>
+          <button class="secondary" onclick="logout()">Trocar Acesso</button>
         </div>
         ${session.role === "master" ? masterBody() : playerBody()}
       </section>
@@ -657,7 +731,7 @@ function masterBody() {
   if (!c) return `<h2>Visão Geral</h2><p class="muted">Nenhuma campanha criada.</p><button onclick="newCampaign()">➕ Criar Campanha</button>`;
 
   const views = {
-    messages: messagesPage, characters: charactersPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
+    messages: messagesPage, room: roomPage, characters: charactersPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
     cases: () => recordsPage("cases", "📁 Casos"), creatures: creaturesPage,
     items: itemsMasterPage, evidence: evidencePage, marks: marksPage, players: playersPage
   };
@@ -689,7 +763,7 @@ function masterTransfersPage() {
       ${pending.length === 0 ? '<p class="muted">Nenhuma solicitação pendente no momento.</p>' : ''}
       ${pending.map(t => `
         <div class="card" style="border-left: 4px solid var(--accent);">
-          ${t.image ? `<img class="avatar" src="${t.image}" style="cursor:pointer;" onclick="openImageModal('${t.image}', '${esc(t.itemName)}')">` : ""}
+          ${t.image ? `<img class="avatar" src="${t.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(t.image)}, ${jsArg(t.itemName)})">` : ""}
           <h3>${esc(t.itemName)}</h3>
           <p class="muted">Tipo: <b>${t.type === 'item' ? 'Item' : 'Evidência'}</b></p>
           <p>De: <b>${esc(t.fromName)}</b> ➡️ Para: <b>${esc(t.toName)}</b></p>
@@ -718,12 +792,21 @@ function resolveTransfer(transferId, status) {
   const t = c.itemTransfers.find(x => x.id === transferId);
   if (!t) return;
 
-  t.status = status;
-  const now = new Date();
-  t.time = `${now.toLocaleDateString()} ${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
-
   if (status === 'approved') {
-    if (t.type === 'item') {
+    if (t.type === 'item' && t.fromCharacterId && t.toCharacterId && t.inventoryId) {
+      try {
+        tabletop.transferInventoryItem(
+          c,
+          t.fromCharacterId,
+          t.toCharacterId,
+          t.inventoryId,
+          t.quantity || 1,
+          uid
+        );
+      } catch (err) {
+        return alert(`Nao foi possivel concluir a transferencia: ${err.message}`);
+      }
+    } else if (t.type === 'item') {
       let targetItem = c.items.find(i => i.name.toLowerCase() === t.itemName.toLowerCase());
       if (!targetItem) {
         c.items.push({ id: uid(), name: t.itemName, description: t.description || "Item transferido.", revealed: true, image: t.image || "" });
@@ -738,10 +821,14 @@ function resolveTransfer(transferId, status) {
         targetEv.revealed = true;
       }
     }
-    toast("Transferência aprovada e aplicada!");
+    toast("Transferencia aprovada e aplicada!");
   } else {
-    toast("Transferência rejeitada.");
+    toast("Transferencia rejeitada.");
   }
+
+  t.status = status;
+  const now = new Date();
+  t.time = `${now.toLocaleDateString()} ${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
 
   save();
   render();
@@ -1018,26 +1105,31 @@ function charactersPage() {
   return `
     <h2>👤 Personagens</h2><button onclick="characterModal()">➕ Criar Personagem</button>
     <div class="grid" style="margin-top:15px;">
-      ${c.characters.map((x, i) => `
+      ${c.characters.map((x, i) => {
+        const controller = c.players.find(player => player.id === x.controllerPlayerId && player.characterId === x.id);
+        return `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
           <h3>${esc(x.name)}</h3><span class="tag">${esc(x.origin)}</span>
           <p style="margin-top:8px;">❤️ ${x.health}/${x.healthMax} · 🧠 ${x.sanity}/${x.sanityMax}</p><br>
+          <p class="muted">${controller ? `Controlado por ${esc(controller.name)}` : "Sem jogador vinculado"} · ${x.inventory.length} item${x.inventory.length === 1 ? "" : "s"}</p>
           <button onclick="characterModal(${i})">Ficha</button>
+          <button class="secondary" onclick="manageCharacterInventoryModal('${x.id}')">Inventario</button>
           <button class="danger" onclick="del('characters',${i})">Excluir</button>
-        </div>`).join("")}
+        </div>`;
+      }).join("")}
     </div>`;
 }
 
 function characterModal(index = null) {
   const c = session.campaign;
-  const x = index === null ? { name: "", origin: ORIGINS[0], healthMax: 20, health: 20, sanityMax: 10, sanity: 10, defense: 10, attrs: {}, res: {}, skills: [], expressions: [], activeExpression: "" } : c.characters[index];
+  const x = index === null ? { name: "", origin: ORIGINS[0], healthMax: 20, health: 20, sanityMax: 10, sanity: 10, defense: 10, attrs: {}, res: {}, skills: [], expressions: [], activeExpression: "", inventory: [], controllerPlayerId: null } : c.characters[index];
   x.skills ??= [];
 
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>👑 Ficha (Mestre)</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="cname" value="${esc(x.name)}">
       ${imgInput("photo", "Imagem")}
       <label>Origem</label><select id="origin">${ORIGINS.map(o => `<option ${o === x.origin ? "selected" : ""}>${o}</option>`).join("")}</select>
@@ -1075,7 +1167,7 @@ function characterModal(index = null) {
 
 async function saveCharacter(index) {
   const isNew = index === null;
-  const c = isNew ? { id: uid(), attrs: {}, res: {}, skills: [], expressions: [], activeExpression: "", inventory: [] } : session.campaign.characters[index];
+  const c = isNew ? { id: uid(), attrs: {}, res: {}, skills: [], expressions: [], activeExpression: "", inventory: [], controllerPlayerId: null } : session.campaign.characters[index];
   
   c.name = document.getElementById("cname").value || "Personagem";
   c.origin = document.getElementById("origin").value;
@@ -1152,10 +1244,59 @@ function sendMessage() {
   render();
 }
 
+function formatLastSeen(value) {
+  if (!value) return "Sem registro";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Sem registro";
+  return date.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+}
+
+function roomPage() {
+  const c = session.campaign;
+  const participants = tabletop?.getControlledParticipants(c) || [];
+  const statusLabels = { online: "Online", away: "Ausente", offline: "Offline" };
+  const claimedWithoutCharacter = c.players.filter(player => player.authUid && !player.characterId).length;
+
+  return `
+    <div class="page-heading">
+      <div>
+        <h2>Sala</h2>
+        <p class="muted">${participants.length} personagem${participants.length === 1 ? "" : "s"} em jogo</p>
+      </div>
+      ${session.role === "master" && claimedWithoutCharacter
+        ? `<span class="notice-badge">${claimedWithoutCharacter} jogador${claimedWithoutCharacter === 1 ? "" : "es"} sem personagem</span>`
+        : ""}
+    </div>
+    <div class="participant-grid">
+      ${participants.map(({ player, character, presence }) => `
+        <article class="participant-card">
+          ${character.image
+            ? `<img class="participant-avatar" src="${character.image}" alt="${esc(character.name)}">`
+            : `<div class="participant-avatar participant-avatar-fallback" aria-hidden="true">${esc(character.name.slice(0, 1).toUpperCase())}</div>`}
+          <div class="participant-info">
+            <div class="participant-title">
+              <h3>${esc(character.name)}</h3>
+              <span class="presence presence-${presence}"><span class="presence-dot"></span>${statusLabels[presence]}</span>
+            </div>
+            <p>${esc(character.origin || "Origem nao definida")}</p>
+            <div class="participant-meta">
+              <span>Jogador: <b>${esc(player.name)}</b></span>
+              <span>Ultima atividade: ${esc(formatLastSeen(player.lastSeen))}</span>
+            </div>
+          </div>
+        </article>`).join("") || `
+        <div class="empty-state">
+          <h3>Nenhum personagem em jogo</h3>
+          <p class="muted">A sala exibira os personagens assim que os jogadores vinculados entrarem.</p>
+        </div>`}
+    </div>`;
+}
+
 // --- PAINEL DO JOGADOR ---
 function playerBody() {
   const v = session.view;
   if (v === "messages") return messagesPage();
+  if (v === "room") return roomPage();
   const ch = session.campaign.characters.find(x => x.id === session.player.characterId);
   if (!ch) {
     return `
@@ -1172,39 +1313,48 @@ function transferPlayerPage(ch) {
   const c = session.campaign;
   c.itemTransfers ??= [];
   const myTransfers = c.itemTransfers.filter(t => t.fromPlayerId === session.player.id);
-  const otherChars = c.characters.filter(x => x.id !== ch.id);
+  const otherParticipants = (tabletop?.getControlledParticipants(c) || []).filter(entry => entry.character.id !== ch.id);
+  const inventory = ch.inventory || [];
+  const visibleEvidence = (c.evidence || []).filter(entry => entry.revealed);
 
   return `
     <h2>🤝 Entregar Item ou Evidência</h2>
-    <p class="muted">Preencha os dados abaixo para solicitar ao Mestre a transferência de um item ou evidência para outro jogador ou para o grupo.</p>
-    
+    <p class="muted">As entregas ficam pendentes ate a aprovacao do Mestre.</p>
+
     <div class="card" style="margin-top:15px;">
-      <h3>Nova Solicitação de Entrega</h3>
+      <h3>Nova solicitacao</h3>
       <label>Tipo de Objeto</label>
-      <select id="trType">
-        <option value="item">Item do Inventário</option>
-        <option value="evidence">Evidência</option>
+      <select id="trType" onchange="toggleTransferType()">
+        <option value="item">Item do inventario</option>
+        <option value="evidence">Evidencia</option>
       </select>
 
-      <label>Nome do Item / Evidência</label>
-      <input id="trItemName" placeholder="Ex: Chave de Fenda / Fita Cassete">
+      <div id="trItemFields">
+        <label>Item</label>
+        <select id="trInventoryId" ${inventory.length ? "" : "disabled"}>
+          ${inventory.map(item => `<option value="${item.id}">${esc(item.name)} (${item.quantity}x)</option>`).join("") || `<option value="">Inventario vazio</option>`}
+        </select>
+        <label>Quantidade</label><input id="trQuantity" type="number" min="1" value="1">
+      </div>
 
-      <label>Descrição Breve</label>
-      <textarea id="trDesc" placeholder="Detalhes do que está sendo entregue..."></textarea>
-
-      ${imgInput("trImg", "Foto do Item / Evidência (Opcional)")}
+      <div id="trEvidenceFields" hidden>
+        <label>Evidencia</label>
+        <select id="trEvidenceId" ${visibleEvidence.length ? "" : "disabled"}>
+          ${visibleEvidence.map(evidence => `<option value="${evidence.id}">${esc(evidence.name)}</option>`).join("") || `<option value="">Nenhuma evidencia revelada</option>`}
+        </select>
+      </div>
 
       <label>Entregar para:</label>
       <select id="trTarget">
-        <option value="Grupo / Geral">Para o Grupo / Geral</option>
-        ${otherChars.map(o => `<option value="${esc(o.name)}">${esc(o.name)}</option>`).join("")}
+        <option value="">Grupo / Geral</option>
+        ${otherParticipants.map(({ player, character }) => `<option value="${character.id}">${esc(character.name)} - ${esc(player.name)}</option>`).join("")}
       </select>
 
-      <label>Observação para o Mestre</label>
-      <input id="trMsg" placeholder="Ex: Encontrado na gaveta da sala de autópsia">
+      <label>Observacao para o Mestre</label>
+      <input id="trMsg" placeholder="Detalhes da entrega">
 
       <br><br>
-      <button onclick="submitPlayerTransfer('${ch.name}')">Enviar Solicitação ao Mestre</button>
+      <button onclick="submitPlayerTransfer('${ch.id}')">Enviar solicitacao</button>
     </div>
 
     <h3 style="margin-top:30px;">📋 Suas Solicitações Recentes</h3>
@@ -1212,7 +1362,7 @@ function transferPlayerPage(ch) {
       ${myTransfers.length === 0 ? '<p class="muted">Nenhuma solicitação enviada.</p>' : ''}
       ${myTransfers.map(t => `
         <div class="card" style="margin:0; opacity: 0.9;">
-          ${t.image ? `<img class="avatar" src="${t.image}" style="cursor:pointer;" onclick="openImageModal('${t.image}', '${esc(t.itemName)}')">` : ""}
+          ${t.image ? `<img class="avatar" src="${t.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(t.image)}, ${jsArg(t.itemName)})">` : ""}
           <h3>${esc(t.itemName)} (${t.status === 'pending' ? '⏳ Pendente' : t.status === 'approved' ? '✅ Aprovado' : '❌ Rejeitado'})</h3>
           <p class="muted">Para: <b>${esc(t.toName)}</b></p>
           <p style="font-size:12px;">${esc(t.message || '')}</p>
@@ -1220,27 +1370,55 @@ function transferPlayerPage(ch) {
     </div>`;
 }
 
-async function submitPlayerTransfer(fromCharName) {
+function toggleTransferType() {
+  const isItem = document.getElementById("trType")?.value === "item";
+  const itemFields = document.getElementById("trItemFields");
+  const evidenceFields = document.getElementById("trEvidenceFields");
+  if (itemFields) itemFields.hidden = !isItem;
+  if (evidenceFields) evidenceFields.hidden = isItem;
+}
+
+async function submitPlayerTransfer(fromCharacterId) {
   const type = document.getElementById("trType").value;
-  const itemName = document.getElementById("trItemName").value.trim();
-  const description = document.getElementById("trDesc").value.trim();
-  const toName = document.getElementById("trTarget").value;
+  const fromCharacter = session.campaign.characters.find(entry => entry.id === fromCharacterId);
+  const toCharacterId = document.getElementById("trTarget").value || null;
+  const toCharacter = session.campaign.characters.find(entry => entry.id === toCharacterId);
   const message = document.getElementById("trMsg").value.trim();
+  if (!fromCharacter) return alert("Personagem de origem nao encontrado.");
 
-  if (!itemName) return alert("Informe o nome do item ou evidência.");
+  let source;
+  let quantity = 1;
+  if (type === "item") {
+    source = fromCharacter.inventory.find(entry => entry.id === document.getElementById("trInventoryId").value);
+    if (!source) return alert("Escolha um item do seu inventario.");
+    if (!toCharacter) return alert("Escolha o personagem que recebera o item.");
+    quantity = Math.max(1, Number.parseInt(document.getElementById("trQuantity").value, 10) || 1);
+    if (quantity > source.quantity) return alert("A quantidade informada e maior que a disponivel.");
+  } else {
+    source = session.campaign.evidence.find(entry => entry.id === document.getElementById("trEvidenceId").value);
+    if (!source) return alert("Escolha uma evidencia revelada.");
+  }
 
-  const im = await readImg(document.getElementById("trImg").files[0]);
+  const targetPlayer = toCharacter
+    ? session.campaign.players.find(player => player.characterId === toCharacter.id)
+    : null;
 
   session.campaign.itemTransfers ??= [];
   session.campaign.itemTransfers.unshift({
     id: uid(),
     fromPlayerId: session.player.id,
-    fromName: fromCharName,
+    fromCharacterId: fromCharacter.id,
+    fromName: fromCharacter.name,
     type,
-    itemName,
-    description,
-    image: im || "",
-    toName,
+    inventoryId: type === "item" ? source.id : null,
+    evidenceId: type === "evidence" ? source.id : null,
+    quantity,
+    itemName: source.name,
+    description: source.description || "",
+    image: source.image || "",
+    toCharacterId,
+    toPlayerId: targetPlayer?.id || null,
+    toName: toCharacter?.name || "Grupo / Geral",
     message,
     status: "pending",
     time: "Pendente de aprovação"
@@ -1255,7 +1433,7 @@ function sheetPlayer(ch) {
   ch.skills ??= [];
   return `
     <h2>👤 ${esc(ch.name)}</h2>
-    ${ch.image ? `<img class="avatar" src="${ch.image}" style="cursor:pointer;" onclick="openImageModal('${ch.image}', '${esc(ch.name)}')">` : ""}
+    ${ch.image ? `<img class="avatar" src="${ch.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(ch.image)}, ${jsArg(ch.name)})">` : ""}
     <span class="tag">Origem: ${esc(ch.origin)}</span>
     <div class="grid" style="margin-top:15px;">
       <div class="card"><h3>❤️ Saúde</h3><h2 id="val-health">${ch.health}/${ch.healthMax}</h2><div class="bar"><div id="bar-health" class="fill health" style="width:${(ch.health/ch.healthMax)*100}%"></div></div><button onclick="changeStatDirect('health',-1)">−</button><button onclick="changeStatDirect('health',1)">+</button></div>
@@ -1263,7 +1441,7 @@ function sheetPlayer(ch) {
       <div class="card"><h3>🛡️ Defesa</h3><h2>${ch.defense || 10}</h2></div>
     </div>
     <div class="grid" style="margin-top:15px;">
-      <div class="card"><h3>📊 Atributos</h3>${Object.entries(ch.attrs).map(([k, v]) => `<div class="stat clickable-stat" onclick="rollAttribute('${k}', ${v})"><span>${k}</span><b>${v >= 0 ? '+' + v : v}</b></div>`).join("")}</div>
+      <div class="card"><h3>📊 Atributos</h3>${Object.entries(ch.attrs).map(([k, v]) => `<div class="stat clickable-stat" onclick="rollAttribute(${jsArg(k)}, ${v})"><span>${esc(k)}</span><b>${v >= 0 ? '+' + v : v}</b></div>`).join("")}</div>
       <div class="card"><h3>🛡️ Resistências</h3>${Object.entries(ch.res).map(([k, v]) => `<div class="stat"><span>${k}</span><b>${v}</b></div>`).join("")}</div>
     </div>
     <div class="card" style="margin-top:15px;">
@@ -1271,7 +1449,7 @@ function sheetPlayer(ch) {
       <div class="grid" style="margin-top:10px;">
         ${ch.skills.map((s, idx) => `
           <div class="card" style="margin:0; padding:10px;">
-            <b class="clickable-stat" onclick="rollSkill('${esc(s.name)}', ${s.bonus || 0})">${esc(s.name)}</b>
+            <b class="clickable-stat" onclick="rollSkill(${jsArg(s.name)}, ${s.bonus || 0})">${esc(s.name)}</b>
             <div style="margin-top:8px; display:flex; align-items:center; gap:8px;">
               <span>Usos: <b>${s.uses}/${s.maxUses}</b></span>
               <button onclick="changeSkillUses('${ch.id}', ${idx}, -1)">−</button>
@@ -1305,12 +1483,13 @@ function itemsMasterPage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.items.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <label style="margin-top:10px; display:flex; align-items:center; gap:5px; font-size:12px;">
             <input type="checkbox" ${x.revealed ? "checked" : ""} onchange="toggleReveal('items', ${i}, this.checked)"> Visível para jogadores
           </label><br>
+          <button onclick="deliverItemModal(${i})">Entregar</button>
           <button onclick="itemModal(${i})">Editar</button>
           <button class="danger" onclick="del('items', ${i})">Excluir</button>
         </div>`).join("")}
@@ -1322,7 +1501,7 @@ function itemModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🎒 Item</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="itname" value="${esc(x.name)}">
       <label>Descrição</label><textarea id="itdesc">${esc(x.description)}</textarea>
       ${imgInput("itimg", "Foto do Item")}
@@ -1349,6 +1528,139 @@ async function saveItemModal(index) {
   save(); document.querySelector(".modal").remove(); render(); toast("Item salvo!");
 }
 
+function deliverItemModal(itemIndex) {
+  const item = session.campaign.items[itemIndex];
+  const characters = session.campaign.characters;
+  if (!item) return;
+  if (!characters.length) return alert("Crie um personagem antes de entregar itens.");
+
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal"><div class="modalbox">
+      <h2>Entregar ${esc(item.name)}</h2>
+      <label>Personagem</label>
+      <select id="grantCharacterId">
+        ${characters.map(character => {
+          const player = session.campaign.players.find(entry => entry.characterId === character.id);
+          return `<option value="${character.id}">${esc(character.name)}${player ? ` - ${esc(player.name)}` : ""}</option>`;
+        }).join("")}
+      </select>
+      <div class="two">
+        <div><label>Quantidade</label><input id="grantQuantity" type="number" min="1" value="1"></div>
+        <div class="checkbox-field"><label><input id="grantEquipped" type="checkbox"> Entregar equipado</label></div>
+      </div>
+      <label>Observacoes</label><textarea id="grantNotes" placeholder="Carga, municao, estado ou detalhes especiais"></textarea>
+      <div class="modal-actions">
+        <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
+        <button onclick="saveItemGrant(${itemIndex})">Entregar</button>
+      </div>
+    </div></div>`);
+}
+
+function saveItemGrant(itemIndex) {
+  const item = session.campaign.items[itemIndex];
+  const characterId = document.getElementById("grantCharacterId").value;
+  try {
+    tabletop.grantItem(session.campaign, characterId, item, {
+      quantity: document.getElementById("grantQuantity").value,
+      equipped: document.getElementById("grantEquipped").checked,
+      notes: document.getElementById("grantNotes").value.trim()
+    }, uid);
+    save();
+    document.querySelector(".modal").remove();
+    render();
+    toast("Item entregue ao personagem.");
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+function manageCharacterInventoryModal(characterId) {
+  const character = session.campaign.characters.find(entry => entry.id === characterId);
+  if (!character) return;
+  character.inventory ??= [];
+  const catalog = session.campaign.items || [];
+
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal" id="inventoryManagerModal"><div class="modalbox modalbox-wide">
+      <div class="modal-heading">
+        <div><h2>Inventario de ${esc(character.name)}</h2><p class="muted">${character.inventory.length} tipo${character.inventory.length === 1 ? "" : "s"} de item</p></div>
+        <button class="icon-button secondary" title="Fechar" aria-label="Fechar" onclick="this.closest('.modal').remove()">×</button>
+      </div>
+
+      <section class="inventory-add-band">
+        <h3>Adicionar do catalogo</h3>
+        ${catalog.length ? `
+          <div class="inventory-add-grid">
+            <select id="inventoryCatalogItem">${catalog.map(item => `<option value="${item.id}">${esc(item.name)}</option>`).join("")}</select>
+            <input id="inventoryCatalogQuantity" type="number" min="1" value="1" aria-label="Quantidade">
+            <button onclick="grantCatalogItemToCharacter('${character.id}')">Adicionar</button>
+          </div>
+          <label>Observacoes</label><input id="inventoryCatalogNotes" placeholder="Detalhes opcionais">`
+          : `<p class="muted">Nenhum item cadastrado no catalogo.</p>`}
+      </section>
+
+      <div class="inventory-manager-list">
+        ${character.inventory.map(entry => `
+          <div class="inventory-manager-row">
+            ${entry.image ? `<img src="${entry.image}" alt="${esc(entry.name)}">` : `<div class="inventory-item-fallback" aria-hidden="true">${esc(entry.name.slice(0, 1).toUpperCase())}</div>`}
+            <div class="inventory-manager-main">
+              <div class="card-title-row"><h3>${esc(entry.name)}</h3>${entry.equipped ? `<span class="status-chip status-online">Equipado</span>` : ""}</div>
+              <p>${esc(entry.description)}</p>
+              <div class="inventory-edit-grid">
+                <div><label>Quantidade</label><input id="invQty_${entry.id}" type="number" min="1" value="${entry.quantity}"></div>
+                <div><label>Observacoes</label><input id="invNotes_${entry.id}" value="${esc(entry.notes)}"></div>
+              </div>
+              <div class="row-actions">
+                <button onclick="saveInventoryEntry('${character.id}','${entry.id}')">Salvar</button>
+                <button class="secondary" onclick="toggleInventoryEquipped('${character.id}','${entry.id}')">${entry.equipped ? "Desequipar" : "Equipar"}</button>
+                <button class="danger" onclick="removeCharacterInventoryItem('${character.id}','${entry.id}')">Remover</button>
+              </div>
+            </div>
+          </div>`).join("") || `<div class="empty-state"><h3>Inventario vazio</h3></div>`}
+      </div>
+    </div></div>`);
+}
+
+function reopenInventoryManager(characterId, message) {
+  save();
+  render();
+  manageCharacterInventoryModal(characterId);
+  if (message) toast(message);
+}
+
+function grantCatalogItemToCharacter(characterId) {
+  const itemId = document.getElementById("inventoryCatalogItem")?.value;
+  const item = session.campaign.items.find(entry => entry.id === itemId);
+  if (!item) return alert("Selecione um item do catalogo.");
+  tabletop.grantItem(session.campaign, characterId, item, {
+    quantity: document.getElementById("inventoryCatalogQuantity").value,
+    notes: document.getElementById("inventoryCatalogNotes").value.trim()
+  }, uid);
+  reopenInventoryManager(characterId, "Item adicionado.");
+}
+
+function saveInventoryEntry(characterId, inventoryId) {
+  tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, {
+    quantity: document.getElementById(`invQty_${inventoryId}`).value,
+    notes: document.getElementById(`invNotes_${inventoryId}`).value.trim()
+  });
+  reopenInventoryManager(characterId, "Inventario atualizado.");
+}
+
+function toggleInventoryEquipped(characterId, inventoryId) {
+  const character = session.campaign.characters.find(entry => entry.id === characterId);
+  const item = character?.inventory.find(entry => entry.id === inventoryId);
+  if (!item) return;
+  tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, { equipped: !item.equipped });
+  reopenInventoryManager(characterId, item.equipped ? "Item equipado." : "Item desequipado.");
+}
+
+function removeCharacterInventoryItem(characterId, inventoryId) {
+  if (!confirm("Remover este item do inventario?")) return;
+  tabletop.removeInventoryEntry(session.campaign, characterId, inventoryId);
+  reopenInventoryManager(characterId, "Item removido.");
+}
+
 function recordsPage(key, title) {
   return `
     <h2>${title}</h2>
@@ -1356,7 +1668,7 @@ function recordsPage(key, title) {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign[key].map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <button onclick="recordModal('${key}', ${i})">Editar</button>
@@ -1370,7 +1682,7 @@ function recordModal(key, index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>📁 Registro</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="rn" value="${esc(x.name)}">
       <label>Descrição</label><textarea id="rd">${esc(x.description)}</textarea>
       ${imgInput("ri", "Foto / Documento")}
@@ -1400,7 +1712,7 @@ function creaturesPage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.creatures.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.appearance)}</p>
           <button onclick="creatureModal(${i})">Editar</button>
@@ -1414,7 +1726,7 @@ function creatureModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>👹 Criatura</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="crname" value="${esc(x.name)}">
       <label>Aparência / Detalhes</label><textarea id="crapp">${esc(x.appearance)}</textarea>
       ${imgInput("crim", "Foto da Criatura")}
@@ -1444,7 +1756,7 @@ function evidencePage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.evidence.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <label style="margin-top:10px; display:flex; align-items:center; gap:5px; font-size:12px;">
@@ -1461,7 +1773,7 @@ function evidenceModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🔎 Evidência</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="evname" value="${esc(x.name)}">
       <label>Descrição</label><textarea id="evdesc">${esc(x.description)}</textarea>
       ${imgInput("evimg", "Foto da Evidência")}
@@ -1495,7 +1807,7 @@ function marksPage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.marks.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <button onclick="markModal(${i})">Editar</button>
@@ -1509,7 +1821,7 @@ function markModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🏷️ Marca</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="mkname" value="${esc(x.name)}">
       <label>Descrição</label><textarea id="mkdesc">${esc(x.description)}</textarea>
       ${imgInput("mkimg", "Foto da Marca")}
@@ -1543,14 +1855,22 @@ function playersPage() {
     <h2>🔐 Jogadores</h2>
     <button onclick="newPlayerModal()">➕ Novo Jogador</button>
     <div class="grid" style="margin-top:15px;">
-      ${c.players.map((p, i) => `
+      ${c.players.map((p, i) => {
+        const character = c.characters.find(ch => ch.id === p.characterId);
+        const presence = tabletop?.presenceState(p) || "offline";
+        return `
         <div class="card">
-          <h3>${esc(p.name)}</h3>
+          <div class="card-title-row">
+            <h3>${esc(p.name)}</h3>
+            <span class="status-chip ${p.authUid ? `status-${presence}` : "status-pending"}">${p.authUid ? (presence === "online" ? "Online" : presence === "away" ? "Ausente" : "Offline") : "Convite pendente"}</span>
+          </div>
           ${p.email ? `<p class="muted">${esc(p.email)}</p>` : ""}
-          <p class="muted">Personagem ID: ${p.characterId || 'Nenhum'}</p>
+          <p class="player-character-line">Personagem: <b>${character ? esc(character.name) : "Nenhum"}</b></p>
           <button onclick="linkPlayerModal(${i})">Vincular Personagem</button>
+          ${character ? `<button class="secondary" onclick="manageCharacterInventoryModal('${character.id}')">Gerenciar Inventario</button>` : ""}
           <button class="danger" onclick="delPlayer(${i})">Remover</button>
-        </div>`).join("")}
+        </div>`;
+      }).join("") || `<div class="empty-state"><h3>Nenhum jogador configurado</h3></div>`}
     </div>`;
 }
 
@@ -1579,11 +1899,26 @@ function newPlayerModal() {
 }
 
 function saveNewPlayer() {
-  const name = document.getElementById("jn").value;
+  const name = document.getElementById("jn").value.trim();
   if (usingFirebase()) {
     const email = document.getElementById("je").value.trim();
     if (!name || !email) return alert("Preencha nome e e-mail.");
-    session.campaign.players.push({ id: uid(), name, email, authUid: null, characterId: null });
+    const emailNormalized = tabletop.normalizeEmail(email);
+    if (session.campaign.players.some(player => tabletop.normalizeEmail(player.emailNormalized || player.email) === emailNormalized)) {
+      return alert("Ja existe um jogador configurado com este e-mail.");
+    }
+    session.campaign.players.push({
+      id: uid(),
+      name,
+      email,
+      emailNormalized,
+      authUid: null,
+      characterId: null,
+      status: "pending",
+      online: false,
+      lastSeen: null,
+      joinedAt: null
+    });
     save(); document.querySelector(".modal").remove(); render(); toast("Jogador adicionado!");
     return;
   }
@@ -1596,13 +1931,19 @@ function saveNewPlayer() {
 function linkPlayerModal(playerIndex) {
   const p = session.campaign.players[playerIndex];
   const chars = session.campaign.characters;
+  const assignedByCharacter = new Map(session.campaign.players
+    .filter(player => player.id !== p.id && player.characterId)
+    .map(player => [player.characterId, player.name]));
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🔗 Vincular Personagem a ${esc(p.name)}</h2>
       <label>Personagem</label>
       <select id="linkCharSel">
         <option value="">Nenhum</option>
-        ${chars.map(ch => `<option value="${ch.id}" ${p.characterId === ch.id ? 'selected' : ''}>${esc(ch.name)}</option>`)}
+        ${chars.map(ch => {
+          const assignedTo = assignedByCharacter.get(ch.id);
+          return `<option value="${ch.id}" ${p.characterId === ch.id ? "selected" : ""} ${assignedTo ? "disabled" : ""}>${esc(ch.name)}${assignedTo ? ` - vinculado a ${esc(assignedTo)}` : ""}</option>`;
+        }).join("")}
       </select>
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
@@ -1612,28 +1953,67 @@ function linkPlayerModal(playerIndex) {
 
 function saveLinkPlayer(playerIndex) {
   const chId = document.getElementById("linkCharSel").value;
-  session.campaign.players[playerIndex].characterId = chId || null;
-  save(); document.querySelector(".modal").remove(); render(); toast("Vinculado com sucesso!");
+  const player = session.campaign.players[playerIndex];
+  try {
+    tabletop.assignCharacter(session.campaign, player.id, chId || null);
+    save(); document.querySelector(".modal").remove(); render(); toast(chId ? "Vinculado com sucesso!" : "Vinculo removido.");
+  } catch (err) {
+    alert(err.message);
+  }
 }
 
-function delPlayer(i) { session.campaign.players.splice(i, 1); save(); render(); }
+function delPlayer(i) {
+  const player = session.campaign.players[i];
+  if (!player || !confirm(`Remover ${player.name} da campanha?`)) return;
+  tabletop.releasePlayer(session.campaign, player.id);
+  if (player.authUid) session.campaign.members = (session.campaign.members || []).filter(id => id !== player.authUid);
+  session.campaign.players.splice(i, 1);
+  save(); render();
+}
 
 function del(key, i) {
-  if (confirm("Excluir item?")) { session.campaign[key].splice(i, 1); save(); render(); }
+  const target = session.campaign[key]?.[i];
+  if (!target) return;
+  const assignedPlayers = key === "characters"
+    ? session.campaign.players.filter(player => player.characterId === target.id)
+    : [];
+  const warning = assignedPlayers.length
+    ? `Excluir este personagem? O vinculo com ${assignedPlayers.map(player => player.name).join(", ")} tambem sera removido.`
+    : "Excluir item?";
+  if (!confirm(warning)) return;
+  assignedPlayers.forEach(player => tabletop.releasePlayer(session.campaign, player.id));
+  session.campaign[key].splice(i, 1);
+  save(); render();
 }
 
 function inventoryPlayer(ch) {
-  const items = (session.campaign.items || []).filter(x => x.revealed);
+  const items = ch.inventory || [];
+  const sharedItems = (session.campaign.items || []).filter(item => item.revealed && !items.some(entry => entry.itemId === item.id));
   return `
     <h2>🎒 Inventário</h2>
     <div class="grid" style="margin-top:15px;">
       ${items.map(x => `
-        <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
-          <h3>${esc(x.name)}</h3>
+        <div class="card inventory-card">
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          <div class="card-title-row">
+            <h3>${esc(x.name)}</h3>
+            <span class="quantity-chip">${x.quantity}x</span>
+          </div>
           <p>${esc(x.description)}</p>
-        </div>`).join("") || "<p class='muted'>Nenhum item disponível.</p>"}
-    </div>`;
+          ${x.notes ? `<p class="inventory-notes">${esc(x.notes)}</p>` : ""}
+          ${x.equipped ? `<span class="status-chip status-online">Equipado</span>` : ""}
+        </div>`).join("") || `<div class="empty-state"><h3>Inventario vazio</h3><p class="muted">O Mestre ainda nao entregou itens a este personagem.</p></div>`}
+    </div>
+    ${sharedItems.length ? `
+      <h3 class="section-heading">Itens compartilhados da mesa</h3>
+      <div class="grid">
+        ${sharedItems.map(item => `
+          <div class="card shared-item-card">
+            ${item.image ? `<img class="avatar" src="${item.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(item.image)}, ${jsArg(item.name)})">` : ""}
+            <h3>${esc(item.name)}</h3>
+            <p>${esc(item.description)}</p>
+          </div>`).join("")}
+      </div>` : ""}`;
 }
 
 function evidencePlayer(ch) {
@@ -1643,7 +2023,7 @@ function evidencePlayer(ch) {
     <div class="grid" style="margin-top:15px;">
       ${ev.map(x => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal('${x.image}', '${esc(x.name)}')">` : ""}
+          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
         </div>`).join("") || "<p class='muted'>Nenhuma evidência revelada.</p>"}
@@ -1676,20 +2056,21 @@ function rollDice(sides, bonus = 0, label = "") {
     session.campaign.diceLogs ??= [];
     const now = new Date();
     session.campaign.diceLogs.unshift({
-      id: uid(), author: authorName, sides, bonus, bonusText, total, label,
+      id: uid(), author: authorName, authorId: firebaseUser?.uid || session.currentMaster?.id || "", sides, bonus, bonusText, total, label,
       time: `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`
     });
     if (session.campaign.diceLogs.length > 50) session.campaign.diceLogs.pop();
     save();
   }
 
-  const resEl = document.getElementById("diceResult");
+  let resEl = document.getElementById("diceResult");
+  if (!resEl) {
+    openDiceRoller();
+    resEl = document.getElementById("diceResult");
+  }
   if (resEl) {
     resEl.innerHTML = `${label ? `<b>${label}</b>: ` : ""}Resultado: <span style="font-size:24px; color:var(--accent);">${total}</span>${bonusText}`;
     document.getElementById("diceHistory").innerHTML = (session.campaign?.diceLogs || []).slice(0, 5).map(l => `<b>${esc(l.author)}</b>: ${l.total}`).join("<br>");
-  } else {
-    openDiceRoller();
-    rollDice(sides, bonus, label);
   }
 }
 

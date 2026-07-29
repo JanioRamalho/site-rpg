@@ -13,7 +13,7 @@ window.CDI_FIREBASE_CONFIG = {
 // Cloudinary > Settings > Product environment credentials: copie o Cloud name.
 // Cloudinary > Settings > Upload > Upload presets: crie um preset unsigned e copie o nome.
 window.CDI_CLOUDINARY_CONFIG = {
-  cloudName: "",
-  uploadPreset: "",
+  cloudName: "sbyfm34m",
+  uploadPreset: "site-rpg",
   folder: "site-rpg"
 };
