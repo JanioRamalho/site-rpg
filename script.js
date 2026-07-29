@@ -36,6 +36,11 @@ let firebaseReady = false;
 let unsubscribeCampaigns = null;
 let saveTimer = null;
 let isApplyingRemoteState = false;
+let lastSavedCampaignJson = "";
+let lastRemoteCampaignJson = "";
+let isCampaignSaveInFlight = false;
+let saveAgainAfterCurrent = false;
+let syncStatus = "Carregando Firebase...";
 
 const root = document.getElementById("root");
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -59,6 +64,9 @@ function normalizeCampaign(c) {
   c.customSkills ??= [...OFFICIAL_SKILLS];
   c.itemTransfers ??= [];
   c.members ??= [c.masterId, ...c.players.map(p => p.authUid).filter(Boolean)];
+  ["players", "characters", "cases", "creatures", "items", "evidence", "marks", "diceLogs", "messages", "itemTransfers"].forEach(key => {
+    c[key].forEach(item => item.id ??= uid());
+  });
   return c;
 }
 
@@ -72,18 +80,46 @@ function persistLocal() {
   localStorage.setItem("cdi_fase1_full", JSON.stringify(state));
 }
 
+function setSyncStatus(status) {
+  syncStatus = status;
+  const el = document.getElementById("syncStatus");
+  if (el) el.textContent = status;
+}
+
+async function flushCampaignSave() {
+  if (!usingFirebase() || isApplyingRemoteState || !session.campaign?.id) return;
+  normalizeCampaign(session.campaign);
+  const payload = JSON.stringify(session.campaign);
+  if (payload === lastSavedCampaignJson) return;
+
+  if (isCampaignSaveInFlight) {
+    saveAgainAfterCurrent = true;
+    return;
+  }
+
+  isCampaignSaveInFlight = true;
+  setSyncStatus("Sincronizando...");
+  try {
+    await window.CDIFirebase.saveCampaign(session.campaign);
+    lastSavedCampaignJson = payload;
+    setSyncStatus("Online em tempo real");
+  } catch (err) {
+    console.error(err);
+    setSyncStatus("Falha de sincronizacao");
+    toast("Nao foi possivel sincronizar com o Firebase.");
+  } finally {
+    isCampaignSaveInFlight = false;
+    if (saveAgainAfterCurrent) {
+      saveAgainAfterCurrent = false;
+      queueCampaignSave();
+    }
+  }
+}
+
 function queueCampaignSave() {
   if (!usingFirebase() || isApplyingRemoteState || !session.campaign?.id) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    try {
-      normalizeCampaign(session.campaign);
-      await window.CDIFirebase.saveCampaign(session.campaign);
-    } catch (err) {
-      console.error(err);
-      toast("Nao foi possivel sincronizar com o Firebase.");
-    }
-  }, 350);
+  saveTimer = setTimeout(flushCampaignSave, 150);
 }
 
 const save = () => {
@@ -94,11 +130,28 @@ const save = () => {
 
 function firebaseStatusText() {
   if (!window.CDIFirebase) return "Firebase carregando...";
-  return usingFirebase() ? "Firebase online em tempo real" : "Modo local: configure firebase-config.js";
+  return usingFirebase() ? syncStatus : "Modo local: configure firebase-config.js";
 }
 
 function findCampaign(id) {
   return state.campaigns.find(c => c.id === id);
+}
+
+function openCampaign(id) {
+  const campaign = findCampaign(id);
+  if (!campaign) return alert("Campanha nao encontrada.");
+  session.campaign = campaign;
+  session.view = "campaign";
+  render();
+}
+
+async function copyCampaignId(id) {
+  try {
+    await navigator.clipboard.writeText(id);
+    toast("ID da campanha copiado!");
+  } catch (err) {
+    prompt("Copie o ID da campanha:", id);
+  }
 }
 
 function getMasterCampaigns() {
@@ -120,14 +173,37 @@ function toast(msg) {
   setTimeout(() => el.remove(), 3000);
 }
 
+function profileCanUseRole(profile, role) {
+  return !profile?.role || profile.role === role;
+}
+
+function addSystemMessage(c, text) {
+  c.messages ??= [];
+  const now = new Date();
+  c.messages.unshift({
+    id: uid(),
+    author: "Sistema",
+    authorId: "system",
+    text,
+    time: `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`
+  });
+  if (c.messages.length > 100) c.messages.pop();
+}
+
 function firebaseErrorMessage(err) {
-  const code = err?.code || "";
+  const code = String(err?.code || "").replace("firestore/", "");
+  const rawMessage = String(err?.message || "").toLowerCase();
+  if (rawMessage.includes("client is offline") || rawMessage.includes("failed to get document")) {
+    return "Nao foi possivel conectar ao Firestore agora. Verifique a internet, bloqueadores/extensoes do navegador e tente novamente em alguns segundos.";
+  }
   const messages = {
     "auth/email-already-in-use": "Este e-mail ja possui uma conta.",
     "auth/invalid-email": "E-mail invalido.",
     "auth/invalid-credential": "E-mail ou senha incorretos.",
     "auth/weak-password": "A senha precisa ter pelo menos 6 caracteres.",
-    "auth/requires-recent-login": "Entre novamente antes de executar esta acao."
+    "auth/requires-recent-login": "Entre novamente antes de executar esta acao.",
+    "permission-denied": "Permissao negada no Firebase. Publique as regras atualizadas do Firestore e tente novamente.",
+    "unavailable": "Nao foi possivel conectar ao Firestore. Verifique sua internet, bloqueadores do navegador e se o Firestore esta ativo no Firebase Console."
   };
   return messages[code] || err?.message || "Erro ao acessar o Firebase.";
 }
@@ -180,17 +256,34 @@ async function initFirebaseBridge() {
 
   window.CDIFirebase.onAuthChanged(async user => {
     firebaseUser = user;
-    firebaseProfile = user ? await window.CDIFirebase.getUserProfile(user.uid) : null;
+    try {
+      firebaseProfile = user ? await window.CDIFirebase.getUserProfile(user.uid) : null;
+    } catch (err) {
+      console.warn(err);
+      firebaseProfile = user ? {
+        id: user.uid,
+        name: user.displayName || user.email,
+        email: user.email,
+        role: "",
+        offlineProfile: true
+      } : null;
+    }
     if (unsubscribeCampaigns) unsubscribeCampaigns();
     unsubscribeCampaigns = null;
 
     if (!user) {
       session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
       state.campaigns = [];
+      lastSavedCampaignJson = "";
+      lastRemoteCampaignJson = "";
       return render();
     }
 
-    unsubscribeCampaigns = window.CDIFirebase.watchCampaigns(user.uid, campaigns => {
+    unsubscribeCampaigns = window.CDIFirebase.watchCampaigns(user.uid, (campaigns, meta = {}) => {
+      const remoteJson = JSON.stringify(campaigns);
+      if (remoteJson === lastRemoteCampaignJson) return;
+      lastRemoteCampaignJson = remoteJson;
+
       isApplyingRemoteState = true;
       state.campaigns = campaigns.map(normalizeCampaign);
       persistLocal();
@@ -206,9 +299,13 @@ async function initFirebaseBridge() {
       }
 
       isApplyingRemoteState = false;
+      if (session.campaign) lastSavedCampaignJson = JSON.stringify(session.campaign);
+      setSyncStatus(meta.hasPendingWrites ? "Sincronizando..." : (meta.fromCache ? "Usando cache local" : "Online em tempo real"));
+      if (meta.hasPendingWrites) return;
       render();
     }, err => {
       console.error(err);
+      setSyncStatus("Falha de conexao");
       toast("Falha ao acompanhar campanhas em tempo real.");
     });
 
@@ -230,7 +327,22 @@ function readImg(file) {
         else if (height > maxSize) { width *= maxSize / height; height = maxSize; }
         canvas.width = width; canvas.height = height;
         canvas.getContext("2d").drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL("image/jpeg", 0.8));
+        if (usingFirebase()) {
+          canvas.toBlob(async blob => {
+            try {
+              const campaignId = session.campaign?.id || "shared";
+              const path = `campaign-images/${campaignId}/${uid()}.jpg`;
+              const url = await window.CDIFirebase.uploadImage(path, blob);
+              resolve(url || canvas.toDataURL("image/jpeg", 0.8));
+            } catch (err) {
+              console.error(err);
+              toast("Nao foi possivel enviar a imagem. Salvando localmente.");
+              resolve(canvas.toDataURL("image/jpeg", 0.8));
+            }
+          }, "image/jpeg", 0.8);
+        } else {
+          resolve(canvas.toDataURL("image/jpeg", 0.8));
+        }
       };
       img.src = e.target.result;
     };
@@ -351,8 +463,9 @@ async function doMasterLogin() {
     const pass = document.getElementById("mpass").value;
     if (!email || !pass) return alert("Informe e-mail e senha.");
     try {
-      let profile = await window.CDIFirebase.signIn(email, pass);
+      let profile = await window.CDIFirebase.signIn(email, pass, "master");
       if (!profile) profile = await window.CDIFirebase.saveUserProfile(window.CDIFirebase.currentUser, "master", email);
+      if (!profileCanUseRole(profile, "master")) return alert("Esta conta foi cadastrada como Jogador. Use uma conta de Mestre para acessar este painel.");
       firebaseProfile = profile;
       session = { role: "master", currentMaster: profile, campaign: null, player: null, view: "home" };
       masterMenu();
@@ -409,32 +522,41 @@ async function doPlayerLogin() {
     const campaignPass = document.getElementById("pw").value;
     const name = document.getElementById("pname").value.trim();
     if (!email || !pass || !campaignId || !campaignPass) return alert("Preencha e-mail, senha e dados da campanha.");
+    const loginBtn = document.querySelector('button[onclick="doPlayerLogin()"]');
+    if (loginBtn) {
+      loginBtn.disabled = true;
+      loginBtn.textContent = "Entrando...";
+    }
+    const resetPlayerLoginButton = () => {
+      if (!loginBtn) return;
+      loginBtn.disabled = false;
+      loginBtn.textContent = "Entrar";
+    };
 
     try {
-      let profile = await window.CDIFirebase.signIn(email, pass);
+      let profile = await window.CDIFirebase.signIn(email, pass, "player");
       if (!profile) profile = await window.CDIFirebase.saveUserProfile(window.CDIFirebase.currentUser, "player", name || email);
+      if (!profileCanUseRole(profile, "player")) {
+        resetPlayerLoginButton();
+        return alert("Esta conta foi cadastrada como Mestre. Use uma conta de Jogador para entrar na campanha.");
+      }
       firebaseProfile = profile;
 
-      const c = normalizeCampaign(await window.CDIFirebase.getCampaign(campaignId));
-      if (!c || c.password !== campaignPass) return alert("Campanha ou senha inválida.");
-
-      const userId = window.CDIFirebase.currentUser.uid;
-      let p = c.players.find(x => x.authUid === userId || x.email === email);
-      if (!p) {
-        p = { id: uid(), name: name || profile?.name || email, email, authUid: userId, characterId: null };
-        c.players.push(p);
+      const joined = await window.CDIFirebase.joinCampaign(campaignId, campaignPass, profile, name);
+      if (!joined?.campaign || !joined?.player) {
+        resetPlayerLoginButton();
+        return alert("Campanha ou senha inválida.");
       }
-      p.authUid = userId;
-      p.email = email;
-      if (name) p.name = name;
-      c.members = Array.from(new Set([...(c.members || []), c.masterId, p.authUid].filter(Boolean)));
+      const c = normalizeCampaign(joined.campaign);
+      const p = joined.player;
 
       state.campaigns = [c, ...state.campaigns.filter(x => x.id !== c.id)];
       session = { role: "player", campaign: c, player: p, currentMaster: null, view: "sheet" };
-      await window.CDIFirebase.saveCampaign(c);
-      await window.CDIFirebase.addCampaignMember(c.id, p.authUid);
+      lastSavedCampaignJson = JSON.stringify(c);
+      toast(`Voce entrou na campanha ${c.name}.`);
       render();
     } catch (err) {
+      resetPlayerLoginButton();
       alert(firebaseErrorMessage(err));
     }
     return;
@@ -491,6 +613,9 @@ function nav() {
 async function logout() {
   if (unsubscribeCampaigns) unsubscribeCampaigns();
   unsubscribeCampaigns = null;
+  lastSavedCampaignJson = "";
+  lastRemoteCampaignJson = "";
+  saveAgainAfterCurrent = false;
   if (usingFirebase()) {
     await window.CDIFirebase.signOut();
   }
@@ -796,7 +921,10 @@ function campaignsPage() {
         <div class="card">
           <h3>${esc(c.name)}</h3>
           <p class="muted">👤 ${c.characters.length} personagens</p>
-          <button onclick="session.campaign=c;session.view='campaign';render()">Abrir</button>
+          <label>ID para jogadores</label>
+          <input readonly value="${esc(c.id)}" onclick="this.select()">
+          <button onclick="openCampaign('${esc(c.id)}')">Abrir</button>
+          <button class="secondary" onclick="copyCampaignId('${esc(c.id)}')">Copiar ID</button>
           <button class="danger" onclick="deleteCampaign('${c.id}')">Excluir</button>
         </div>`).join("")}
     </div>`;
@@ -807,7 +935,8 @@ function campaignPage() {
   return `
     <h2>📚 ${esc(c.name)}</h2>
     <div class="card">
-      <label>ID da Campanha para jogadores</label><input readonly value="${esc(c.id)}">
+      <label>ID da Campanha para jogadores</label><input readonly value="${esc(c.id)}" onclick="this.select()">
+      <button class="secondary" onclick="copyCampaignId('${esc(c.id)}')">Copiar ID da Campanha</button>
       <label>Nome</label><input id="campName" value="${esc(c.name)}">
       <label>Senha</label><input id="campPass" value="${esc(c.password)}">
       <label>Descrição</label><textarea id="campDesc">${esc(c.description)}</textarea>
@@ -835,7 +964,7 @@ function newCampaign(first = false) {
     </div></div>`);
 }
 
-function createCampaign() {
+async function createCampaign() {
   const c = {
     id: uid(), masterId: session.currentMaster.id,
     name: document.getElementById("cn").value || "Campanha",
@@ -845,8 +974,29 @@ function createCampaign() {
     players: [], characters: [], cases: [], creatures: [], items: [], evidence: [], marks: [], diceLogs: [], messages: [], scenes: [],
     itemTransfers: [], customSkills: [...OFFICIAL_SKILLS]
   };
-  state.campaigns.push(c); session.campaign = c; save(); session.view = "home";
-  document.querySelectorAll(".modal").forEach(m => m.remove()); render();
+  normalizeCampaign(c);
+  state.campaigns.push(c);
+  session.campaign = c;
+  session.view = "campaign";
+  persistLocal();
+
+  if (usingFirebase()) {
+    try {
+      await window.CDIFirebase.saveCampaign(c);
+      lastSavedCampaignJson = JSON.stringify(c);
+    } catch (err) {
+      state.campaigns = state.campaigns.filter(x => x.id !== c.id);
+      session.campaign = null;
+      alert(firebaseErrorMessage(err));
+      return;
+    }
+  } else {
+    save();
+  }
+
+  document.querySelectorAll(".modal").forEach(m => m.remove());
+  render();
+  toast("Campanha criada! Compartilhe o ID com os jogadores.");
 }
 
 async function deleteCampaign(id) {

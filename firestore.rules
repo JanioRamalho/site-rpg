@@ -14,6 +14,36 @@ service cloud.firestore {
       return signedIn() && request.auth.uid in request.resource.data.members;
     }
 
+    function isCampaignMemberById(campaignId) {
+      return signedIn()
+        && request.auth.uid in get(/databases/$(database)/documents/campaigns/$(campaignId)).data.members;
+    }
+
+    function isCampaignMasterById(campaignId) {
+      return signedIn()
+        && get(/databases/$(database)/documents/campaigns/$(campaignId)).data.masterId == request.auth.uid;
+    }
+
+    function isOwnIncomingPlayerDoc() {
+      return signedIn()
+        && request.resource.data.authUid == request.auth.uid;
+    }
+
+    function isOwnExistingPlayerDoc() {
+      return signedIn()
+        && resource.data.authUid == request.auth.uid;
+    }
+
+    function isOwnIncomingMessageOrLog() {
+      return signedIn()
+        && (request.resource.data.authorId == request.auth.uid || request.resource.data.authorId == "system");
+    }
+
+    function isOwnExistingMessageOrLog() {
+      return signedIn()
+        && resource.data.authorId == request.auth.uid;
+    }
+
     match /users/{userId} {
       allow read: if signedIn() && request.auth.uid == userId;
       allow create, update: if signedIn() && request.auth.uid == userId;
@@ -29,6 +59,44 @@ service cloud.firestore {
         && request.resource.data.masterId == request.auth.uid;
       allow update: if isIncomingCampaignMember();
       allow delete: if signedIn() && resource.data.masterId == request.auth.uid;
+
+      match /players/{docId} {
+        allow read: if isCampaignMemberById(campaignId);
+        allow create: if isCampaignMemberById(campaignId) && (isCampaignMasterById(campaignId) || isOwnIncomingPlayerDoc());
+        allow update: if isCampaignMemberById(campaignId) && (isCampaignMasterById(campaignId) || isOwnExistingPlayerDoc());
+        allow delete: if isCampaignMasterById(campaignId);
+      }
+
+      match /messages/{docId} {
+        allow read: if isCampaignMemberById(campaignId);
+        allow create: if isCampaignMemberById(campaignId) && (isCampaignMasterById(campaignId) || isOwnIncomingMessageOrLog());
+        allow update: if isCampaignMemberById(campaignId) && (isCampaignMasterById(campaignId) || isOwnExistingMessageOrLog());
+        allow delete: if isCampaignMasterById(campaignId);
+      }
+
+      match /diceLogs/{docId} {
+        allow read: if isCampaignMemberById(campaignId);
+        allow create: if isCampaignMemberById(campaignId) && (isCampaignMasterById(campaignId) || isOwnIncomingMessageOrLog());
+        allow update: if isCampaignMemberById(campaignId) && (isCampaignMasterById(campaignId) || isOwnExistingMessageOrLog());
+        allow delete: if isCampaignMasterById(campaignId);
+      }
+
+      match /characters/{docId} {
+        allow read: if isCampaignMemberById(campaignId);
+        allow create, update: if isCampaignMemberById(campaignId);
+        allow delete: if isCampaignMasterById(campaignId);
+      }
+
+      match /itemTransfers/{docId} {
+        allow read: if isCampaignMemberById(campaignId);
+        allow create, update: if isCampaignMemberById(campaignId);
+        allow delete: if isCampaignMasterById(campaignId);
+      }
+
+      match /{subcollection}/{docId} {
+        allow read: if isCampaignMemberById(campaignId);
+        allow create, update, delete: if isCampaignMasterById(campaignId);
+      }
     }
   }
 }
