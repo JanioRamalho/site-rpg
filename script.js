@@ -30,12 +30,76 @@ state.campaigns?.forEach(c => {
 });
 
 let session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
+let firebaseUser = null;
+let firebaseProfile = null;
+let firebaseReady = false;
+let unsubscribeCampaigns = null;
+let saveTimer = null;
+let isApplyingRemoteState = false;
 
 const root = document.getElementById("root");
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-const save = () => localStorage.setItem("cdi_fase1_full", JSON.stringify(state));
+const usingFirebase = () => Boolean(window.CDIFirebase?.enabled);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 const imgInput = (id, label) => `<label>${label}</label><input id="${id}" type="file" accept="image/*">`;
+
+function normalizeCampaign(c) {
+  if (!c) return c;
+  c.masterId ??= "m1";
+  c.players ??= [];
+  c.characters ??= [];
+  c.cases ??= [];
+  c.creatures ??= [];
+  c.items ??= [];
+  c.evidence ??= [];
+  c.marks ??= [];
+  c.diceLogs ??= [];
+  c.scenes ??= [];
+  c.messages ??= [];
+  c.customSkills ??= [...OFFICIAL_SKILLS];
+  c.itemTransfers ??= [];
+  c.members ??= [c.masterId, ...c.players.map(p => p.authUid).filter(Boolean)];
+  return c;
+}
+
+function normalizeState() {
+  state.masters ??= [];
+  state.campaigns ??= [];
+  state.campaigns.forEach(normalizeCampaign);
+}
+
+function persistLocal() {
+  localStorage.setItem("cdi_fase1_full", JSON.stringify(state));
+}
+
+function queueCampaignSave() {
+  if (!usingFirebase() || isApplyingRemoteState || !session.campaign?.id) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    try {
+      normalizeCampaign(session.campaign);
+      await window.CDIFirebase.saveCampaign(session.campaign);
+    } catch (err) {
+      console.error(err);
+      toast("Nao foi possivel sincronizar com o Firebase.");
+    }
+  }, 350);
+}
+
+const save = () => {
+  normalizeState();
+  persistLocal();
+  queueCampaignSave();
+};
+
+function firebaseStatusText() {
+  if (!window.CDIFirebase) return "Firebase carregando...";
+  return usingFirebase() ? "Firebase online em tempo real" : "Modo local: configure firebase-config.js";
+}
+
+function findCampaign(id) {
+  return state.campaigns.find(c => c.id === id);
+}
 
 function getMasterCampaigns() {
   return session.currentMaster ? state.campaigns.filter(c => c.masterId === session.currentMaster.id) : [];
@@ -56,12 +120,101 @@ function toast(msg) {
   setTimeout(() => el.remove(), 3000);
 }
 
+function firebaseErrorMessage(err) {
+  const code = err?.code || "";
+  const messages = {
+    "auth/email-already-in-use": "Este e-mail ja possui uma conta.",
+    "auth/invalid-email": "E-mail invalido.",
+    "auth/invalid-credential": "E-mail ou senha incorretos.",
+    "auth/weak-password": "A senha precisa ter pelo menos 6 caracteres.",
+    "auth/requires-recent-login": "Entre novamente antes de executar esta acao."
+  };
+  return messages[code] || err?.message || "Erro ao acessar o Firebase.";
+}
+
+function playerRegisterModal() {
+  if (!usingFirebase()) return playerLogin();
+  root.innerHTML = `
+    <div class="modal"><div class="modalbox">
+      <h2>➕ Novo Jogador</h2>
+      <label>Nome</label><input id="newPName" placeholder="Seu nome na mesa">
+      <label>E-mail</label><input id="newPEmail" type="email" placeholder="jogador@email.com">
+      <label>Senha</label><input id="newPPass" type="password" placeholder="Senha com pelo menos 6 caracteres">
+      <br><br>
+      <button onclick="createPlayerAccount()">Cadastrar</button>
+      <button class="secondary" onclick="playerLogin()">Voltar</button>
+    </div></div>`;
+}
+
+async function createPlayerAccount() {
+  const name = document.getElementById("newPName").value.trim();
+  const email = document.getElementById("newPEmail").value.trim();
+  const password = document.getElementById("newPPass").value.trim();
+  if (!name || !email || !password) return alert("Preencha todos os campos.");
+  try {
+    firebaseProfile = await window.CDIFirebase.signUp(email, password, name, "player");
+    toast("Conta de jogador criada!");
+    playerLogin();
+  } catch (err) {
+    alert(firebaseErrorMessage(err));
+  }
+}
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     const modals = document.querySelectorAll(".modal");
     if (modals.length > 0) modals[modals.length - 1].remove();
   }
 });
+
+window.addEventListener("cdi-firebase-ready", initFirebaseBridge);
+
+async function initFirebaseBridge() {
+  if (firebaseReady || !window.CDIFirebase) return;
+  firebaseReady = true;
+  if (!usingFirebase()) {
+    normalizeState();
+    persistLocal();
+    return render();
+  }
+
+  window.CDIFirebase.onAuthChanged(async user => {
+    firebaseUser = user;
+    firebaseProfile = user ? await window.CDIFirebase.getUserProfile(user.uid) : null;
+    if (unsubscribeCampaigns) unsubscribeCampaigns();
+    unsubscribeCampaigns = null;
+
+    if (!user) {
+      session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
+      state.campaigns = [];
+      return render();
+    }
+
+    unsubscribeCampaigns = window.CDIFirebase.watchCampaigns(user.uid, campaigns => {
+      isApplyingRemoteState = true;
+      state.campaigns = campaigns.map(normalizeCampaign);
+      persistLocal();
+
+      if (session.campaign) {
+        const updated = findCampaign(session.campaign.id);
+        if (updated) {
+          session.campaign = updated;
+          if (session.player) {
+            session.player = updated.players.find(p => p.id === session.player.id || p.authUid === user.uid) || session.player;
+          }
+        }
+      }
+
+      isApplyingRemoteState = false;
+      render();
+    }, err => {
+      console.error(err);
+      toast("Falha ao acompanhar campanhas em tempo real.");
+    });
+
+    if (!session.role) render();
+  });
+}
 
 function readImg(file) {
   return new Promise(resolve => {
@@ -103,7 +256,7 @@ function home() {
   root.innerHTML = `
     <div class="modal"><div class="modalbox">
       <h1>🌑 Crônicas do Infinito</h1>
-      <p class="muted">Gerenciador de RPG de Mesa Local</p>
+      <p class="muted">Gerenciador de RPG de Mesa Online</p>
       <div class="grid" style="margin-top:15px;">
         <div class="card"><h2>👑 Painel do Mestre</h2><p>Controle campanhas, fichas, criaturas e mistérios.</p><button onclick="masterLoginModal()">Entrar como Mestre</button></div>
         <div class="card"><h2>👤 Painel do Jogador</h2><p>Acesse seu personagem, inventário e atributos.</p><button onclick="playerLogin()">Entrar como Jogador</button></div>
@@ -112,6 +265,19 @@ function home() {
 }
 
 function masterLoginModal() {
+  if (usingFirebase()) {
+    root.innerHTML = `
+      <div class="modal"><div class="modalbox">
+        <h2>👑 Acesso do Mestre</h2>
+        <label>E-mail</label><input id="memail" type="email" placeholder="mestre@email.com">
+        <label>Senha</label><input id="mpass" type="password" placeholder="Sua senha">
+        <br><br>
+        <button onclick="doMasterLogin()">Entrar</button>
+        <button class="secondary" onclick="newMasterModal()">Criar conta</button>
+        <button class="secondary" onclick="home()">Voltar</button>
+      </div></div>`;
+    return;
+  }
   if (state.masters.length === 0) return newMasterModal();
   root.innerHTML = `
     <div class="modal"><div class="modalbox">
@@ -128,6 +294,19 @@ function masterLoginModal() {
 }
 
 function newMasterModal() {
+  if (usingFirebase()) {
+    root.innerHTML = `
+      <div class="modal"><div class="modalbox">
+        <h2>➕ Novo Mestre</h2>
+        <label>Nome do Mestre</label><input id="newMName" placeholder="Ex: Mestre Gabriel">
+        <label>E-mail</label><input id="newMEmail" type="email" placeholder="mestre@email.com">
+        <label>Senha de Acesso</label><input id="newMPass" type="password" placeholder="Senha com pelo menos 6 caracteres">
+        <br><br>
+        <button onclick="createMaster()">Cadastrar</button>
+        <button class="secondary" onclick="masterLoginModal()">Voltar</button>
+      </div></div>`;
+    return;
+  }
   root.innerHTML = `
     <div class="modal"><div class="modalbox">
       <h2>➕ Novo Mestre</h2>
@@ -139,7 +318,23 @@ function newMasterModal() {
     </div></div>`;
 }
 
-function createMaster() {
+async function createMaster() {
+  if (usingFirebase()) {
+    const name = document.getElementById("newMName").value.trim();
+    const email = document.getElementById("newMEmail").value.trim();
+    const password = document.getElementById("newMPass").value.trim();
+    if (!name || !email || !password) return alert("Preencha todos os campos.");
+    try {
+      const profile = await window.CDIFirebase.signUp(email, password, name, "master");
+      firebaseProfile = profile;
+      session = { role: "master", currentMaster: profile, campaign: null, player: null, view: "home" };
+      toast("Mestre cadastrado no Firebase!");
+      masterMenu();
+    } catch (err) {
+      alert(firebaseErrorMessage(err));
+    }
+    return;
+  }
   const name = document.getElementById("newMName").value.trim();
   const password = document.getElementById("newMPass").value.trim();
   if (!name || !password) return alert("Preencha todos os campos.");
@@ -150,7 +345,22 @@ function createMaster() {
   masterLoginModal();
 }
 
-function doMasterLogin() {
+async function doMasterLogin() {
+  if (usingFirebase()) {
+    const email = document.getElementById("memail").value.trim();
+    const pass = document.getElementById("mpass").value;
+    if (!email || !pass) return alert("Informe e-mail e senha.");
+    try {
+      let profile = await window.CDIFirebase.signIn(email, pass);
+      if (!profile) profile = await window.CDIFirebase.saveUserProfile(window.CDIFirebase.currentUser, "master", email);
+      firebaseProfile = profile;
+      session = { role: "master", currentMaster: profile, campaign: null, player: null, view: "home" };
+      masterMenu();
+    } catch (err) {
+      alert(firebaseErrorMessage(err));
+    }
+    return;
+  }
   const mid = document.getElementById("msel").value;
   const pass = document.getElementById("mpass").value;
   const target = state.masters.find(m => m.id === mid);
@@ -162,6 +372,22 @@ function doMasterLogin() {
 }
 
 function playerLogin() {
+  if (usingFirebase()) {
+    root.innerHTML = `
+      <div class="modal"><div class="modalbox">
+        <h2>👤 Acesso do Jogador</h2>
+        <label>E-mail</label><input id="pemail" type="email" placeholder="jogador@email.com">
+        <label>Senha</label><input id="ppass" type="password" placeholder="Sua senha">
+        <label>ID da Campanha</label><input id="pcid" placeholder="Cole o ID informado pelo Mestre">
+        <label>Senha da Campanha</label><input id="pw" type="password">
+        <label>Nome na mesa</label><input id="pname" placeholder="Ex: Ana">
+        <br><br>
+        <button onclick="doPlayerLogin()">Entrar</button>
+        <button class="secondary" onclick="playerRegisterModal()">Criar conta de jogador</button>
+        <button class="secondary" onclick="home()">Voltar</button>
+      </div></div>`;
+    return;
+  }
   if (!state.campaigns.length) return alert("Nenhuma campanha criada.");
   root.innerHTML = `
     <div class="modal"><div class="modalbox">
@@ -175,7 +401,44 @@ function playerLogin() {
     </div></div>`;
 }
 
-function doPlayerLogin() {
+async function doPlayerLogin() {
+  if (usingFirebase()) {
+    const email = document.getElementById("pemail").value.trim();
+    const pass = document.getElementById("ppass").value;
+    const campaignId = document.getElementById("pcid").value.trim();
+    const campaignPass = document.getElementById("pw").value;
+    const name = document.getElementById("pname").value.trim();
+    if (!email || !pass || !campaignId || !campaignPass) return alert("Preencha e-mail, senha e dados da campanha.");
+
+    try {
+      let profile = await window.CDIFirebase.signIn(email, pass);
+      if (!profile) profile = await window.CDIFirebase.saveUserProfile(window.CDIFirebase.currentUser, "player", name || email);
+      firebaseProfile = profile;
+
+      const c = normalizeCampaign(await window.CDIFirebase.getCampaign(campaignId));
+      if (!c || c.password !== campaignPass) return alert("Campanha ou senha inválida.");
+
+      const userId = window.CDIFirebase.currentUser.uid;
+      let p = c.players.find(x => x.authUid === userId || x.email === email);
+      if (!p) {
+        p = { id: uid(), name: name || profile?.name || email, email, authUid: userId, characterId: null };
+        c.players.push(p);
+      }
+      p.authUid = userId;
+      p.email = email;
+      if (name) p.name = name;
+      c.members = Array.from(new Set([...(c.members || []), c.masterId, p.authUid].filter(Boolean)));
+
+      state.campaigns = [c, ...state.campaigns.filter(x => x.id !== c.id)];
+      session = { role: "player", campaign: c, player: p, currentMaster: null, view: "sheet" };
+      await window.CDIFirebase.saveCampaign(c);
+      await window.CDIFirebase.addCampaignMember(c.id, p.authUid);
+      render();
+    } catch (err) {
+      alert(firebaseErrorMessage(err));
+    }
+    return;
+  }
   const pc = document.getElementById("pc").value;
   const pw = document.getElementById("pw").value;
   const pp = document.getElementById("pp").value;
@@ -189,6 +452,11 @@ function doPlayerLogin() {
 
 function masterMenu() {
   const myCampaigns = getMasterCampaigns();
+  if (usingFirebase() && !myCampaigns.length) {
+    session.campaign = null;
+    session.view = "home";
+    return render();
+  }
   if (!myCampaigns.length) return newCampaign(true);
   session.campaign = myCampaigns[0];
   session.view = "home";
@@ -199,11 +467,13 @@ function masterMenu() {
 function nav() {
   const m = session.role === "master";
   const items = m ? [
+    ["messages","Mensagens"],
     ["home","🏠 Visão Geral"], ["campaigns","📚 Campanhas"], ["characters","👤 Personagens"],
     ["skills","🎯 Habilidades"], ["diceLogs","🎲 Histórico"], ["cases","📁 Casos"],
     ["creatures","👹 Criaturas"], ["items","🎒 Itens"], ["evidence","🔎 Evidências"],
     ["marks","🏷️ Marcas"], ["transfers", "🤝 Permissões / Trocas"], ["players","🔐 Jogadores"], ["settings","⚙️ Configurações"]
   ] : [
+    ["messages","Mensagens"],
     ["sheet","👤 Meu Personagem"], ["inventory","🎒 Inventário"], ["evidencePlayer","🔎 Evidências"], ["transferPlayer","🤝 Dar Item/Evidência"]
   ];
 
@@ -214,8 +484,18 @@ function nav() {
       <div class="nav">${items.map(([v, t]) => `<button class="${session.view === v ? "active" : ""}" onclick="session.view='${v}';render()">${t}</button>`).join("")}</div>
       <button class="dice-btn" onclick="openDiceRoller()">🎲 Rolador</button>
       <hr style="border-color:var(--card-border); margin: 15px 0;">
-      <button class="secondary" onclick="session={role:null};home()">Sair</button>
+      <button class="secondary" onclick="logout()">Sair</button>
     </div>`;
+}
+
+async function logout() {
+  if (unsubscribeCampaigns) unsubscribeCampaigns();
+  unsubscribeCampaigns = null;
+  if (usingFirebase()) {
+    await window.CDIFirebase.signOut();
+  }
+  session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
+  home();
 }
 
 function render() {
@@ -252,7 +532,7 @@ function masterBody() {
   if (!c) return `<h2>Visão Geral</h2><p class="muted">Nenhuma campanha criada.</p><button onclick="newCampaign()">➕ Criar Campanha</button>`;
 
   const views = {
-    characters: charactersPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
+    messages: messagesPage, characters: charactersPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
     cases: () => recordsPage("cases", "📁 Casos"), creatures: creaturesPage,
     items: itemsMasterPage, evidence: evidencePage, marks: marksPage, players: playersPage
   };
@@ -459,7 +739,23 @@ function deleteMasterAccountModal() {
     </div></div>`);
 }
 
-function executeDeleteMasterAccount() {
+async function executeDeleteMasterAccount() {
+  if (usingFirebase()) {
+    if (!confirm("Confirmar exclusao da conta Firebase e campanhas deste mestre?")) return;
+    try {
+      const ids = getMasterCampaigns().map(c => c.id);
+      for (const id of ids) await window.CDIFirebase.deleteCampaign(id);
+      await window.CDIFirebase.deleteCurrentUser();
+      state.campaigns = [];
+      persistLocal();
+      document.querySelectorAll(".modal").forEach(m => m.remove());
+      toast("Conta de Mestre excluida com sucesso.");
+      home();
+    } catch (err) {
+      alert(firebaseErrorMessage(err));
+    }
+    return;
+  }
   const pass = document.getElementById("confirmMasterDelPass").value;
   const target = state.masters.find(m => m.id === session.currentMaster.id);
 
@@ -482,6 +778,12 @@ function executeDeleteMasterAccount() {
 function saveMasterPassword() {
   const pass = document.getElementById("newMasterPass").value.trim();
   if (!pass) return alert("Vazio.");
+  if (usingFirebase()) {
+    window.CDIFirebase.updateCurrentPassword(pass)
+      .then(() => toast("Senha alterada no Firebase!"))
+      .catch(err => alert(firebaseErrorMessage(err)));
+    return;
+  }
   const m = state.masters.find(x => x.id === session.currentMaster.id);
   if (m) { m.password = pass; session.currentMaster.password = pass; save(); toast("Senha alterada!"); }
 }
@@ -505,6 +807,7 @@ function campaignPage() {
   return `
     <h2>📚 ${esc(c.name)}</h2>
     <div class="card">
+      <label>ID da Campanha para jogadores</label><input readonly value="${esc(c.id)}">
       <label>Nome</label><input id="campName" value="${esc(c.name)}">
       <label>Senha</label><input id="campPass" value="${esc(c.password)}">
       <label>Descrição</label><textarea id="campDesc">${esc(c.description)}</textarea>
@@ -538,18 +841,24 @@ function createCampaign() {
     name: document.getElementById("cn").value || "Campanha",
     password: document.getElementById("cp").value || "123",
     description: document.getElementById("cd").value || "",
-    players: [], characters: [], cases: [], creatures: [], items: [], evidence: [], marks: [], diceLogs: [], scenes: [],
+    members: [session.currentMaster.id],
+    players: [], characters: [], cases: [], creatures: [], items: [], evidence: [], marks: [], diceLogs: [], messages: [], scenes: [],
     itemTransfers: [], customSkills: [...OFFICIAL_SKILLS]
   };
   state.campaigns.push(c); session.campaign = c; save(); session.view = "home";
   document.querySelectorAll(".modal").forEach(m => m.remove()); render();
 }
 
-function deleteCampaign(id) {
+async function deleteCampaign(id) {
   if (confirm("Excluir campanha?")) {
     state.campaigns = state.campaigns.filter(c => c.id !== id);
     session.campaign = getMasterCampaigns()[0] || null;
-    save(); render();
+    persistLocal();
+    if (usingFirebase()) {
+      try { await window.CDIFirebase.deleteCampaign(id); }
+      catch (err) { alert(firebaseErrorMessage(err)); }
+    }
+    render();
   }
 }
 
@@ -650,9 +959,53 @@ function removeSkill(charId, idx) {
   save(); render();
 }
 
+function messagesPage() {
+  const c = session.campaign;
+  c.messages ??= [];
+  const messages = c.messages.slice(0, 80);
+  return `
+    <h2>💬 Mensagens</h2>
+    <div class="card chat-panel">
+      <div class="chat-list">
+        ${messages.length === 0 ? '<p class="muted">Nenhuma mensagem enviada ainda.</p>' : messages.map(m => `
+          <div class="chat-message">
+            <div><b>${esc(m.author)}</b> <span class="muted">${esc(m.time || "")}</span></div>
+            <p>${esc(m.text)}</p>
+          </div>`).join("")}
+      </div>
+      <div class="chat-compose">
+        <input id="msgText" placeholder="Escreva uma mensagem para a mesa" onkeydown="if(event.key==='Enter') sendMessage()">
+        <button onclick="sendMessage()">Enviar</button>
+      </div>
+    </div>`;
+}
+
+function sendMessage() {
+  const input = document.getElementById("msgText");
+  const text = input.value.trim();
+  if (!text) return;
+  const now = new Date();
+  const author = session.role === "master"
+    ? `Mestre (${session.currentMaster?.name || "Mestre"})`
+    : (session.player?.name || firebaseProfile?.name || "Jogador");
+
+  session.campaign.messages ??= [];
+  session.campaign.messages.unshift({
+    id: uid(),
+    author,
+    authorId: firebaseUser?.uid || session.currentMaster?.id || session.player?.id || "",
+    text,
+    time: `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`
+  });
+  if (session.campaign.messages.length > 100) session.campaign.messages.pop();
+  save();
+  render();
+}
+
 // --- PAINEL DO JOGADOR ---
 function playerBody() {
   const v = session.view;
+  if (v === "messages") return messagesPage();
   const ch = session.campaign.characters.find(x => x.id === session.player.characterId);
   if (!ch) {
     return `
@@ -1043,6 +1396,7 @@ function playersPage() {
       ${c.players.map((p, i) => `
         <div class="card">
           <h3>${esc(p.name)}</h3>
+          ${p.email ? `<p class="muted">${esc(p.email)}</p>` : ""}
           <p class="muted">Personagem ID: ${p.characterId || 'Nenhum'}</p>
           <button onclick="linkPlayerModal(${i})">Vincular Personagem</button>
           <button class="danger" onclick="delPlayer(${i})">Remover</button>
@@ -1051,6 +1405,18 @@ function playersPage() {
 }
 
 function newPlayerModal() {
+  if (usingFirebase()) {
+    root.insertAdjacentHTML("beforeend", `
+      <div class="modal"><div class="modalbox">
+        <h2>🔐 Jogador</h2>
+        <label>Nome</label><input id="jn">
+        <label>E-mail da conta Firebase</label><input id="je" type="email" placeholder="jogador@email.com">
+        <br><br>
+        <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
+        <button onclick="saveNewPlayer()">Salvar</button>
+      </div></div>`);
+    return;
+  }
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🔐 Jogador</h2>
@@ -1063,7 +1429,15 @@ function newPlayerModal() {
 }
 
 function saveNewPlayer() {
-  const name = document.getElementById("jn").value, password = document.getElementById("jp").value;
+  const name = document.getElementById("jn").value;
+  if (usingFirebase()) {
+    const email = document.getElementById("je").value.trim();
+    if (!name || !email) return alert("Preencha nome e e-mail.");
+    session.campaign.players.push({ id: uid(), name, email, authUid: null, characterId: null });
+    save(); document.querySelector(".modal").remove(); render(); toast("Jogador adicionado!");
+    return;
+  }
+  const password = document.getElementById("jp").value;
   if (!name || !password) return alert("Preencha tudo.");
   session.campaign.players.push({ id: uid(), name, password, characterId: null });
   save(); document.querySelector(".modal").remove(); render(); toast("Jogador adicionado!");
@@ -1172,5 +1546,7 @@ function rollDice(sides, bonus = 0, label = "") {
 function rollAttribute(name, mod) { rollDice(20, mod, `Atributo: ${name}`); }
 function rollSkill(name, mod) { rollDice(20, mod, `Habilidade: ${name}`); }
 
+normalizeState();
+if (window.CDIFirebase) initFirebaseBridge();
 render();
             
