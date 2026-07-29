@@ -276,6 +276,44 @@ label {
   font-size: 16px;
 }
 
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 900px;
+}
+
+.chat-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+
+.chat-message {
+  background: var(--bg);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.chat-message p {
+  margin: 6px 0 0;
+  color: var(--text);
+}
+
+.chat-compose {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: start;
+}
+
+.chat-compose input {
+  margin: 0;
+}
+
 .skills-selector {
   display: grid;
   grid-template-columns: 1fr 1fr;
