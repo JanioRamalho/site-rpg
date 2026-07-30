@@ -454,6 +454,30 @@ export function createCampaignRepository(ctx) {
     }
   }
 
+  async function updateCharacterInventory(campaignId, characterId, inventory) {
+    if (!campaignId || !characterId || !auth.currentUser) {
+      throw new Error("Inventario de personagem invalido.");
+    }
+
+    const cleanInventory = stripUndefined(Array.isArray(inventory) ? inventory : []);
+    const inventoryUpdatedAt = new Date().toISOString();
+    const update = { inventory: cleanInventory, inventoryUpdatedAt };
+    try {
+      await withRetry(() => api.updateDoc(
+        api.doc(db, "campaigns", campaignId, "characters", String(characterId)),
+        update
+      ), ctx);
+    } catch (err) {
+      console.warn("SDK Firestore falhou ao atualizar inventario; usando REST.", err);
+      await restPatchDoc(`campaigns/${campaignId}/characters/${String(characterId)}`, update);
+    }
+
+    const cachedCharacter = campaignSaveCache.get(campaignId)?.characters
+      ?.find(character => String(character.id) === String(characterId));
+    if (cachedCharacter) Object.assign(cachedCharacter, stripUndefined(update));
+    return update;
+  }
+
   async function assignPlayerCharacter(campaignId, playerId, characterId) {
     if (!campaignId || !playerId || !auth.currentUser) throw new Error("Vinculo de personagem invalido.");
 
@@ -720,6 +744,7 @@ export function createCampaignRepository(ctx) {
     resolveItemTransfer,
     saveCampaign,
     setPlayerPresence,
+    updateCharacterInventory,
     watchCampaigns
   };
 }

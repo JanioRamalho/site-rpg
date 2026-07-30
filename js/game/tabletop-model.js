@@ -77,8 +77,6 @@
       active: Boolean(target.active),
       sceneId: target.sceneId ? String(target.sceneId) : null,
       image: String(target.image || ""),
-      title: String(target.title || ""),
-      caption: String(target.caption || ""),
       index: Math.max(0, Number.parseInt(target.index, 10) || 0),
       total: Math.max(0, Number.parseInt(target.total, 10) || 0),
       updatedAt: target.updatedAt || null
@@ -309,8 +307,6 @@
       active: options.active === undefined ? Boolean(campaign.liveScene.active) : Boolean(options.active),
       sceneId: scene.id,
       image: scene.image,
-      title: scene.title,
-      caption: scene.caption,
       index,
       total: campaign.scenes.length,
       updatedAt: new Date().toISOString()

@@ -119,12 +119,13 @@ function allowedSessionView(role, view) {
 function persistSessionContext() {
   if (!session.role) return;
   const authUid = firebaseUser?.uid || window.CDIFirebase?.currentUser?.uid || null;
+  if (usingFirebase() && !authUid) return;
   const context = {
     mode: usingFirebase() ? "firebase" : "local",
     authUid,
     role: session.role,
-    campaignId: session.campaign?.id || null,
-    playerId: session.player?.id || null,
+    campaignId: session.campaign?.id ? String(session.campaign.id) : null,
+    playerId: session.player?.id ? String(session.player.id) : null,
     masterId: session.currentMaster?.id || null,
     view: allowedSessionView(session.role, session.view),
     savedAt: new Date().toISOString()
@@ -137,10 +138,15 @@ function restoreFirebaseSession(user, profile) {
   const saved = readSessionContext();
   const savedBelongsToUser = saved?.mode === "firebase" && saved.authUid === user.uid;
   const role = savedBelongsToUser ? saved.role : profile?.role;
+  const savedCampaignId = savedBelongsToUser && saved?.campaignId ? String(saved.campaignId) : null;
+  const savedPlayerId = savedBelongsToUser && saved?.playerId ? String(saved.playerId) : null;
 
   if (role === "master") {
     const campaigns = state.campaigns.filter(campaign => campaign.masterId === user.uid);
-    const campaign = campaigns.find(entry => entry.id === saved?.campaignId) || campaigns[0] || null;
+    const campaign = savedCampaignId
+      ? campaigns.find(entry => String(entry.id) === savedCampaignId) || null
+      : campaigns[0] || null;
+    if (savedCampaignId && !campaign) return false;
     session = {
       role: "master",
       campaign,
@@ -155,8 +161,13 @@ function restoreFirebaseSession(user, profile) {
 
   if (role === "player") {
     const candidates = state.campaigns.filter(campaign => campaign.players?.some(player => player.authUid === user.uid));
-    const campaign = candidates.find(entry => entry.id === saved?.campaignId) || candidates[0] || null;
-    const player = campaign?.players.find(entry => entry.id === saved?.playerId || entry.authUid === user.uid) || null;
+    const campaign = savedCampaignId
+      ? candidates.find(entry => String(entry.id) === savedCampaignId) || null
+      : candidates[0] || null;
+    if (savedCampaignId && !campaign) return false;
+    const player = campaign?.players.find(entry => (
+      entry.authUid === user.uid && (!savedPlayerId || String(entry.id) === savedPlayerId)
+    )) || campaign?.players.find(entry => entry.authUid === user.uid) || null;
     if (!campaign || !player) return false;
     session = {
       role: "player",
@@ -484,6 +495,50 @@ window.addEventListener("keydown", (e) => {
 
 window.addEventListener("cdi-firebase-ready", initFirebaseBridge);
 
+function applyRemoteCampaignSnapshot(campaigns, meta = {}, user = firebaseUser) {
+  const syncText = meta.hasPendingWrites
+    ? "Sincronizando..."
+    : (meta.fromCache ? "Usando cache local" : "Online em tempo real");
+  const remoteJson = JSON.stringify(campaigns);
+  if (remoteJson === lastRemoteCampaignJson) {
+    setSyncStatus(syncText);
+    return false;
+  }
+
+  const activeCampaignId = session.campaign?.id ? String(session.campaign.id) : null;
+  const activePlayerId = session.player?.id ? String(session.player.id) : null;
+  lastRemoteCampaignJson = remoteJson;
+  isApplyingRemoteState = true;
+
+  try {
+    state.campaigns = campaigns.map(normalizeCampaign);
+    persistLocal();
+
+    if (!session.role) restoreFirebaseSession(user, firebaseProfile);
+    sessionRestoreCompleted = true;
+
+    if (session.campaign) {
+      const targetCampaignId = activeCampaignId || String(session.campaign.id);
+      const updated = findCampaign(targetCampaignId);
+      if (updated) {
+        session.campaign = updated;
+        if (session.player) {
+          session.player = updated.players.find(player => (
+            String(player.id) === activePlayerId && player.authUid === user?.uid
+          )) || updated.players.find(player => player.authUid === user?.uid) || session.player;
+        }
+      }
+    }
+  } finally {
+    isApplyingRemoteState = false;
+  }
+
+  if (session.campaign) lastSavedCampaignJson = JSON.stringify(session.campaign);
+  setSyncStatus(syncText);
+  render();
+  return true;
+}
+
 async function initFirebaseBridge() {
   if (firebaseReady || !window.CDIFirebase) return;
   firebaseReady = true;
@@ -524,35 +579,7 @@ async function initFirebaseBridge() {
     }
 
     unsubscribeCampaigns = window.CDIFirebase.watchCampaigns(user.uid, (campaigns, meta = {}) => {
-      const remoteJson = JSON.stringify(campaigns);
-      if (remoteJson === lastRemoteCampaignJson) {
-        setSyncStatus(meta.hasPendingWrites ? "Sincronizando..." : (meta.fromCache ? "Usando cache local" : "Online em tempo real"));
-        return;
-      }
-      lastRemoteCampaignJson = remoteJson;
-
-      isApplyingRemoteState = true;
-      state.campaigns = campaigns.map(normalizeCampaign);
-      persistLocal();
-
-      if (!session.role) restoreFirebaseSession(user, firebaseProfile);
-      sessionRestoreCompleted = true;
-
-      if (session.campaign) {
-        const updated = findCampaign(session.campaign.id);
-        if (updated) {
-          session.campaign = updated;
-          if (session.player) {
-            session.player = updated.players.find(p => p.id === session.player.id || p.authUid === user.uid) || session.player;
-          }
-        }
-      }
-
-      isApplyingRemoteState = false;
-      if (session.campaign) lastSavedCampaignJson = JSON.stringify(session.campaign);
-      setSyncStatus(meta.hasPendingWrites ? "Sincronizando..." : (meta.fromCache ? "Usando cache local" : "Online em tempo real"));
-      if (meta.hasPendingWrites) return;
-      render();
+      applyRemoteCampaignSnapshot(campaigns, meta, user);
     }, err => {
       console.error(err);
       setSyncStatus("Falha de conexao");
@@ -804,6 +831,7 @@ async function doPlayerLogin() {
       state.campaigns = [c, ...state.campaigns.filter(x => x.id !== c.id)];
       session = { role: "player", campaign: c, player: p, currentMaster: null, view: "sheet" };
       lastSavedCampaignJson = JSON.stringify(c);
+      persistSessionContext();
       startPlayerPresence();
       toast(`Voce entrou na campanha ${c.name}.`);
       render();
@@ -1607,10 +1635,9 @@ function playerScenesPage() {
     </div>
     <section class="player-scene-view">
       <figure id="sceneStage" class="scene-stage player-scene-stage" onclick="toggleSceneFullscreen()">
-        <img src="${esc(live.image)}" alt="${esc(live.title || "Cena atual")}">
+        <img src="${esc(live.image)}" alt="Cena apresentada pelo Mestre">
       </figure>
-      <div class="player-scene-caption">
-        <div><h3>${esc(live.title || "Cena atual")}</h3>${live.caption ? `<p>${esc(live.caption)}</p>` : ""}</div>
+      <div class="player-scene-caption player-scene-toolbar">
         <div class="scene-player-actions">
           ${live.total ? `<span class="scene-counter">${Math.min(live.total, Number(live.index || 0) + 1)} / ${live.total}</span>` : ""}
           <button class="icon-button secondary" title="Tela cheia" aria-label="Tela cheia" onclick="event.stopPropagation();toggleSceneFullscreen()">⛶</button>
@@ -2097,23 +2124,61 @@ function deliverItemModal(itemIndex) {
     </div></div>`);
 }
 
-function saveItemGrant(itemIndex) {
+async function persistCharacterInventoryNow(characterId) {
+  const character = session.campaign?.characters.find(entry => entry.id === characterId);
+  if (!character) throw new Error("Personagem nao encontrado.");
+  normalizeState();
+  persistLocal();
+  if (!usingFirebase()) return true;
+
+  setSyncStatus("Sincronizando inventario...");
+  try {
+    const result = await window.CDIFirebase.updateCharacterInventory(
+      session.campaign.id,
+      character.id,
+      character.inventory || []
+    );
+    if (result?.inventoryUpdatedAt) character.inventoryUpdatedAt = result.inventoryUpdatedAt;
+    setSyncStatus("Online em tempo real");
+    return true;
+  } catch (err) {
+    setSyncStatus("Falha de sincronizacao");
+    throw err;
+  }
+}
+
+async function commitCharacterInventoryMutation(characterId, mutation) {
+  const character = session.campaign?.characters.find(entry => entry.id === characterId);
+  if (!character) throw new Error("Personagem nao encontrado.");
+  if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
+  const previousInventory = JSON.parse(JSON.stringify(character.inventory || []));
+  try {
+    const result = mutation(character);
+    await persistCharacterInventoryNow(characterId);
+    return result;
+  } catch (err) {
+    character.inventory = previousInventory;
+    persistLocal();
+    throw err;
+  }
+}
+
+async function saveItemGrant(itemIndex) {
   if (session.role !== "master") return alert("Somente o Mestre pode entregar itens diretamente.");
   const item = session.campaign.items[itemIndex];
   const characterId = document.getElementById("grantCharacterId").value;
   try {
     requireCompleteItemPresentation(item);
-    tabletop.grantItem(session.campaign, characterId, item, {
-      quantity: document.getElementById("grantQuantity").value,
-      equipped: document.getElementById("grantEquipped").checked,
-      notes: document.getElementById("grantNotes").value.trim()
-    }, uid);
-    save();
+    await commitCharacterInventoryMutation(characterId, () => tabletop.grantItem(session.campaign, characterId, item, {
+        quantity: document.getElementById("grantQuantity").value,
+        equipped: document.getElementById("grantEquipped").checked,
+        notes: document.getElementById("grantNotes").value.trim()
+      }, uid));
     document.querySelector(".modal").remove();
     render();
     toast("Item entregue ao personagem.");
   } catch (err) {
-    alert(err.message);
+    alert(firebaseErrorMessage(err));
   }
 }
 
@@ -2189,26 +2254,25 @@ function manageCharacterInventoryModal(characterId) {
 }
 
 function reopenInventoryManager(characterId, message) {
-  save();
   render();
   manageCharacterInventoryModal(characterId);
   if (message) toast(message);
 }
 
-function grantCatalogItemToCharacter(characterId) {
+async function grantCatalogItemToCharacter(characterId) {
   if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
   const itemId = document.getElementById("inventoryCatalogItem")?.value;
   const item = session.campaign.items.find(entry => entry.id === itemId);
   if (!item) return alert("Selecione um item do catalogo.");
   try {
     requireCompleteItemPresentation(item);
-    tabletop.grantItem(session.campaign, characterId, item, {
-      quantity: document.getElementById("inventoryCatalogQuantity").value,
-      notes: document.getElementById("inventoryCatalogNotes").value.trim()
-    }, uid);
+    await commitCharacterInventoryMutation(characterId, () => tabletop.grantItem(session.campaign, characterId, item, {
+        quantity: document.getElementById("inventoryCatalogQuantity").value,
+        notes: document.getElementById("inventoryCatalogNotes").value.trim()
+      }, uid));
     reopenInventoryManager(characterId, "Item adicionado.");
   } catch (err) {
-    alert(err.message || "Nao foi possivel adicionar o item.");
+    alert(firebaseErrorMessage(err));
   }
 }
 
@@ -2235,12 +2299,12 @@ async function grantCustomItemToCharacter(characterId, button) {
       image
     };
     requireCompleteItemPresentation(item);
-    tabletop.grantItem(session.campaign, characterId, item, {
-      quantity,
-      equipped: Boolean(document.getElementById("inventoryCustomEquipped")?.checked),
-      notes: document.getElementById("inventoryCustomNotes")?.value.trim() || "",
-      stack: false
-    }, uid);
+    await commitCharacterInventoryMutation(characterId, () => tabletop.grantItem(session.campaign, characterId, item, {
+        quantity,
+        equipped: Boolean(document.getElementById("inventoryCustomEquipped")?.checked),
+        notes: document.getElementById("inventoryCustomNotes")?.value.trim() || "",
+        stack: false
+      }, uid));
     reopenInventoryManager(characterId, "Item personalizado adicionado.");
   } catch (err) {
     console.error(err);
@@ -2282,7 +2346,9 @@ async function saveInventoryEntry(characterId, inventoryId, button) {
       notes: document.getElementById(`invNotes_${inventoryId}`).value.trim()
     };
     requireCompleteItemPresentation(changes);
-    tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, changes);
+    await commitCharacterInventoryMutation(characterId, () => (
+      tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, changes)
+    ));
     reopenInventoryManager(characterId, "Inventario atualizado.");
   } catch (err) {
     console.error(err);
@@ -2295,20 +2361,32 @@ async function saveInventoryEntry(characterId, inventoryId, button) {
   }
 }
 
-function toggleInventoryEquipped(characterId, inventoryId) {
+async function toggleInventoryEquipped(characterId, inventoryId) {
   if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
   const character = session.campaign.characters.find(entry => entry.id === characterId);
   const item = character?.inventory.find(entry => entry.id === inventoryId);
   if (!item) return;
-  tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, { equipped: !item.equipped });
-  reopenInventoryManager(characterId, item.equipped ? "Item equipado." : "Item desequipado.");
+  try {
+    await commitCharacterInventoryMutation(characterId, () => (
+      tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, { equipped: !item.equipped })
+    ));
+    reopenInventoryManager(characterId, item.equipped ? "Item equipado." : "Item desequipado.");
+  } catch (err) {
+    alert(firebaseErrorMessage(err));
+  }
 }
 
-function removeCharacterInventoryItem(characterId, inventoryId) {
+async function removeCharacterInventoryItem(characterId, inventoryId) {
   if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
   if (!confirm("Remover este item do inventario?")) return;
-  tabletop.removeInventoryEntry(session.campaign, characterId, inventoryId);
-  reopenInventoryManager(characterId, "Item removido.");
+  try {
+    await commitCharacterInventoryMutation(characterId, () => (
+      tabletop.removeInventoryEntry(session.campaign, characterId, inventoryId)
+    ));
+    reopenInventoryManager(characterId, "Item removido.");
+  } catch (err) {
+    alert(firebaseErrorMessage(err));
+  }
 }
 
 function recordsPage(key, title) {

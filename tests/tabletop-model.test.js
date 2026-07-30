@@ -219,7 +219,9 @@ test("publishes only public scene fields and clears them when hidden", () => {
 
   const live = tabletop.publishScene(campaign, "scene-1", { active: true });
   assert.equal(live.active, true);
-  assert.equal(live.title, "Entrada");
+  assert.equal(live.image, "one.jpg");
+  assert.equal("title" in live, false);
+  assert.equal("caption" in live, false);
   assert.equal("masterNotes" in live, false);
 
   tabletop.stepScene(campaign, 1);

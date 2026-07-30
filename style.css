@@ -1441,6 +1441,10 @@ button.inventory-slot:hover {
   border-bottom: 1px solid var(--card-border);
 }
 
+.player-scene-toolbar {
+  justify-content: flex-end;
+}
+
 .player-scene-caption h3 {
   margin-bottom: 6px;
 }

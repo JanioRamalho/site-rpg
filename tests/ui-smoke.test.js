@@ -200,7 +200,7 @@ test("renders the private scene deck and controls only for the master", () => {
   assert.match(root.innerHTML, /Ocultar dos jogadores/);
 });
 
-test("renders only the active public scene for a player", () => {
+test("renders only the active image for a player without its title or caption", () => {
   const { context, root } = createAppContext();
   seedCampaign(context);
   vm.runInContext(`
@@ -208,8 +208,9 @@ test("renders only the active public scene for a player", () => {
     render();
   `, context);
 
-  assert.match(root.innerHTML, /Portao/);
-  assert.match(root.innerHTML, /O portao se abre/);
+  assert.match(root.innerHTML, /scene-1\.jpg/);
+  assert.match(root.innerHTML, /Cena apresentada pelo Mestre/);
+  assert.doesNotMatch(root.innerHTML, /Portao|O portao se abre/);
   assert.doesNotMatch(root.innerHTML, /Corredor futuro/);
   assert.doesNotMatch(root.innerHTML, /Armadilha privada|Monstro escondido/);
 });
@@ -234,4 +235,80 @@ test("restores the Firebase player session without storing a password", () => {
     { role: "player", campaignId: "campaign-1", playerId: "player-1", view: "inventory" }
   );
   assert.doesNotMatch(saved, /secret|password/i);
+});
+
+test("waits for the saved campaign instead of switching campaigns during refresh", () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    window.CDIFirebase = { enabled: true, currentUser: { uid: "auth-1" } };
+    firebaseUser = { uid: "auth-1", email: "ana@example.com" };
+    const refreshCampaignOne = state.campaigns[0];
+    const refreshCampaignTwo = JSON.parse(JSON.stringify(refreshCampaignOne));
+    refreshCampaignTwo.id = "campaign-2";
+    refreshCampaignTwo.name = "Campanha atual";
+    refreshCampaignTwo.players[0].id = "player-current";
+    refreshCampaignTwo.players[0].characterId = "char-current";
+    refreshCampaignTwo.characters[0].id = "char-current";
+    refreshCampaignTwo.characters[0].controllerPlayerId = "player-current";
+    state.campaigns = [refreshCampaignOne, refreshCampaignTwo];
+    normalizeState();
+
+    session = { role: "player", campaign: refreshCampaignTwo, player: refreshCampaignTwo.players[0], currentMaster: null, view: "inventory" };
+    render();
+    session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
+
+    state.campaigns = [refreshCampaignOne];
+    window.__partialRestore = restoreFirebaseSession(firebaseUser, { id: "auth-1", role: "player", name: "Ana" });
+    window.__partialRole = session.role;
+
+    state.campaigns.push(refreshCampaignTwo);
+    window.__completeRestore = restoreFirebaseSession(firebaseUser, { id: "auth-1", role: "player", name: "Ana" });
+    window.__refreshCampaignId = session.campaign?.id;
+    window.__refreshPlayerId = session.player?.id;
+  `, context);
+
+  assert.equal(context.window.__partialRestore, false);
+  assert.equal(context.window.__partialRole, null);
+  assert.equal(context.window.__completeRestore, true);
+  assert.equal(context.window.__refreshCampaignId, "campaign-2");
+  assert.equal(context.window.__refreshPlayerId, "player-current");
+});
+
+test("applies a remote inventory update immediately without changing the active campaign", () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    window.CDIFirebase = { enabled: true, currentUser: { uid: "auth-1" } };
+    firebaseUser = { uid: "auth-1", email: "ana@example.com" };
+    firebaseProfile = { id: "auth-1", role: "player", name: "Ana" };
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "inventory" };
+    render();
+    lastRemoteCampaignJson = JSON.stringify(state.campaigns);
+
+    const realtimeCampaigns = JSON.parse(JSON.stringify(state.campaigns));
+    realtimeCampaigns[0].characters[0].inventory.push({
+      id: "inv-live",
+      name: "Lanterna",
+      description: "Ilumina o caminho",
+      image: "lanterna.jpg",
+      quantity: 1
+    });
+    window.__remoteApplied = applyRemoteCampaignSnapshot(
+      realtimeCampaigns,
+      { fromCache: false, hasPendingWrites: false },
+      firebaseUser
+    );
+    window.__realtimeCampaignId = session.campaign?.id;
+    window.__realtimeInventorySize = session.campaign?.characters[0]?.inventory?.length;
+    window.__realtimeDescription = session.campaign?.characters[0]?.inventory
+      ?.find((item) => item.id === "inv-live")?.description;
+  `, context);
+
+  assert.equal(context.window.__remoteApplied, true);
+  assert.equal(context.window.__realtimeCampaignId, "campaign-1");
+  assert.equal(context.window.__realtimeInventorySize, 2);
+  assert.equal(context.window.__realtimeDescription, "Ilumina o caminho");
+  assert.match(root.innerHTML, /Lanterna/);
+  assert.match(root.innerHTML, /lanterna.jpg/);
 });

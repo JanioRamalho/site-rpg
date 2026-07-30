@@ -97,6 +97,29 @@ test("player persistence never writes inventory or master-owned character fields
   assert.equal("inventory" in characterWrite.data, false);
 });
 
+test("master inventory delivery writes the character document immediately", async () => {
+  const { context, writes } = createFakeContext({
+    user: { uid: "master-1", email: "master@example.com" }
+  });
+  const repository = createCampaignRepository(context);
+  const inventory = [{
+    id: "inv-live",
+    name: "Lanterna",
+    description: "Ilumina o caminho",
+    image: "lanterna.jpg",
+    quantity: 1,
+    equipped: false
+  }];
+
+  const result = await repository.updateCharacterInventory("campaign-1", "char-1", inventory);
+
+  const write = writes.find(entry => entry.ref === "db/campaigns/campaign-1/characters/char-1");
+  assert.equal(write.method, "update");
+  assert.deepEqual(write.data.inventory, inventory);
+  assert.equal(typeof write.data.inventoryUpdatedAt, "string");
+  assert.deepEqual(result.inventory, inventory);
+});
+
 test("join rejects an account without a character prepared by the master", async () => {
   const baseCampaign = {
     id: "campaign-1",
