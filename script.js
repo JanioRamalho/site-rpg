@@ -453,8 +453,8 @@ setInterval(() => {
 function playerRegisterModal() {
   if (!usingFirebase()) return playerLogin();
   root.innerHTML = `
-    <div class="modal"><div class="modalbox">
-      <h2>➕ Novo Jogador</h2>
+    <div class="modal home-screen auth-screen"><div class="modalbox auth-panel">
+      <h2>Novo Jogador</h2>
       <label>Nome</label><input id="newPName" placeholder="Seu nome na mesa">
       <label>E-mail</label><input id="newPEmail" type="email" placeholder="jogador@email.com">
       <label>Senha</label><input id="newPPass" type="password" placeholder="Senha com pelo menos 6 caracteres">
@@ -644,21 +644,33 @@ function openImageModal(imgSrc, title = "Visualizar Imagem") {
 // --- TELAS DE AUTENTICAÇÃO E HOME ---
 function home() {
   root.innerHTML = `
-    <div class="modal home-screen"><div class="modalbox">
-      <h1>🌑 Crônicas do Infinito</h1>
-      <p class="muted">Gerenciador de RPG de Mesa Online</p>
-      <div class="grid" style="margin-top:15px;">
-        <div class="card"><h2>👑 Painel do Mestre</h2><p>Controle campanhas, fichas, criaturas e mistérios.</p><button onclick="masterLoginModal()">Entrar como Mestre</button></div>
-        <div class="card"><h2>👤 Painel do Jogador</h2><p>Acesse seu personagem, inventário e atributos.</p><button onclick="playerLogin()">Entrar como Jogador</button></div>
+    <div class="modal home-screen"><main class="modalbox home-gateway">
+      <header class="gateway-heading">
+        <span class="gateway-sigil" aria-hidden="true">◉</span>
+        <span class="gateway-eyebrow">Arquivos do desconhecido</span>
+        <h1>Crônicas do Infinito</h1>
+        <p>Gerenciador de RPG de Mesa Online</p>
+      </header>
+      <div class="home-access-grid">
+        <article class="card access-card">
+          <span class="access-card-icon" aria-hidden="true">♛</span>
+          <div><span class="access-card-eyebrow">Conduzir a investigação</span><h2>Painel do Mestre</h2><p>Controle campanhas, fichas, criaturas e mistérios.</p></div>
+          <button onclick="masterLoginModal()">Entrar como Mestre</button>
+        </article>
+        <article class="card access-card">
+          <span class="access-card-icon" aria-hidden="true">◈</span>
+          <div><span class="access-card-eyebrow">Abrir o seu dossiê</span><h2>Painel do Jogador</h2><p>Acesse seu personagem, inventário e atributos.</p></div>
+          <button onclick="playerLogin()">Entrar como Jogador</button>
+        </article>
       </div>
-    </div></div>`;
+    </main></div>`;
 }
 
 function masterLoginModal() {
   if (usingFirebase()) {
     root.innerHTML = `
-      <div class="modal"><div class="modalbox">
-        <h2>👑 Acesso do Mestre</h2>
+      <div class="modal home-screen auth-screen"><div class="modalbox auth-panel">
+        <h2>Acesso do Mestre</h2>
         <label>E-mail</label><input id="memail" type="email" placeholder="mestre@email.com">
         <label>Senha</label><input id="mpass" type="password" placeholder="Sua senha">
         <br><br>
@@ -670,8 +682,8 @@ function masterLoginModal() {
   }
   if (state.masters.length === 0) return newMasterModal();
   root.innerHTML = `
-    <div class="modal"><div class="modalbox">
-      <h2>👑 Acesso do Mestre</h2>
+    <div class="modal home-screen auth-screen"><div class="modalbox auth-panel">
+      <h2>Acesso do Mestre</h2>
       <label>Selecione o Mestre</label>
       <select id="msel">${state.masters.map(m => `<option value="${m.id}">${esc(m.name)}</option>`).join("")}</select>
       <label>Senha do Mestre</label>
@@ -686,8 +698,8 @@ function masterLoginModal() {
 function newMasterModal() {
   if (usingFirebase()) {
     root.innerHTML = `
-      <div class="modal"><div class="modalbox">
-        <h2>➕ Novo Mestre</h2>
+      <div class="modal home-screen auth-screen"><div class="modalbox auth-panel">
+        <h2>Novo Mestre</h2>
         <label>Nome do Mestre</label><input id="newMName" placeholder="Ex: Mestre Gabriel">
         <label>E-mail</label><input id="newMEmail" type="email" placeholder="mestre@email.com">
         <label>Senha de Acesso</label><input id="newMPass" type="password" placeholder="Senha com pelo menos 6 caracteres">
@@ -698,8 +710,8 @@ function newMasterModal() {
     return;
   }
   root.innerHTML = `
-    <div class="modal"><div class="modalbox">
-      <h2>➕ Novo Mestre</h2>
+    <div class="modal home-screen auth-screen"><div class="modalbox auth-panel">
+      <h2>Novo Mestre</h2>
       <label>Nome do Mestre</label><input id="newMName" placeholder="Ex: Mestre Gabriel">
       <label>Senha de Acesso</label><input id="newMPass" type="password" placeholder="Senha">
       <br><br>
@@ -765,8 +777,8 @@ async function doMasterLogin() {
 function playerLogin() {
   if (usingFirebase()) {
     root.innerHTML = `
-      <div class="modal"><div class="modalbox">
-        <h2>👤 Acesso do Jogador</h2>
+      <div class="modal home-screen auth-screen"><div class="modalbox auth-panel">
+        <h2>Acesso do Jogador</h2>
         <label>E-mail</label><input id="pemail" type="email" placeholder="jogador@email.com">
         <label>Senha</label><input id="ppass" type="password" placeholder="Sua senha">
         <label>ID da Campanha</label><input id="pcid" placeholder="Cole o ID informado pelo Mestre">
@@ -781,8 +793,8 @@ function playerLogin() {
   }
   if (!state.campaigns.length) return alert("Nenhuma campanha criada.");
   root.innerHTML = `
-    <div class="modal"><div class="modalbox">
-      <h2>👤 Acesso do Jogador</h2>
+    <div class="modal home-screen auth-screen"><div class="modalbox auth-panel">
+      <h2>Acesso do Jogador</h2>
       <label>Campanha</label><select id="pc">${state.campaigns.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}</select>
       <label>Senha da Campanha</label><input id="pw" type="password">
       <label>Senha do Jogador</label><input id="pp" type="password">
@@ -874,28 +886,29 @@ function masterMenu() {
 function nav() {
   const m = session.role === "master";
   const items = m ? [
-    ["messages","Mensagens"],
-    ["room","Sala"],
-    ["scenes","Cenas"],
-    ["home","🏠 Visão Geral"], ["campaigns","📚 Campanhas"], ["characters","👤 Personagens"],
-    ["skills","🎯 Habilidades"], ["diceLogs","🎲 Histórico"], ["cases","📁 Casos"],
-    ["creatures","👹 Criaturas"], ["items","🎒 Itens"], ["evidence","🔎 Evidências"],
-    ["marks","🏷️ Marcas"], ["transfers", "🤝 Permissões / Trocas"], ["players","🔐 Jogadores"], ["settings","⚙️ Configurações"]
+    ["messages","✉ Mensagens"],
+    ["room","◉ Sala"],
+    ["scenes","▣ Cenas"],
+    ["home","⌂ Visão Geral"], ["campaigns","▤ Campanhas"], ["characters","♙ Personagens"],
+    ["skills","✦ Habilidades"], ["diceLogs","◷ Histórico"], ["cases","▱ Casos"],
+    ["creatures","☠ Criaturas"], ["items","▦ Itens"], ["evidence","⌕ Evidências"],
+    ["marks","◇ Marcas"], ["transfers", "⇄ Permissões / Trocas"], ["players","♟ Jogadores"], ["settings","⚙ Configurações"]
   ] : [
-    ["messages","Mensagens"],
-    ["room","Sala"],
-    ["scenes","Cenas"],
-    ["sheet","👤 Meu Personagem"], ["inventory","🎒 Inventário"], ["evidencePlayer","🔎 Evidências"], ["transferPlayer","🤝 Dar Item/Evidência"]
+    ["messages","✉ Mensagens"],
+    ["room","◉ Sala"],
+    ["scenes","▣ Cenas"],
+    ["sheet","♙ Meu Personagem"], ["inventory","▦ Inventário"], ["evidencePlayer","⌕ Evidências"], ["transferPlayer","⇄ Dar Item/Evidência"]
   ];
 
   return `
     <div class="side">
-      <div class="brand">🌑 Crônicas</div>
+      <div class="brand"><span class="brand-sigil" aria-hidden="true">◉</span><span class="brand-copy"><b>Crônicas</b><small>do Infinito</small></span></div>
       <div class="role">${m ? `Mestre: ${esc(session.currentMaster?.name)}` : "Jogador"}</div>
       <div class="nav">${items.map(([v, t]) => `<button class="${session.view === v ? "active" : ""}" onclick="session.view='${v}';render()">${t}</button>`).join("")}</div>
-      <button class="dice-btn" onclick="openDiceRoller()">🎲 Rolador</button>
-      <hr style="border-color:var(--card-border); margin: 15px 0;">
-      <button class="secondary" onclick="logout()">Sair</button>
+      <div class="side-footer">
+        <button class="dice-btn" onclick="openDiceRoller()">✦ Rolador</button>
+        <button class="secondary" onclick="logout()">Sair</button>
+      </div>
     </div>`;
 }
 
@@ -935,7 +948,7 @@ function render() {
       ${nav()}
       <section class="content">
         <div class="top">
-          <div><h1>${esc(c ? c.name : "Configurações")}</h1><span class="muted">${session.role === "master" ? "Mestre" : "Jogador"}</span></div>
+          <div class="campaign-heading"><span class="campaign-kicker">${session.role === "master" ? "Mestre" : "Jogador"}</span><h1>${esc(c ? c.name : "Configurações")}</h1></div>
           <button class="secondary" onclick="logout()">Trocar Acesso</button>
         </div>
         ${session.role === "master" ? masterBody() : playerBody()}
@@ -1951,10 +1964,10 @@ function sheetPlayer(ch) {
         <span class="tag">Origem: ${esc(ch.origin)}</span>
       </div>
     </div>
-    <div class="grid" style="margin-top:15px;">
-      <div class="card"><h3>❤️ Saúde</h3><h2 id="val-health">${ch.health}/${ch.healthMax}</h2><div class="bar"><div id="bar-health" class="fill health" style="width:${(ch.health/ch.healthMax)*100}%"></div></div><button onclick="changeStatDirect('health',-1)">−</button><button onclick="changeStatDirect('health',1)">+</button></div>
-      <div class="card"><h3>🧠 Sanidade</h3><h2 id="val-sanity">${ch.sanity}/${ch.sanityMax}</h2><div class="bar"><div id="bar-sanity" class="fill sanity" style="width:${(ch.sanity/ch.sanityMax)*100}%"></div></div><button onclick="changeStatDirect('sanity',-1)">−</button><button onclick="changeStatDirect('sanity',1)">+</button></div>
-      <div class="card"><h3>🛡️ Defesa</h3><h2>${ch.defense || 10}</h2></div>
+    <div class="grid vital-grid" style="margin-top:15px;">
+      <div class="card vital-card vital-health"><h3>❤️ Saúde</h3><h2 id="val-health">${ch.health}/${ch.healthMax}</h2><div class="bar"><div id="bar-health" class="fill health" style="width:${(ch.health/ch.healthMax)*100}%"></div></div><button onclick="changeStatDirect('health',-1)">−</button><button onclick="changeStatDirect('health',1)">+</button></div>
+      <div class="card vital-card vital-sanity"><h3>🧠 Sanidade</h3><h2 id="val-sanity">${ch.sanity}/${ch.sanityMax}</h2><div class="bar"><div id="bar-sanity" class="fill sanity" style="width:${(ch.sanity/ch.sanityMax)*100}%"></div></div><button onclick="changeStatDirect('sanity',-1)">−</button><button onclick="changeStatDirect('sanity',1)">+</button></div>
+      <div class="card vital-card vital-defense"><h3>🛡️ Defesa</h3><h2>${ch.defense || 10}</h2></div>
     </div>
     <div class="grid" style="margin-top:15px;">
       <div class="card"><h3>📊 Atributos</h3>${Object.entries(ch.attrs).map(([k, v]) => `<div class="stat clickable-stat" onclick="rollAttribute(${jsArg(k)}, ${v})"><span>${esc(k)}</span><b>${v >= 0 ? '+' + v : v}</b></div>`).join("")}</div>
@@ -2885,13 +2898,14 @@ function openDiceRoller() {
   const c = session.campaign;
   const logs = c?.diceLogs || [];
   root.insertAdjacentHTML("beforeend", `
-    <div class="modal" id="diceModal"><div class="modalbox">🎲 Rolador de Dados
-      <div class="grid" style="margin-top:10px;">
+    <div class="modal ritual-modal" id="diceModal"><div class="modalbox dice-modalbox">
+      <div class="dice-modal-heading"><span class="ritual-sigil" aria-hidden="true">✦</span><h2>Rolador de Dados</h2></div>
+      <div class="dice-grid">
         ${[4, 6, 8, 10, 12, 20, 100].map(s => `<button onclick="rollDice(${s})">d${s}</button>`).join("")}
       </div>
-      <div class="dice-result" id="diceResult" style="margin-top:15px; text-align:center;">Escolha um dado</div>
-      <div id="diceHistory" style="font-size:12px; color:var(--muted); margin-top:10px;">${logs.slice(0, 5).map(l => `<b>${esc(l.author)}</b>: ${l.total}`).join("<br>") || "Sem rolagens."}</div>
-      <button class="secondary" style="margin-top:15px;" onclick="document.getElementById('diceModal').remove()">Fechar</button>
+      <div class="dice-result" id="diceResult">Escolha um dado</div>
+      <div id="diceHistory" class="dice-history">${logs.slice(0, 5).map(l => `<b>${esc(l.author)}</b>: ${l.total}`).join("<br>") || "Sem rolagens."}</div>
+      <div class="modal-actions"><button class="secondary" onclick="document.getElementById('diceModal').remove()">Fechar</button></div>
     </div></div>`);
 }
 
@@ -2919,7 +2933,10 @@ function rollDice(sides, bonus = 0, label = "") {
     resEl = document.getElementById("diceResult");
   }
   if (resEl) {
-    resEl.innerHTML = `${label ? `<b>${label}</b>: ` : ""}Resultado: <span style="font-size:24px; color:var(--accent);">${total}</span>${bonusText}`;
+    resEl.innerHTML = `${label ? `<b>${label}</b>: ` : ""}Resultado: <span class="dice-total">${total}</span>${bonusText}`;
+    resEl.classList.remove("is-revealed");
+    void resEl.offsetWidth;
+    resEl.classList.add("is-revealed");
     document.getElementById("diceHistory").innerHTML = (session.campaign?.diceLogs || []).slice(0, 5).map(l => `<b>${esc(l.author)}</b>: ${l.total}`).join("<br>");
   }
 }
