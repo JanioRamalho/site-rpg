@@ -24,6 +24,8 @@ function disabledService() {
     joinCampaign: () => Promise.resolve(null),
     saveCampaign: () => Promise.resolve(),
     setPlayerPresence: () => Promise.resolve(),
+    assignPlayerCharacter: () => Promise.reject(new Error("Firebase nao configurado.")),
+    resolveItemTransfer: () => Promise.reject(new Error("Firebase nao configurado.")),
     addCampaignMember: () => Promise.resolve(),
     deleteCampaign: () => Promise.resolve(),
     uploadImage: () => Promise.resolve("")
@@ -53,6 +55,8 @@ function composeService(ctx) {
     joinCampaign: campaigns.joinCampaign,
     saveCampaign: campaigns.saveCampaign,
     setPlayerPresence: campaigns.setPlayerPresence,
+    assignPlayerCharacter: campaigns.assignPlayerCharacter,
+    resolveItemTransfer: campaigns.resolveItemTransfer,
     addCampaignMember: campaigns.addCampaignMember,
     deleteCampaign: campaigns.deleteCampaign,
     uploadImage: (_path, blob) => media.uploadImage(blob, { tags: "site-rpg" })

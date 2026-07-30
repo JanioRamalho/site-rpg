@@ -11,6 +11,7 @@ export async function createFirebaseClient(cfg) {
 
   const app = firebaseApp.initializeApp(cfg);
   const auth = firebaseAuth.getAuth(app);
+  await firebaseAuth.setPersistence(auth, firebaseAuth.browserLocalPersistence);
   const db = firebaseFirestore.initializeFirestore(app, {
     experimentalForceLongPolling: true,
     useFetchStreams: false

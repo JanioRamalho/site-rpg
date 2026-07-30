@@ -106,12 +106,26 @@ service cloud.firestore {
       return signedIn() && request.resource.data.authorId == request.auth.uid;
     }
 
-    function isOwnIncomingTransfer(campaignId) {
+    function isOwnIncomingTransfer(campaignId, docId) {
+      let sourcePlayer = get(playerPath(campaignId, request.resource.data.fromPlayerId));
       return signedIn()
+        && request.resource.data.id == docId
         && request.resource.data.status == 'pending'
         && request.resource.data.fromPlayerId is string
         && exists(playerPath(campaignId, request.resource.data.fromPlayerId))
-        && get(playerPath(campaignId, request.resource.data.fromPlayerId)).data.authUid == request.auth.uid;
+        && sourcePlayer.data.authUid == request.auth.uid
+        && request.resource.data.fromCharacterId == sourcePlayer.data.characterId
+        && !request.resource.data.keys().hasAny(['resolvedAt', 'resolvedBy'])
+        && (
+          request.resource.data.type == 'evidence'
+          || (
+            request.resource.data.type == 'item'
+            && request.resource.data.inventoryId is string
+            && request.resource.data.toCharacterId is string
+            && request.resource.data.quantity is int
+            && request.resource.data.quantity > 0
+          )
+        );
     }
 
     function isOwnControlledCharacter(campaignId, characterId) {
@@ -188,13 +202,19 @@ service cloud.firestore {
       match /itemTransfers/{docId} {
         allow read: if isCampaignMemberById(campaignId);
         allow create: if isCampaignMemberById(campaignId)
-          && (isCampaignMasterById(campaignId) || isOwnIncomingTransfer(campaignId));
+          && (isCampaignMasterById(campaignId) || isOwnIncomingTransfer(campaignId, docId));
         allow update, delete: if isCampaignMasterById(campaignId);
       }
 
+      match /scenes/{docId} {
+        allow read, create, update, delete: if isCampaignMasterById(campaignId);
+      }
+
       match /{subcollection}/{docId} {
-        allow read: if isCampaignMemberById(campaignId);
-        allow create, update, delete: if isCampaignMasterById(campaignId);
+        allow read: if subcollection != 'scenes'
+          && isCampaignMemberById(campaignId);
+        allow create, update, delete: if subcollection != 'scenes'
+          && isCampaignMasterById(campaignId);
       }
     }
   }

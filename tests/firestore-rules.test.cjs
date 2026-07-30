@@ -14,6 +14,8 @@ const {
 const {
   arrayUnion,
   doc,
+  getDoc,
+  runTransaction,
   setDoc,
   updateDoc
 } = require("firebase/firestore");
@@ -65,6 +67,18 @@ async function run() {
         inventory: [],
         _order: 0
       });
+      await setDoc(doc(db, "campaigns", "room-1", "characters", "char-2"), {
+        id: "char-2",
+        name: "Orion",
+        controllerPlayerId: null,
+        health: 10,
+        healthMax: 10,
+        sanity: 8,
+        sanityMax: 8,
+        skills: [],
+        inventory: [],
+        _order: 1
+      });
     });
 
     const prepared = testEnv.authenticatedContext("player-auth", { email: "ana@example.com" }).firestore();
@@ -111,16 +125,79 @@ async function run() {
       fromPlayerId: "player-1",
       fromCharacterId: "char-1",
       toCharacterId: "char-2",
+      type: "item",
+      inventoryId: "inv-1",
+      quantity: 1,
       itemName: "Pocao",
       status: "pending",
       _order: 0
+    }));
+
+    await assertFails(setDoc(doc(prepared, "campaigns", "room-1", "itemTransfers", "transfer-forged"), {
+      id: "transfer-forged",
+      fromPlayerId: "player-1",
+      fromCharacterId: "another-character",
+      toCharacterId: "char-2",
+      type: "item",
+      inventoryId: "inv-1",
+      quantity: 1,
+      itemName: "Item alheio",
+      status: "pending",
+      _order: 1
+    }));
+
+    await assertFails(updateDoc(doc(prepared, "campaigns", "room-1", "itemTransfers", "transfer-1"), {
+      status: "approved"
+    }));
+
+    await assertSucceeds(updateDoc(doc(master, "campaigns", "room-1", "itemTransfers", "transfer-1"), {
+      status: "approved",
+      resolvedBy: "master-auth"
     }));
 
     await assertSucceeds(updateDoc(doc(master, "campaigns", "room-1", "characters", "char-1"), {
       inventory: [{ id: "inv-1", name: "Pocao", quantity: 1 }]
     }));
 
-    console.log("Firestore rules: 8 permission checks passed.");
+    await assertSucceeds(runTransaction(master, async transaction => {
+      const campaignRef = doc(master, "campaigns", "room-1");
+      const playerRef = doc(master, "campaigns", "room-1", "players", "player-1");
+      const previousCharacterRef = doc(master, "campaigns", "room-1", "characters", "char-1");
+      const nextCharacterRef = doc(master, "campaigns", "room-1", "characters", "char-2");
+      await transaction.get(playerRef);
+      await transaction.get(previousCharacterRef);
+      await transaction.get(nextCharacterRef);
+      transaction.update(playerRef, {
+        characterId: "char-2",
+        characterLinkUpdatedAt: new Date().toISOString(),
+        characterLinkUpdatedBy: "master-auth"
+      });
+      transaction.update(previousCharacterRef, { controllerPlayerId: null });
+      transaction.update(nextCharacterRef, { controllerPlayerId: "player-1" });
+      transaction.update(campaignRef, { updatedAt: new Date().toISOString() });
+    }));
+
+    await assertSucceeds(updateDoc(doc(prepared, "campaigns", "room-1", "players", "player-1"), {
+      online: false,
+      lastSeen: new Date().toISOString()
+    }));
+
+    await assertSucceeds(updateDoc(doc(prepared, "campaigns", "room-1", "characters", "char-2"), {
+      health: 9
+    }));
+
+    await assertSucceeds(setDoc(doc(master, "campaigns", "room-1", "scenes", "scene-1"), {
+      id: "scene-1",
+      title: "Entrada",
+      image: "https://example.com/scene.jpg",
+      masterNotes: "Informacao privada",
+      _order: 0
+    }));
+
+    await assertFails(getDoc(doc(prepared, "campaigns", "room-1", "scenes", "scene-1")));
+    await assertSucceeds(getDoc(doc(master, "campaigns", "room-1", "scenes", "scene-1")));
+
+    console.log("Firestore rules: 17 permission checks passed.");
   } finally {
     await testEnv.cleanup();
   }

@@ -44,13 +44,171 @@ let saveAgainAfterCurrent = false;
 let syncStatus = "Carregando Firebase...";
 let presenceTimer = null;
 let presenceContext = null;
+let sessionRestoreCompleted = false;
+const resolvingTransfers = new Set();
+const linkingPlayers = new Set();
+const selectedSceneIds = new Map();
+let sceneUploadInProgress = false;
+
+const SESSION_STORAGE_KEY = "cdi_session_context_v2";
+const MASTER_VIEWS = new Set([
+  "messages", "room", "scenes", "home", "campaigns", "campaign", "characters",
+  "skills", "diceLogs", "cases", "creatures", "items", "evidence", "marks",
+  "transfers", "players", "settings"
+]);
+const PLAYER_VIEWS = new Set(["messages", "room", "scenes", "sheet", "inventory", "evidencePlayer", "transferPlayer"]);
 
 const root = document.getElementById("root");
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const usingFirebase = () => Boolean(window.CDIFirebase?.enabled);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 const jsArg = value => esc(JSON.stringify(String(value ?? "")));
-const imgInput = (id, label) => `<label>${label}</label><input id="${id}" type="file" accept="image/*">`;
+
+function entityVisual(src, label, className = "avatar") {
+  const name = String(label || "Imagem");
+  if (src) {
+    return `<img class="${className} entity-visual-image" src="${esc(src)}" alt="${esc(name)}" loading="lazy" style="cursor:pointer;" onclick="openImageModal(${jsArg(src)}, ${jsArg(name)})">`;
+  }
+  const initial = name.trim().slice(0, 1).toUpperCase() || "?";
+  return `<div class="${className} entity-visual-fallback" role="img" aria-label="${esc(name)}"><span>${esc(initial)}</span></div>`;
+}
+
+function imgInput(id, label, currentImage = "", required = false) {
+  return `
+    <div class="image-upload-field">
+      <label>${esc(label)}${required ? `<span class="required-marker"> *</span>` : ""}</label>
+      <div id="${id}Preview" class="image-upload-preview">${entityVisual(currentImage, label, "image-preview-visual")}</div>
+      <input id="${id}" type="file" accept="image/*" ${required && !currentImage ? "required" : ""} ${required ? `aria-required="true"` : ""} onchange="previewImageInput(this, '${id}Preview')">
+    </div>`;
+}
+
+function previewImageInput(input, previewId) {
+  const file = input?.files?.[0];
+  const preview = document.getElementById(previewId);
+  if (!file || !preview) return;
+  const reader = new FileReader();
+  reader.onload = event => {
+    const image = document.createElement("img");
+    image.className = "image-preview-visual entity-visual-image";
+    image.alt = "Previa da imagem selecionada";
+    image.src = event.target.result;
+    preview.replaceChildren(image);
+  };
+  reader.readAsDataURL(file);
+}
+
+function readSessionContext() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SESSION_STORAGE_KEY) || "null");
+    return saved && typeof saved === "object" ? saved : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function clearSessionContext() {
+  localStorage.removeItem(SESSION_STORAGE_KEY);
+}
+
+function allowedSessionView(role, view) {
+  const allowed = role === "master" ? MASTER_VIEWS : PLAYER_VIEWS;
+  const fallback = role === "master" ? "home" : "sheet";
+  return allowed.has(view) ? view : fallback;
+}
+
+function persistSessionContext() {
+  if (!session.role) return;
+  const authUid = firebaseUser?.uid || window.CDIFirebase?.currentUser?.uid || null;
+  const context = {
+    mode: usingFirebase() ? "firebase" : "local",
+    authUid,
+    role: session.role,
+    campaignId: session.campaign?.id || null,
+    playerId: session.player?.id || null,
+    masterId: session.currentMaster?.id || null,
+    view: allowedSessionView(session.role, session.view),
+    savedAt: new Date().toISOString()
+  };
+  localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(context));
+}
+
+function restoreFirebaseSession(user, profile) {
+  if (!user || session.role) return false;
+  const saved = readSessionContext();
+  const savedBelongsToUser = saved?.mode === "firebase" && saved.authUid === user.uid;
+  const role = savedBelongsToUser ? saved.role : profile?.role;
+
+  if (role === "master") {
+    const campaigns = state.campaigns.filter(campaign => campaign.masterId === user.uid);
+    const campaign = campaigns.find(entry => entry.id === saved?.campaignId) || campaigns[0] || null;
+    session = {
+      role: "master",
+      campaign,
+      player: null,
+      currentMaster: profile || { id: user.uid, name: user.displayName || user.email, email: user.email, role: "master" },
+      view: allowedSessionView("master", savedBelongsToUser ? saved.view : "home")
+    };
+    if (!campaign && !["home", "campaigns", "settings"].includes(session.view)) session.view = "home";
+    persistSessionContext();
+    return true;
+  }
+
+  if (role === "player") {
+    const candidates = state.campaigns.filter(campaign => campaign.players?.some(player => player.authUid === user.uid));
+    const campaign = candidates.find(entry => entry.id === saved?.campaignId) || candidates[0] || null;
+    const player = campaign?.players.find(entry => entry.id === saved?.playerId || entry.authUid === user.uid) || null;
+    if (!campaign || !player) return false;
+    session = {
+      role: "player",
+      campaign,
+      player,
+      currentMaster: null,
+      view: allowedSessionView("player", savedBelongsToUser ? saved.view : "sheet")
+    };
+    persistSessionContext();
+    startPlayerPresence();
+    return true;
+  }
+
+  return false;
+}
+
+function restoreLocalSession() {
+  if (session.role) return true;
+  const saved = readSessionContext();
+  if (saved?.mode !== "local") return false;
+
+  if (saved.role === "master") {
+    const master = state.masters.find(entry => entry.id === saved.masterId);
+    if (!master) return false;
+    const campaigns = state.campaigns.filter(campaign => campaign.masterId === master.id);
+    session = {
+      role: "master",
+      campaign: campaigns.find(entry => entry.id === saved.campaignId) || campaigns[0] || null,
+      player: null,
+      currentMaster: master,
+      view: allowedSessionView("master", saved.view)
+    };
+    return true;
+  }
+
+  if (saved.role === "player") {
+    const campaign = state.campaigns.find(entry => entry.id === saved.campaignId);
+    const player = campaign?.players.find(entry => entry.id === saved.playerId);
+    if (!campaign || !player) return false;
+    session = {
+      role: "player",
+      campaign,
+      player,
+      currentMaster: null,
+      view: allowedSessionView("player", saved.view)
+    };
+    updateLocalPlayerPresence(true);
+    return true;
+  }
+
+  return false;
+}
 
 function normalizeCampaign(c) {
   if (!c) return c;
@@ -128,6 +286,22 @@ function queueCampaignSave() {
   if (!usingFirebase() || isApplyingRemoteState || !session.campaign?.id) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(flushCampaignSave, 150);
+}
+
+async function flushBeforeAtomicCampaignMutation() {
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  while (isCampaignSaveInFlight) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  saveAgainAfterCurrent = false;
+  await flushCampaignSave();
+  while (isCampaignSaveInFlight) {
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  clearTimeout(saveTimer);
+  saveTimer = null;
+  saveAgainAfterCurrent = false;
 }
 
 const save = () => {
@@ -298,6 +472,14 @@ window.addEventListener("keydown", (e) => {
     const modals = document.querySelectorAll(".modal");
     if (modals.length > 0) modals[modals.length - 1].remove();
   }
+
+  const target = e.target;
+  const isEditing = target?.matches?.("input, textarea, select, [contenteditable='true']");
+  if (isEditing || document.querySelector(".modal") || session.role !== "master" || session.view !== "scenes") return;
+  if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+    e.preventDefault();
+    stepMasterScene(e.key === "ArrowLeft" ? -1 : 1);
+  }
 });
 
 window.addEventListener("cdi-firebase-ready", initFirebaseBridge);
@@ -308,6 +490,8 @@ async function initFirebaseBridge() {
   if (!usingFirebase()) {
     normalizeState();
     persistLocal();
+    restoreLocalSession();
+    sessionRestoreCompleted = true;
     return render();
   }
 
@@ -332,8 +516,10 @@ async function initFirebaseBridge() {
       await stopPlayerPresence(false);
       session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
       state.campaigns = [];
+      persistLocal();
       lastSavedCampaignJson = "";
       lastRemoteCampaignJson = "";
+      sessionRestoreCompleted = true;
       return render();
     }
 
@@ -348,6 +534,9 @@ async function initFirebaseBridge() {
       isApplyingRemoteState = true;
       state.campaigns = campaigns.map(normalizeCampaign);
       persistLocal();
+
+      if (!session.role) restoreFirebaseSession(user, firebaseProfile);
+      sessionRestoreCompleted = true;
 
       if (session.campaign) {
         const updated = findCampaign(session.campaign.id);
@@ -370,11 +559,11 @@ async function initFirebaseBridge() {
       toast("Falha ao acompanhar campanhas em tempo real.");
     });
 
-    if (!session.role) render();
+    if (!session.role && sessionRestoreCompleted) render();
   });
 }
 
-function readImg(file) {
+function readImg(file, maxSize = 800) {
   return new Promise(resolve => {
     if (!file) return resolve("");
     const fr = new FileReader();
@@ -382,7 +571,6 @@ function readImg(file) {
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement("canvas");
-        const maxSize = 800;
         let width = img.width, height = img.height;
         if (width > height && width > maxSize) { height *= maxSize / width; width = maxSize; }
         else if (height > maxSize) { width *= maxSize / height; height = maxSize; }
@@ -405,8 +593,10 @@ function readImg(file) {
           resolve(canvas.toDataURL("image/jpeg", 0.8));
         }
       };
+      img.onerror = () => resolve("");
       img.src = e.target.result;
     };
+    fr.onerror = () => resolve("");
     fr.readAsDataURL(file);
   });
 }
@@ -417,7 +607,7 @@ function openImageModal(imgSrc, title = "Visualizar Imagem") {
     <div class="modal" onclick="this.remove()">
       <div class="modalbox" style="text-align:center; max-width:90vw;" onclick="event.stopPropagation()">
         <h3>${esc(title)}</h3>
-        <img src="${imgSrc}" style="max-width:100%; max-height:70vh; border-radius:8px; object-fit:contain; margin-top:10px; cursor:pointer;" onclick="this.closest('.modal').remove()">
+        <img src="${esc(imgSrc)}" alt="${esc(title)}" style="max-width:100%; max-height:70vh; border-radius:8px; object-fit:contain; margin-top:10px; cursor:pointer;" onclick="this.closest('.modal').remove()">
         <br><br>
         <button class="secondary" onclick="this.closest('.modal').remove()">Fechar</button>
       </div>
@@ -658,6 +848,7 @@ function nav() {
   const items = m ? [
     ["messages","Mensagens"],
     ["room","Sala"],
+    ["scenes","Cenas"],
     ["home","🏠 Visão Geral"], ["campaigns","📚 Campanhas"], ["characters","👤 Personagens"],
     ["skills","🎯 Habilidades"], ["diceLogs","🎲 Histórico"], ["cases","📁 Casos"],
     ["creatures","👹 Criaturas"], ["items","🎒 Itens"], ["evidence","🔎 Evidências"],
@@ -665,6 +856,7 @@ function nav() {
   ] : [
     ["messages","Mensagens"],
     ["room","Sala"],
+    ["scenes","Cenas"],
     ["sheet","👤 Meu Personagem"], ["inventory","🎒 Inventário"], ["evidencePlayer","🔎 Evidências"], ["transferPlayer","🤝 Dar Item/Evidência"]
   ];
 
@@ -690,6 +882,7 @@ async function logout() {
   lastSavedCampaignJson = "";
   lastRemoteCampaignJson = "";
   saveAgainAfterCurrent = false;
+  clearSessionContext();
   if (usingFirebase()) {
     await window.CDIFirebase.signOut();
   }
@@ -699,6 +892,7 @@ async function logout() {
 
 function render() {
   if (!session.role) return home();
+  persistSessionContext();
   const c = session.campaign;
   if (c) {
     c.scenes ??= [];
@@ -731,7 +925,7 @@ function masterBody() {
   if (!c) return `<h2>Visão Geral</h2><p class="muted">Nenhuma campanha criada.</p><button onclick="newCampaign()">➕ Criar Campanha</button>`;
 
   const views = {
-    messages: messagesPage, room: roomPage, characters: charactersPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
+    messages: messagesPage, room: roomPage, scenes: masterScenesPage, characters: charactersPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
     cases: () => recordsPage("cases", "📁 Casos"), creatures: creaturesPage,
     items: itemsMasterPage, evidence: evidencePage, marks: marksPage, players: playersPage
   };
@@ -761,18 +955,21 @@ function masterTransfersPage() {
     <h3>⏳ Solicitações Pendentes</h3>
     <div class="grid" style="margin-top:15px;">
       ${pending.length === 0 ? '<p class="muted">Nenhuma solicitação pendente no momento.</p>' : ''}
-      ${pending.map(t => `
-        <div class="card" style="border-left: 4px solid var(--accent);">
-          ${t.image ? `<img class="avatar" src="${t.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(t.image)}, ${jsArg(t.itemName)})">` : ""}
-          <h3>${esc(t.itemName)}</h3>
-          <p class="muted">Tipo: <b>${t.type === 'item' ? 'Item' : 'Evidência'}</b></p>
-          <p>De: <b>${esc(t.fromName)}</b> ➡️ Para: <b>${esc(t.toName)}</b></p>
-          <p style="font-size:13px; margin: 8px 0;"><i>"${esc(t.message || 'Sem observações')}"</i></p>
-          <div style="display:flex; gap:8px; margin-top:10px;">
-            <button onclick="resolveTransfer('${t.id}', 'approved')">✅ Aprovar</button>
-            <button class="danger" onclick="resolveTransfer('${t.id}', 'rejected')">❌ Rejeitar</button>
-          </div>
-        </div>`).join("")}
+      ${pending.map(t => {
+        const resolving = resolvingTransfers.has(String(t.id));
+        return `
+          <div class="card" style="border-left: 4px solid var(--accent);">
+            ${entityVisual(t.image, t.itemName)}
+            <h3>${esc(t.itemName)}</h3>
+            <p class="muted">Tipo: <b>${t.type === 'item' ? 'Item' : 'Evidência'}</b>${t.type === "item" ? ` · Quantidade: <b>${Math.max(1, Number(t.quantity) || 1)}</b>` : ""}</p>
+            <p>De: <b>${esc(t.fromName)}</b> ➡️ Para: <b>${esc(t.toName)}</b></p>
+            <p style="font-size:13px; margin: 8px 0;"><i>"${esc(t.message || 'Sem observações')}"</i></p>
+            <div style="display:flex; gap:8px; margin-top:10px;">
+              <button ${resolving ? "disabled" : ""} onclick="resolveTransfer('${t.id}', 'approved')">${resolving ? "Processando..." : "✅ Aprovar"}</button>
+              <button class="danger" ${resolving ? "disabled" : ""} onclick="resolveTransfer('${t.id}', 'rejected')">❌ Rejeitar</button>
+            </div>
+          </div>`;
+      }).join("")}
     </div>
 
     <h3 style="margin-top:30px;">📜 Histórico de Transferências</h3>
@@ -780,6 +977,7 @@ function masterTransfersPage() {
       ${history.length === 0 ? '<p class="muted">Nenhum histórico registrado.</p>' : ''}
       ${history.map(t => `
         <div class="card" style="opacity: 0.8;">
+          ${entityVisual(t.image, t.itemName)}
           <h3>${esc(t.itemName)} (${t.status === 'approved' ? '✅ Aprovado' : '❌ Rejeitado'})</h3>
           <p>De: <b>${esc(t.fromName)}</b> ➡️ Para: <b>${esc(t.toName)}</b></p>
           <span class="muted" style="font-size:11px;">${t.time}</span>
@@ -787,14 +985,33 @@ function masterTransfersPage() {
     </div>`;
 }
 
-function resolveTransfer(transferId, status) {
+async function resolveTransfer(transferId, status) {
   const c = session.campaign;
-  const t = c.itemTransfers.find(x => x.id === transferId);
-  if (!t) return;
+  const t = c.itemTransfers.find(x => String(x.id) === String(transferId));
+  if (!t || t.status !== "pending" || resolvingTransfers.has(String(transferId))) return;
+  if (!['approved', 'rejected'].includes(status)) return;
 
-  if (status === 'approved') {
-    if (t.type === 'item' && t.fromCharacterId && t.toCharacterId && t.inventoryId) {
-      try {
+  resolvingTransfers.add(String(transferId));
+  render();
+  let resolvedStatus = status;
+  let wasAlreadyResolved = false;
+  try {
+    if (usingFirebase() && window.CDIFirebase?.resolveItemTransfer) {
+      const result = await window.CDIFirebase.resolveItemTransfer(c.id, transferId, status);
+      if (result?.transfer) Object.assign(t, result.transfer);
+      resolvedStatus = result?.transfer?.status || status;
+      wasAlreadyResolved = Boolean(result?.alreadyResolved);
+      if (result?.sourceCharacter) {
+        const sourceCharacter = c.characters.find(entry => entry.id === result.sourceCharacter.id);
+        if (sourceCharacter) sourceCharacter.inventory = result.sourceCharacter.inventory;
+      }
+      if (result?.targetCharacter) {
+        const targetCharacter = c.characters.find(entry => entry.id === result.targetCharacter.id);
+        if (targetCharacter) targetCharacter.inventory = result.targetCharacter.inventory;
+      }
+      persistLocal();
+    } else {
+      if (status === 'approved' && t.type === 'item' && t.fromCharacterId && t.toCharacterId && t.inventoryId) {
         tabletop.transferInventoryItem(
           c,
           t.fromCharacterId,
@@ -803,35 +1020,38 @@ function resolveTransfer(transferId, status) {
           t.quantity || 1,
           uid
         );
-      } catch (err) {
-        return alert(`Nao foi possivel concluir a transferencia: ${err.message}`);
+      } else if (status === 'approved' && t.type === 'item') {
+        let targetItem = c.items.find(i => i.name.toLowerCase() === t.itemName.toLowerCase());
+        if (!targetItem) {
+          c.items.push({ id: uid(), name: t.itemName, description: t.description || "Item transferido.", revealed: true, image: t.image || "" });
+        } else {
+          targetItem.revealed = true;
+        }
+      } else if (status === 'approved' && t.type === 'evidence') {
+        let targetEv = c.evidence.find(e => e.name.toLowerCase() === t.itemName.toLowerCase());
+        if (!targetEv) {
+          c.evidence.push({ id: uid(), name: t.itemName, description: t.description || "Evidência transferida.", revealed: true, image: t.image || "" });
+        } else {
+          targetEv.revealed = true;
+        }
       }
-    } else if (t.type === 'item') {
-      let targetItem = c.items.find(i => i.name.toLowerCase() === t.itemName.toLowerCase());
-      if (!targetItem) {
-        c.items.push({ id: uid(), name: t.itemName, description: t.description || "Item transferido.", revealed: true, image: t.image || "" });
-      } else {
-        targetItem.revealed = true;
-      }
-    } else if (t.type === 'evidence') {
-      let targetEv = c.evidence.find(e => e.name.toLowerCase() === t.itemName.toLowerCase());
-      if (!targetEv) {
-        c.evidence.push({ id: uid(), name: t.itemName, description: t.description || "Evidência transferida.", revealed: true, image: t.image || "" });
-      } else {
-        targetEv.revealed = true;
-      }
+
+      t.status = status;
+      t.resolvedAt = new Date().toISOString();
+      t.resolvedBy = session.currentMaster?.id || "local-master";
+      t.time = new Date().toLocaleString("pt-BR");
+      save();
     }
-    toast("Transferencia aprovada e aplicada!");
-  } else {
-    toast("Transferencia rejeitada.");
+    toast(wasAlreadyResolved
+      ? `A solicitacao ja estava ${resolvedStatus === "approved" ? "aprovada" : "rejeitada"}.`
+      : (resolvedStatus === "approved" ? "Transferencia aprovada e aplicada!" : "Transferencia rejeitada."));
+  } catch (err) {
+    console.error(err);
+    alert(`Nao foi possivel concluir a transferencia: ${err.message}`);
+  } finally {
+    resolvingTransfers.delete(String(transferId));
+    render();
   }
-
-  t.status = status;
-  const now = new Date();
-  t.time = `${now.toLocaleDateString()} ${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`;
-
-  save();
-  render();
 }
 
 function masterSkillsManagerPage() {
@@ -1109,7 +1329,7 @@ function charactersPage() {
         const controller = c.players.find(player => player.id === x.controllerPlayerId && player.characterId === x.id);
         return `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          ${entityVisual(x.image, x.name)}
           <h3>${esc(x.name)}</h3><span class="tag">${esc(x.origin)}</span>
           <p style="margin-top:8px;">❤️ ${x.health}/${x.healthMax} · 🧠 ${x.sanity}/${x.sanityMax}</p><br>
           <p class="muted">${controller ? `Controlado por ${esc(controller.name)}` : "Sem jogador vinculado"} · ${x.inventory.length} item${x.inventory.length === 1 ? "" : "s"}</p>
@@ -1129,9 +1349,8 @@ function characterModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>👑 Ficha (Mestre)</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="cname" value="${esc(x.name)}">
-      ${imgInput("photo", "Imagem")}
+      ${imgInput("photo", "Foto do personagem", x.image)}
       <label>Origem</label><select id="origin">${ORIGINS.map(o => `<option ${o === x.origin ? "selected" : ""}>${o}</option>`).join("")}</select>
       <div class="two">
         <div><label>Saúde Máx</label><input id="hm" type="number" value="${x.healthMax}"></div>
@@ -1270,9 +1489,7 @@ function roomPage() {
     <div class="participant-grid">
       ${participants.map(({ player, character, presence }) => `
         <article class="participant-card">
-          ${character.image
-            ? `<img class="participant-avatar" src="${character.image}" alt="${esc(character.name)}">`
-            : `<div class="participant-avatar participant-avatar-fallback" aria-hidden="true">${esc(character.name.slice(0, 1).toUpperCase())}</div>`}
+          ${entityVisual(character.image, character.name, "participant-avatar")}
           <div class="participant-info">
             <div class="participant-title">
               <h3>${esc(character.name)}</h3>
@@ -1292,11 +1509,262 @@ function roomPage() {
     </div>`;
 }
 
+function selectedMasterScene(campaign = session.campaign) {
+  if (!campaign) return null;
+  campaign.scenes ??= [];
+  const rememberedId = selectedSceneIds.get(campaign.id);
+  const scene = campaign.scenes.find(entry => entry.id === rememberedId)
+    || campaign.scenes.find(entry => entry.id === campaign.liveScene?.sceneId)
+    || campaign.scenes[0]
+    || null;
+  if (scene) selectedSceneIds.set(campaign.id, scene.id);
+  return scene;
+}
+
+function masterScenesPage() {
+  const campaign = session.campaign;
+  const scenes = campaign.scenes || [];
+  const selected = selectedMasterScene(campaign);
+  const selectedIndex = selected ? scenes.findIndex(scene => scene.id === selected.id) : -1;
+  const isPresenting = Boolean(campaign.liveScene?.active);
+
+  return `
+    <div class="page-heading scenes-heading">
+      <div>
+        <h2>Cenas</h2>
+        <p class="muted">${scenes.length} imagem${scenes.length === 1 ? "" : "s"} no roteiro</p>
+      </div>
+      <div class="scene-heading-actions">
+        <input id="sceneImageFiles" class="visually-hidden" type="file" accept="image/*" multiple onchange="addSceneImages(this.files)">
+        <label class="button-label ${sceneUploadInProgress ? "is-disabled" : ""}" for="sceneImageFiles">${sceneUploadInProgress ? "Enviando..." : "Adicionar imagens"}</label>
+      </div>
+    </div>
+
+    ${selected ? `
+      <div class="scene-workspace">
+        <section class="scene-presentation-panel">
+          <figure id="sceneStage" class="scene-stage">
+            <img src="${esc(selected.image)}" alt="${esc(selected.title)}">
+          </figure>
+          <div class="scene-controls" aria-label="Controles da apresentacao">
+            <button class="icon-button secondary" title="Cena anterior" aria-label="Cena anterior" onclick="stepMasterScene(-1)" ${selectedIndex <= 0 ? "disabled" : ""}>←</button>
+            <span class="scene-counter">${selectedIndex + 1} / ${scenes.length}</span>
+            <button class="icon-button secondary" title="Proxima cena" aria-label="Proxima cena" onclick="stepMasterScene(1)" ${selectedIndex >= scenes.length - 1 ? "disabled" : ""}>→</button>
+            <button onclick="toggleScenePresentation()">${isPresenting ? "Ocultar dos jogadores" : "Iniciar apresentacao"}</button>
+            <button class="icon-button secondary" title="Tela cheia" aria-label="Tela cheia" onclick="toggleSceneFullscreen()">⛶</button>
+            ${isPresenting ? `<span class="status-chip status-online"><span class="presence-dot"></span>Ao vivo</span>` : `<span class="status-chip status-offline">Oculta</span>`}
+          </div>
+
+          <div class="scene-editor">
+            <input id="sceneEditorId" type="hidden" value="${esc(selected.id)}">
+            <label>Titulo publico</label><input id="sceneTitle" value="${esc(selected.title)}">
+            <label>Legenda publica</label><textarea id="sceneCaption">${esc(selected.caption)}</textarea>
+            <label>Notas privadas do Mestre</label><textarea id="sceneMasterNotes">${esc(selected.masterNotes)}</textarea>
+            <div class="row-actions"><button onclick="saveSceneDetails()">Salvar cena</button></div>
+          </div>
+        </section>
+
+        <aside class="scene-deck" aria-label="Roteiro de cenas">
+          <div class="scene-deck-heading"><h3>Roteiro</h3><span class="muted">${scenes.length}</span></div>
+          <div class="scene-deck-list">
+            ${scenes.map((scene, index) => `
+              <article class="scene-deck-item ${scene.id === selected.id ? "is-selected" : ""} ${campaign.liveScene?.active && scene.id === campaign.liveScene.sceneId ? "is-live" : ""}" onclick="selectMasterScene(${jsArg(scene.id)})">
+                <img src="${esc(scene.image)}" alt="">
+                <div class="scene-deck-info">
+                  <strong>${esc(scene.title)}</strong>
+                  <span>${index + 1} / ${scenes.length}</span>
+                </div>
+                <div class="scene-deck-actions">
+                  <button class="icon-button secondary" title="Mover para cima" aria-label="Mover para cima" onclick="event.stopPropagation();moveScene(${jsArg(scene.id)}, -1)" ${index === 0 ? "disabled" : ""}>↑</button>
+                  <button class="icon-button secondary" title="Mover para baixo" aria-label="Mover para baixo" onclick="event.stopPropagation();moveScene(${jsArg(scene.id)}, 1)" ${index === scenes.length - 1 ? "disabled" : ""}>↓</button>
+                  <button class="icon-button danger" title="Excluir cena" aria-label="Excluir cena" onclick="event.stopPropagation();deleteScene(${jsArg(scene.id)})">×</button>
+                </div>
+              </article>`).join("")}
+          </div>
+        </aside>
+      </div>` : `
+      <div class="scene-empty-state">
+        <h3>Nenhuma cena adicionada</h3>
+        <p class="muted">Adicione uma ou mais imagens para montar o roteiro.</p>
+      </div>`}`;
+}
+
+function playerScenesPage() {
+  const live = session.campaign.liveScene || {};
+  if (!live.active || !live.image) {
+    return `
+      <div class="page-heading"><div><h2>Cenas</h2><p class="muted">A apresentacao esta oculta.</p></div></div>
+      <div class="scene-empty-state scene-waiting-state">
+        <h3>Aguardando o Mestre</h3>
+        <p class="muted">A cena aparecera aqui quando a apresentacao comecar.</p>
+      </div>`;
+  }
+
+  return `
+    <div class="page-heading">
+      <div><h2>Cenas</h2><p class="muted">Apresentacao ao vivo</p></div>
+      <span class="status-chip status-online"><span class="presence-dot"></span>Ao vivo</span>
+    </div>
+    <section class="player-scene-view">
+      <figure id="sceneStage" class="scene-stage player-scene-stage" onclick="toggleSceneFullscreen()">
+        <img src="${esc(live.image)}" alt="${esc(live.title || "Cena atual")}">
+      </figure>
+      <div class="player-scene-caption">
+        <div><h3>${esc(live.title || "Cena atual")}</h3>${live.caption ? `<p>${esc(live.caption)}</p>` : ""}</div>
+        <div class="scene-player-actions">
+          ${live.total ? `<span class="scene-counter">${Math.min(live.total, Number(live.index || 0) + 1)} / ${live.total}</span>` : ""}
+          <button class="icon-button secondary" title="Tela cheia" aria-label="Tela cheia" onclick="event.stopPropagation();toggleSceneFullscreen()">⛶</button>
+        </div>
+      </div>
+    </section>`;
+}
+
+async function addSceneImages(fileList) {
+  const files = Array.from(fileList || []).filter(file => String(file.type || "").startsWith("image/"));
+  if (!files.length || sceneUploadInProgress) return;
+  const campaign = session.campaign;
+  sceneUploadInProgress = true;
+  render();
+  let added = 0;
+
+  try {
+    for (const file of files) {
+      const image = await readImg(file, 1600);
+      if (!image) continue;
+      const title = String(file.name || "")
+        .replace(/\.[^.]+$/, "")
+        .replace(/[_-]+/g, " ")
+        .trim() || `Cena ${campaign.scenes.length + 1}`;
+      const scene = tabletop.normalizeScene({ id: uid(), title, image, caption: "", masterNotes: "" }, uid);
+      campaign.scenes.push(scene);
+      if (!selectedSceneIds.has(campaign.id)) selectedSceneIds.set(campaign.id, scene.id);
+      added += 1;
+    }
+    if (added) {
+      if (campaign.liveScene?.active && campaign.liveScene.sceneId) {
+        tabletop.publishScene(campaign, campaign.liveScene.sceneId, { active: true });
+      }
+      save();
+      toast(`${added} cena${added === 1 ? " adicionada" : "s adicionadas"}.`);
+    } else {
+      alert("Nao foi possivel processar as imagens selecionadas.");
+    }
+  } finally {
+    sceneUploadInProgress = false;
+    render();
+  }
+}
+
+function selectMasterScene(sceneId) {
+  const campaign = session.campaign;
+  const scene = campaign.scenes.find(entry => entry.id === String(sceneId));
+  if (!scene) return;
+  selectedSceneIds.set(campaign.id, scene.id);
+  if (campaign.liveScene?.active) {
+    tabletop.publishScene(campaign, scene.id, { active: true });
+    save();
+  }
+  render();
+}
+
+function stepMasterScene(delta) {
+  const campaign = session.campaign;
+  const selected = selectedMasterScene(campaign);
+  if (!selected) return;
+  const index = campaign.scenes.findIndex(scene => scene.id === selected.id);
+  const nextIndex = Math.max(0, Math.min(campaign.scenes.length - 1, index + Number(delta || 0)));
+  if (nextIndex === index) return;
+  const nextScene = campaign.scenes[nextIndex];
+  selectedSceneIds.set(campaign.id, nextScene.id);
+  if (campaign.liveScene?.active) {
+    tabletop.publishScene(campaign, nextScene.id, { active: true });
+    save();
+  }
+  render();
+}
+
+function toggleScenePresentation() {
+  const campaign = session.campaign;
+  if (campaign.liveScene?.active) {
+    tabletop.setScenePresentationActive(campaign, false);
+    save();
+    render();
+    toast("Apresentacao ocultada.");
+    return;
+  }
+
+  const selected = selectedMasterScene(campaign);
+  if (!selected) return alert("Adicione uma cena antes de iniciar a apresentacao.");
+  tabletop.publishScene(campaign, selected.id, { active: true });
+  save();
+  render();
+  toast("Apresentacao iniciada.");
+}
+
+function saveSceneDetails() {
+  const campaign = session.campaign;
+  const sceneId = document.getElementById("sceneEditorId")?.value;
+  const scene = campaign.scenes.find(entry => entry.id === sceneId);
+  if (!scene) return;
+  scene.title = document.getElementById("sceneTitle").value.trim() || "Cena";
+  scene.caption = document.getElementById("sceneCaption").value.trim();
+  scene.masterNotes = document.getElementById("sceneMasterNotes").value.trim();
+  if (campaign.liveScene?.active && campaign.liveScene.sceneId === scene.id) {
+    tabletop.publishScene(campaign, scene.id, { active: true });
+  }
+  save();
+  render();
+  toast("Cena salva.");
+}
+
+function moveScene(sceneId, direction) {
+  const campaign = session.campaign;
+  const index = campaign.scenes.findIndex(scene => scene.id === String(sceneId));
+  const nextIndex = index + Number(direction || 0);
+  if (index < 0 || nextIndex < 0 || nextIndex >= campaign.scenes.length) return;
+  const [scene] = campaign.scenes.splice(index, 1);
+  campaign.scenes.splice(nextIndex, 0, scene);
+  if (campaign.liveScene?.active && campaign.liveScene.sceneId) {
+    tabletop.publishScene(campaign, campaign.liveScene.sceneId, { active: true });
+  }
+  save();
+  render();
+}
+
+function deleteScene(sceneId) {
+  const campaign = session.campaign;
+  const index = campaign.scenes.findIndex(scene => scene.id === String(sceneId));
+  if (index < 0 || !confirm("Excluir esta cena do roteiro?")) return;
+  const wasLive = campaign.liveScene?.active && campaign.liveScene.sceneId === String(sceneId);
+  campaign.scenes.splice(index, 1);
+  const fallback = campaign.scenes[Math.min(index, campaign.scenes.length - 1)] || null;
+  if (fallback) selectedSceneIds.set(campaign.id, fallback.id);
+  else selectedSceneIds.delete(campaign.id);
+
+  if (!campaign.scenes.length) {
+    tabletop.setScenePresentationActive(campaign, false);
+  } else if (wasLive) {
+    tabletop.publishScene(campaign, fallback.id, { active: true });
+  } else if (campaign.liveScene?.active) {
+    tabletop.publishScene(campaign, campaign.liveScene.sceneId, { active: true });
+  }
+  save();
+  render();
+}
+
+function toggleSceneFullscreen() {
+  const stage = document.getElementById("sceneStage");
+  if (!stage) return;
+  const action = document.fullscreenElement ? document.exitFullscreen?.() : stage.requestFullscreen?.();
+  action?.catch?.(() => toast("O navegador nao permitiu abrir em tela cheia."));
+}
+
 // --- PAINEL DO JOGADOR ---
 function playerBody() {
   const v = session.view;
   if (v === "messages") return messagesPage();
   if (v === "room") return roomPage();
+  if (v === "scenes") return playerScenesPage();
   const ch = session.campaign.characters.find(x => x.id === session.player.characterId);
   if (!ch) {
     return `
@@ -1315,6 +1783,11 @@ function transferPlayerPage(ch) {
   const myTransfers = c.itemTransfers.filter(t => t.fromPlayerId === session.player.id);
   const otherParticipants = (tabletop?.getControlledParticipants(c) || []).filter(entry => entry.character.id !== ch.id);
   const inventory = ch.inventory || [];
+  const inventoryAvailability = inventory.map(item => ({
+    ...item,
+    available: tabletop?.availableInventoryQuantity(c, ch.id, item.id) ?? item.quantity
+  }));
+  const hasTransferableItem = inventoryAvailability.some(item => item.available > 0);
   const visibleEvidence = (c.evidence || []).filter(entry => entry.revealed);
 
   return `
@@ -1331,10 +1804,11 @@ function transferPlayerPage(ch) {
 
       <div id="trItemFields">
         <label>Item</label>
-        <select id="trInventoryId" ${inventory.length ? "" : "disabled"}>
-          ${inventory.map(item => `<option value="${item.id}">${esc(item.name)} (${item.quantity}x)</option>`).join("") || `<option value="">Inventario vazio</option>`}
+        <select id="trInventoryId" onchange="syncTransferQuantityLimit()" ${hasTransferableItem ? "" : "disabled"}>
+          ${inventoryAvailability.map(item => `<option value="${item.id}" data-available="${item.available}" ${item.available > 0 ? "" : "disabled"}>${esc(item.name)} (${item.available} disponivel${item.available !== item.quantity ? ` de ${item.quantity}` : ""})</option>`).join("") || `<option value="">Inventario vazio</option>`}
         </select>
-        <label>Quantidade</label><input id="trQuantity" type="number" min="1" value="1">
+        <label>Quantidade</label><input id="trQuantity" type="number" min="1" max="${inventoryAvailability.find(item => item.available > 0)?.available || 1}" value="1" ${hasTransferableItem ? "" : "disabled"}>
+        ${inventory.length && !hasTransferableItem ? `<p class="muted">Todos os itens estao reservados em solicitacoes pendentes.</p>` : ""}
       </div>
 
       <div id="trEvidenceFields" hidden>
@@ -1362,8 +1836,9 @@ function transferPlayerPage(ch) {
       ${myTransfers.length === 0 ? '<p class="muted">Nenhuma solicitação enviada.</p>' : ''}
       ${myTransfers.map(t => `
         <div class="card" style="margin:0; opacity: 0.9;">
-          ${t.image ? `<img class="avatar" src="${t.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(t.image)}, ${jsArg(t.itemName)})">` : ""}
+          ${entityVisual(t.image, t.itemName)}
           <h3>${esc(t.itemName)} (${t.status === 'pending' ? '⏳ Pendente' : t.status === 'approved' ? '✅ Aprovado' : '❌ Rejeitado'})</h3>
+          ${t.type === "item" ? `<p class="muted">Quantidade: <b>${Math.max(1, Number(t.quantity) || 1)}</b></p>` : ""}
           <p class="muted">Para: <b>${esc(t.toName)}</b></p>
           <p style="font-size:12px;">${esc(t.message || '')}</p>
         </div>`).join("")}
@@ -1376,6 +1851,15 @@ function toggleTransferType() {
   const evidenceFields = document.getElementById("trEvidenceFields");
   if (itemFields) itemFields.hidden = !isItem;
   if (evidenceFields) evidenceFields.hidden = isItem;
+}
+
+function syncTransferQuantityLimit() {
+  const select = document.getElementById("trInventoryId");
+  const quantity = document.getElementById("trQuantity");
+  if (!select || !quantity) return;
+  const available = Math.max(0, Number(select.selectedOptions[0]?.dataset.available) || 0);
+  quantity.max = String(Math.max(1, available));
+  quantity.value = String(Math.min(Math.max(1, Number.parseInt(quantity.value, 10) || 1), Math.max(1, available)));
 }
 
 async function submitPlayerTransfer(fromCharacterId) {
@@ -1393,7 +1877,8 @@ async function submitPlayerTransfer(fromCharacterId) {
     if (!source) return alert("Escolha um item do seu inventario.");
     if (!toCharacter) return alert("Escolha o personagem que recebera o item.");
     quantity = Math.max(1, Number.parseInt(document.getElementById("trQuantity").value, 10) || 1);
-    if (quantity > source.quantity) return alert("A quantidade informada e maior que a disponivel.");
+    const available = tabletop?.availableInventoryQuantity(session.campaign, fromCharacter.id, source.id) ?? source.quantity;
+    if (quantity > available) return alert("A quantidade informada e maior que a disponivel. Verifique as solicitacoes pendentes.");
   } else {
     source = session.campaign.evidence.find(entry => entry.id === document.getElementById("trEvidenceId").value);
     if (!source) return alert("Escolha uma evidencia revelada.");
@@ -1432,9 +1917,13 @@ async function submitPlayerTransfer(fromCharacterId) {
 function sheetPlayer(ch) {
   ch.skills ??= [];
   return `
-    <h2>👤 ${esc(ch.name)}</h2>
-    ${ch.image ? `<img class="avatar" src="${ch.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(ch.image)}, ${jsArg(ch.name)})">` : ""}
-    <span class="tag">Origem: ${esc(ch.origin)}</span>
+    <div class="character-sheet-profile">
+      ${entityVisual(ch.image, ch.name, "character-sheet-portrait")}
+      <div class="character-sheet-identity">
+        <h2>${esc(ch.name)}</h2>
+        <span class="tag">Origem: ${esc(ch.origin)}</span>
+      </div>
+    </div>
     <div class="grid" style="margin-top:15px;">
       <div class="card"><h3>❤️ Saúde</h3><h2 id="val-health">${ch.health}/${ch.healthMax}</h2><div class="bar"><div id="bar-health" class="fill health" style="width:${(ch.health/ch.healthMax)*100}%"></div></div><button onclick="changeStatDirect('health',-1)">−</button><button onclick="changeStatDirect('health',1)">+</button></div>
       <div class="card"><h3>🧠 Sanidade</h3><h2 id="val-sanity">${ch.sanity}/${ch.sanityMax}</h2><div class="bar"><div id="bar-sanity" class="fill sanity" style="width:${(ch.sanity/ch.sanityMax)*100}%"></div></div><button onclick="changeStatDirect('sanity',-1)">−</button><button onclick="changeStatDirect('sanity',1)">+</button></div>
@@ -1476,6 +1965,22 @@ function changeStatDirect(key, delta) {
 }
 
 // --- ITENS, CASOS E EVIDÊNCIAS ---
+function missingItemPresentationFields(item) {
+  const missing = [];
+  if (!String(item?.name || "").trim()) missing.push("titulo");
+  if (!String(item?.description || "").trim()) missing.push("descricao");
+  if (!String(item?.image || "").trim()) missing.push("foto");
+  return missing;
+}
+
+function requireCompleteItemPresentation(item) {
+  const missing = missingItemPresentationFields(item);
+  if (missing.length) {
+    throw new Error(`Complete ${missing.join(", ")} antes de entregar este item.`);
+  }
+  return item;
+}
+
 function itemsMasterPage() {
   return `
     <h2>🎒 Itens</h2>
@@ -1483,7 +1988,7 @@ function itemsMasterPage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.items.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          ${entityVisual(x.image, x.name)}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <label style="margin-top:10px; display:flex; align-items:center; gap:5px; font-size:12px;">
@@ -1501,42 +2006,78 @@ function itemModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🎒 Item</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
-      <label>Nome</label><input id="itname" value="${esc(x.name)}">
-      <label>Descrição</label><textarea id="itdesc">${esc(x.description)}</textarea>
-      ${imgInput("itimg", "Foto do Item")}
+      <label>Nome<span class="required-marker"> *</span></label><input id="itname" value="${esc(x.name)}" required>
+      <label>Descrição<span class="required-marker"> *</span></label><textarea id="itdesc" required>${esc(x.description)}</textarea>
+      ${imgInput("itimg", "Foto do Item", x.image, true)}
       <label style="margin-top:10px; display:flex; align-items:center; gap:5px;">
         <input type="checkbox" id="itrev" ${x.revealed ? "checked" : ""}> Visível para Jogadores
       </label>
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
-      <button onclick="saveItemModal(${index})">Salvar</button>
+      <button onclick="saveItemModal(${index}, this)">Salvar</button>
     </div></div>`);
 }
 
-async function saveItemModal(index) {
+async function saveItemModal(index, button) {
   const isNew = index === null;
-  const x = isNew ? {} : session.campaign.items[index];
-  x.name = document.getElementById("itname").value || "Item";
-  x.description = document.getElementById("itdesc").value || "";
-  x.revealed = document.getElementById("itrev").checked;
+  const current = isNew ? null : session.campaign.items[index];
+  const name = document.getElementById("itname").value.trim();
+  const description = document.getElementById("itdesc").value.trim();
+  const imageFile = document.getElementById("itimg").files[0];
+  if (!name) return alert("Informe o titulo do item.");
+  if (!description) return alert("Informe a descricao do item.");
+  if (!imageFile && !current?.image) return alert("Selecione uma foto para o item.");
 
-  const im = await readImg(document.getElementById("itimg").files[0]);
-  if (im) x.image = im;
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Salvando...";
+  }
+  try {
+    const uploadedImage = imageFile ? await readImg(imageFile) : "";
+    const item = {
+      ...(current || {}),
+      name,
+      description,
+      image: uploadedImage || current?.image || "",
+      revealed: document.getElementById("itrev").checked
+    };
+    requireCompleteItemPresentation(item);
 
-  if (isNew) session.campaign.items.push(x);
-  save(); document.querySelector(".modal").remove(); render(); toast("Item salvo!");
+    if (isNew) session.campaign.items.push(item);
+    else Object.assign(current, item);
+    save();
+    (button?.closest(".modal") || document.querySelector(".modal"))?.remove();
+    render();
+    toast("Item salvo!");
+  } catch (err) {
+    console.error(err);
+    alert(err.message || "Nao foi possivel salvar o item.");
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "Salvar";
+    }
+  }
 }
 
 function deliverItemModal(itemIndex) {
   const item = session.campaign.items[itemIndex];
   const characters = session.campaign.characters;
   if (!item) return;
+  try {
+    requireCompleteItemPresentation(item);
+  } catch (err) {
+    return alert(err.message);
+  }
   if (!characters.length) return alert("Crie um personagem antes de entregar itens.");
 
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>Entregar ${esc(item.name)}</h2>
+      <div class="item-delivery-preview">
+        ${entityVisual(item.image, item.name, "item-delivery-image")}
+        <div><h3>${esc(item.name)}</h3><p>${esc(item.description)}</p></div>
+      </div>
       <label>Personagem</label>
       <select id="grantCharacterId">
         ${characters.map(character => {
@@ -1557,9 +2098,11 @@ function deliverItemModal(itemIndex) {
 }
 
 function saveItemGrant(itemIndex) {
+  if (session.role !== "master") return alert("Somente o Mestre pode entregar itens diretamente.");
   const item = session.campaign.items[itemIndex];
   const characterId = document.getElementById("grantCharacterId").value;
   try {
+    requireCompleteItemPresentation(item);
     tabletop.grantItem(session.campaign, characterId, item, {
       quantity: document.getElementById("grantQuantity").value,
       equipped: document.getElementById("grantEquipped").checked,
@@ -1575,6 +2118,7 @@ function saveItemGrant(itemIndex) {
 }
 
 function manageCharacterInventoryModal(characterId) {
+  if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
   const character = session.campaign.characters.find(entry => entry.id === characterId);
   if (!character) return;
   character.inventory ??= [];
@@ -1591,27 +2135,50 @@ function manageCharacterInventoryModal(characterId) {
         <h3>Adicionar do catalogo</h3>
         ${catalog.length ? `
           <div class="inventory-add-grid">
-            <select id="inventoryCatalogItem">${catalog.map(item => `<option value="${item.id}">${esc(item.name)}</option>`).join("")}</select>
+            <select id="inventoryCatalogItem">${catalog.map(item => {
+              const complete = missingItemPresentationFields(item).length === 0;
+              return `<option value="${item.id}" ${complete ? "" : "disabled"}>${esc(item.name)}${complete ? "" : " - cadastro incompleto"}</option>`;
+            }).join("")}</select>
             <input id="inventoryCatalogQuantity" type="number" min="1" value="1" aria-label="Quantidade">
             <button onclick="grantCatalogItemToCharacter('${character.id}')">Adicionar</button>
           </div>
           <label>Observacoes</label><input id="inventoryCatalogNotes" placeholder="Detalhes opcionais">`
           : `<p class="muted">Nenhum item cadastrado no catalogo.</p>`}
+
+        <div class="inventory-freeform">
+          <h3>Adicionar item livremente</h3>
+          <div class="inventory-freeform-grid">
+            <div><label>Nome<span class="required-marker"> *</span></label><input id="inventoryCustomName" placeholder="Nome do item" required></div>
+            <div><label>Quantidade<span class="required-marker"> *</span></label><input id="inventoryCustomQuantity" type="number" min="1" value="1" required></div>
+          </div>
+          <label>Descricao<span class="required-marker"> *</span></label><textarea id="inventoryCustomDescription" placeholder="Efeito, historia ou detalhes do item" required></textarea>
+          ${imgInput("inventoryCustomImage", "Foto do item", "", true)}
+          <label>Observacoes</label><input id="inventoryCustomNotes" placeholder="Carga, municao, estado ou detalhes especiais">
+          <div class="inventory-freeform-actions">
+            <label class="checkbox-field compact-checkbox"><input id="inventoryCustomEquipped" type="checkbox"> Entregar equipado</label>
+            <button onclick="grantCustomItemToCharacter('${character.id}', this)">Adicionar ao inventario</button>
+          </div>
+        </div>
       </section>
 
       <div class="inventory-manager-list">
         ${character.inventory.map(entry => `
           <div class="inventory-manager-row">
-            ${entry.image ? `<img src="${entry.image}" alt="${esc(entry.name)}">` : `<div class="inventory-item-fallback" aria-hidden="true">${esc(entry.name.slice(0, 1).toUpperCase())}</div>`}
+            <div class="inventory-manager-media">
+              ${imgInput(`invImage_${entry.id}`, "Foto do item", entry.image, true)}
+            </div>
             <div class="inventory-manager-main">
               <div class="card-title-row"><h3>${esc(entry.name)}</h3>${entry.equipped ? `<span class="status-chip status-online">Equipado</span>` : ""}</div>
-              <p>${esc(entry.description)}</p>
-              <div class="inventory-edit-grid">
-                <div><label>Quantidade</label><input id="invQty_${entry.id}" type="number" min="1" value="${entry.quantity}"></div>
+              <div class="inventory-primary-fields">
+                <div><label>Titulo<span class="required-marker"> *</span></label><input id="invName_${entry.id}" value="${esc(entry.name)}" required></div>
+                <div><label>Quantidade<span class="required-marker"> *</span></label><input id="invQty_${entry.id}" type="number" min="1" value="${entry.quantity}" required></div>
+              </div>
+              <label>Descricao<span class="required-marker"> *</span></label><textarea id="invDescription_${entry.id}" class="inventory-manager-description" required>${esc(entry.description)}</textarea>
+              <div class="inventory-notes-field">
                 <div><label>Observacoes</label><input id="invNotes_${entry.id}" value="${esc(entry.notes)}"></div>
               </div>
               <div class="row-actions">
-                <button onclick="saveInventoryEntry('${character.id}','${entry.id}')">Salvar</button>
+                <button onclick="saveInventoryEntry('${character.id}','${entry.id}', this)">Salvar</button>
                 <button class="secondary" onclick="toggleInventoryEquipped('${character.id}','${entry.id}')">${entry.equipped ? "Desequipar" : "Equipar"}</button>
                 <button class="danger" onclick="removeCharacterInventoryItem('${character.id}','${entry.id}')">Remover</button>
               </div>
@@ -1629,25 +2196,107 @@ function reopenInventoryManager(characterId, message) {
 }
 
 function grantCatalogItemToCharacter(characterId) {
+  if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
   const itemId = document.getElementById("inventoryCatalogItem")?.value;
   const item = session.campaign.items.find(entry => entry.id === itemId);
   if (!item) return alert("Selecione um item do catalogo.");
-  tabletop.grantItem(session.campaign, characterId, item, {
-    quantity: document.getElementById("inventoryCatalogQuantity").value,
-    notes: document.getElementById("inventoryCatalogNotes").value.trim()
-  }, uid);
-  reopenInventoryManager(characterId, "Item adicionado.");
+  try {
+    requireCompleteItemPresentation(item);
+    tabletop.grantItem(session.campaign, characterId, item, {
+      quantity: document.getElementById("inventoryCatalogQuantity").value,
+      notes: document.getElementById("inventoryCatalogNotes").value.trim()
+    }, uid);
+    reopenInventoryManager(characterId, "Item adicionado.");
+  } catch (err) {
+    alert(err.message || "Nao foi possivel adicionar o item.");
+  }
 }
 
-function saveInventoryEntry(characterId, inventoryId) {
-  tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, {
-    quantity: document.getElementById(`invQty_${inventoryId}`).value,
-    notes: document.getElementById(`invNotes_${inventoryId}`).value.trim()
-  });
-  reopenInventoryManager(characterId, "Inventario atualizado.");
+async function grantCustomItemToCharacter(characterId, button) {
+  if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
+  const name = document.getElementById("inventoryCustomName")?.value.trim();
+  const description = document.getElementById("inventoryCustomDescription")?.value.trim();
+  const quantity = Number.parseInt(document.getElementById("inventoryCustomQuantity")?.value, 10);
+  const imageFile = document.getElementById("inventoryCustomImage")?.files?.[0];
+  if (!name) return alert("Informe o nome do item.");
+  if (!description) return alert("Informe a descricao do item.");
+  if (!Number.isFinite(quantity) || quantity < 1) return alert("Informe uma quantidade valida.");
+  if (!imageFile) return alert("Selecione uma foto para o item.");
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Adicionando...";
+  }
+  try {
+    const image = await readImg(imageFile);
+    const item = {
+      name,
+      description,
+      image
+    };
+    requireCompleteItemPresentation(item);
+    tabletop.grantItem(session.campaign, characterId, item, {
+      quantity,
+      equipped: Boolean(document.getElementById("inventoryCustomEquipped")?.checked),
+      notes: document.getElementById("inventoryCustomNotes")?.value.trim() || "",
+      stack: false
+    }, uid);
+    reopenInventoryManager(characterId, "Item personalizado adicionado.");
+  } catch (err) {
+    console.error(err);
+    alert(err.message || "Nao foi possivel adicionar o item.");
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "Adicionar ao inventario";
+    }
+  }
+}
+
+async function saveInventoryEntry(characterId, inventoryId, button) {
+  if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
+  const character = session.campaign.characters.find(entry => entry.id === characterId);
+  const item = character?.inventory.find(entry => entry.id === inventoryId);
+  if (!item) return alert("Item do inventario nao encontrado.");
+
+  const name = document.getElementById(`invName_${inventoryId}`)?.value.trim();
+  const description = document.getElementById(`invDescription_${inventoryId}`)?.value.trim();
+  const quantity = Number.parseInt(document.getElementById(`invQty_${inventoryId}`)?.value, 10);
+  const imageFile = document.getElementById(`invImage_${inventoryId}`)?.files?.[0];
+  if (!name) return alert("Informe o titulo do item.");
+  if (!description) return alert("Informe a descricao do item.");
+  if (!Number.isFinite(quantity) || quantity < 1) return alert("Informe uma quantidade valida.");
+  if (!imageFile && !item.image) return alert("Selecione uma foto para o item.");
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Salvando...";
+  }
+  try {
+    const uploadedImage = imageFile ? await readImg(imageFile) : "";
+    const changes = {
+      name,
+      description,
+      image: uploadedImage || item.image || "",
+      quantity,
+      notes: document.getElementById(`invNotes_${inventoryId}`).value.trim()
+    };
+    requireCompleteItemPresentation(changes);
+    tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, changes);
+    reopenInventoryManager(characterId, "Inventario atualizado.");
+  } catch (err) {
+    console.error(err);
+    alert(err.message || "Nao foi possivel atualizar o item.");
+  } finally {
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "Salvar";
+    }
+  }
 }
 
 function toggleInventoryEquipped(characterId, inventoryId) {
+  if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
   const character = session.campaign.characters.find(entry => entry.id === characterId);
   const item = character?.inventory.find(entry => entry.id === inventoryId);
   if (!item) return;
@@ -1656,6 +2305,7 @@ function toggleInventoryEquipped(characterId, inventoryId) {
 }
 
 function removeCharacterInventoryItem(characterId, inventoryId) {
+  if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
   if (!confirm("Remover este item do inventario?")) return;
   tabletop.removeInventoryEntry(session.campaign, characterId, inventoryId);
   reopenInventoryManager(characterId, "Item removido.");
@@ -1668,7 +2318,7 @@ function recordsPage(key, title) {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign[key].map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          ${entityVisual(x.image, x.name)}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <button onclick="recordModal('${key}', ${i})">Editar</button>
@@ -1682,10 +2332,9 @@ function recordModal(key, index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>📁 Registro</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="rn" value="${esc(x.name)}">
       <label>Descrição</label><textarea id="rd">${esc(x.description)}</textarea>
-      ${imgInput("ri", "Foto / Documento")}
+      ${imgInput("ri", "Foto / Documento", x.image)}
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
       <button onclick="saveRecordModal('${key}', ${index})">Salvar</button>
@@ -1712,7 +2361,7 @@ function creaturesPage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.creatures.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          ${entityVisual(x.image, x.name)}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.appearance)}</p>
           <button onclick="creatureModal(${i})">Editar</button>
@@ -1726,10 +2375,9 @@ function creatureModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>👹 Criatura</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="crname" value="${esc(x.name)}">
       <label>Aparência / Detalhes</label><textarea id="crapp">${esc(x.appearance)}</textarea>
-      ${imgInput("crim", "Foto da Criatura")}
+      ${imgInput("crim", "Foto da Criatura", x.image)}
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
       <button onclick="saveCreatureModal(${index})">Salvar</button>
@@ -1756,7 +2404,7 @@ function evidencePage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.evidence.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          ${entityVisual(x.image, x.name)}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <label style="margin-top:10px; display:flex; align-items:center; gap:5px; font-size:12px;">
@@ -1773,10 +2421,9 @@ function evidenceModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🔎 Evidência</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="evname" value="${esc(x.name)}">
       <label>Descrição</label><textarea id="evdesc">${esc(x.description)}</textarea>
-      ${imgInput("evimg", "Foto da Evidência")}
+      ${imgInput("evimg", "Foto da Evidência", x.image)}
       <label style="margin-top:10px; display:flex; align-items:center; gap:5px;">
         <input type="checkbox" id="evrev" ${x.revealed ? "checked" : ""}> Visível para Jogadores
       </label>
@@ -1807,7 +2454,7 @@ function marksPage() {
     <div class="grid" style="margin-top:15px;">
       ${session.campaign.marks.map((x, i) => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          ${entityVisual(x.image, x.name)}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
           <button onclick="markModal(${i})">Editar</button>
@@ -1821,10 +2468,9 @@ function markModal(index = null) {
   root.insertAdjacentHTML("beforeend", `
     <div class="modal"><div class="modalbox">
       <h2>🏷️ Marca</h2>
-      ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
       <label>Nome</label><input id="mkname" value="${esc(x.name)}">
       <label>Descrição</label><textarea id="mkdesc">${esc(x.description)}</textarea>
-      ${imgInput("mkimg", "Foto da Marca")}
+      ${imgInput("mkimg", "Foto da Marca", x.image)}
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
       <button onclick="saveMarkModal(${index})">Salvar</button>
@@ -1860,6 +2506,7 @@ function playersPage() {
         const presence = tabletop?.presenceState(p) || "offline";
         return `
         <div class="card">
+          ${entityVisual(character?.image, character?.name || p.name, "player-card-image")}
           <div class="card-title-row">
             <h3>${esc(p.name)}</h3>
             <span class="status-chip ${p.authUid ? `status-${presence}` : "status-pending"}">${p.authUid ? (presence === "online" ? "Online" : presence === "away" ? "Ausente" : "Offline") : "Convite pendente"}</span>
@@ -1947,18 +2594,60 @@ function linkPlayerModal(playerIndex) {
       </select>
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
-      <button onclick="saveLinkPlayer(${playerIndex})">Salvar</button>
+      <button onclick="saveLinkPlayer(${playerIndex}, this)">Salvar</button>
     </div></div>`);
 }
 
-function saveLinkPlayer(playerIndex) {
+async function saveLinkPlayer(playerIndex, button) {
   const chId = document.getElementById("linkCharSel").value;
   const player = session.campaign.players[playerIndex];
+  const campaignId = session.campaign?.id;
+  const linkKey = `${campaignId}:${player?.id || ""}`;
+  if (!campaignId || !player || linkingPlayers.has(linkKey)) return;
+
+  linkingPlayers.add(linkKey);
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Salvando...";
+  }
   try {
-    tabletop.assignCharacter(session.campaign, player.id, chId || null);
-    save(); document.querySelector(".modal").remove(); render(); toast(chId ? "Vinculado com sucesso!" : "Vinculo removido.");
+    if (usingFirebase()) {
+      await flushBeforeAtomicCampaignMutation();
+      const result = await window.CDIFirebase.assignPlayerCharacter(campaignId, player.id, chId || null);
+      const currentCampaign = findCampaign(campaignId)
+        || (session.campaign?.id === campaignId ? session.campaign : null);
+      const currentPlayer = currentCampaign?.players.find(entry => entry.id === player.id);
+      if (currentCampaign && currentPlayer) {
+        const previousCharacter = currentCampaign.characters.find(character => character.id === result.previousCharacterId);
+        if (previousCharacter?.controllerPlayerId === currentPlayer.id && result.previousCharacterId !== result.player.characterId) {
+          previousCharacter.controllerPlayerId = null;
+        }
+        Object.assign(currentPlayer, result.player);
+        const nextCharacter = result.player.characterId
+          ? currentCampaign.characters.find(character => character.id === result.player.characterId)
+          : null;
+        if (nextCharacter) nextCharacter.controllerPlayerId = currentPlayer.id;
+        normalizeCampaign(currentCampaign);
+        persistLocal();
+        persistSessionContext();
+        if (session.campaign?.id === campaignId) lastSavedCampaignJson = JSON.stringify(currentCampaign);
+      }
+    } else {
+      tabletop.assignCharacter(session.campaign, player.id, chId || null);
+      save();
+    }
+    button?.closest(".modal")?.remove();
+    render();
+    toast(chId ? "Vinculado com sucesso!" : "Vinculo removido.");
   } catch (err) {
+    console.error(err);
     alert(err.message);
+  } finally {
+    linkingPlayers.delete(linkKey);
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "Salvar";
+    }
   }
 }
 
@@ -1986,34 +2675,117 @@ function del(key, i) {
   save(); render();
 }
 
+const INVENTORY_BASE_SLOTS = 24;
+const INVENTORY_COLUMNS = 6;
+
+function inventorySlotVisual(item) {
+  if (item.image) {
+    return `<img class="inventory-slot-image" src="${esc(item.image)}" alt="" loading="lazy">`;
+  }
+  const initial = String(item.name || "?").trim().slice(0, 1).toUpperCase() || "?";
+  return `<span class="inventory-slot-fallback" aria-hidden="true">${esc(initial)}</span>`;
+}
+
+function inventoryItemDetails(item) {
+  if (!item) {
+    return `
+      <div class="inventory-detail-empty">
+        <span aria-hidden="true"><b>?</b></span>
+        <h3>Mochila vazia</h3>
+        <p>Nenhum item carregado.</p>
+      </div>`;
+  }
+
+  const quantity = Math.max(1, Number(item.quantity) || 1);
+  return `
+    <div class="inventory-detail-visual">
+      ${entityVisual(item.image, item.name, "inventory-detail-image")}
+      ${item.equipped ? `<span class="inventory-equipped-badge">Equipado</span>` : ""}
+    </div>
+    <div class="inventory-detail-copy">
+      <div class="inventory-detail-title">
+        <h3>${esc(item.name)}</h3>
+        <span>${quantity}x</span>
+      </div>
+      <p class="inventory-detail-description">${esc(item.description || "Sem descricao.")}</p>
+      ${item.notes ? `
+        <div class="inventory-detail-notes">
+          <strong>Observacoes</strong>
+          <p>${esc(item.notes)}</p>
+        </div>` : ""}
+    </div>`;
+}
+
+function inspectInventoryItem(inventoryId, button) {
+  if (session.role !== "player") return;
+  const character = session.campaign?.characters.find(entry => entry.id === session.player?.characterId);
+  const item = character?.inventory?.find(entry => String(entry.id) === String(inventoryId));
+  const details = document.getElementById("inventoryItemDetails");
+  if (!item || !details) return;
+
+  details.innerHTML = inventoryItemDetails(item);
+  document.querySelectorAll(".inventory-slot.is-selected").forEach(slot => slot.classList.remove("is-selected"));
+  button?.classList.add("is-selected");
+}
+
 function inventoryPlayer(ch) {
   const items = ch.inventory || [];
-  const sharedItems = (session.campaign.items || []).filter(item => item.revealed && !items.some(entry => entry.itemId === item.id));
+  const slotCount = Math.max(INVENTORY_BASE_SLOTS, Math.ceil(items.length / INVENTORY_COLUMNS) * INVENTORY_COLUMNS);
+  const emptySlots = Math.max(0, slotCount - items.length);
+  const totalUnits = items.reduce((total, item) => total + Math.max(1, Number(item.quantity) || 1), 0);
+  const equippedItems = items.filter(item => item.equipped).length;
+
   return `
-    <h2>🎒 Inventário</h2>
-    <div class="grid" style="margin-top:15px;">
-      ${items.map(x => `
-        <div class="card inventory-card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
-          <div class="card-title-row">
-            <h3>${esc(x.name)}</h3>
-            <span class="quantity-chip">${x.quantity}x</span>
+    <section class="rpg-inventory-page" aria-label="Inventario de ${esc(ch.name)}">
+      <header class="inventory-page-heading">
+        <div class="inventory-title-lockup">
+          <span class="inventory-eyebrow">Mochila pessoal</span>
+          <h2>Inventario</h2>
+          <p>${esc(ch.name)}</p>
+        </div>
+        <div class="inventory-summary" aria-label="Resumo do inventario">
+          <span><strong>${items.length}/${slotCount}</strong><small>espacos</small></span>
+          <span><strong>${totalUnits}</strong><small>unidades</small></span>
+          <span><strong>${equippedItems}</strong><small>equipados</small></span>
+        </div>
+      </header>
+
+      <div class="inventory-frame">
+        <div class="inventory-frame-heading">
+          <div>
+            <span class="inventory-frame-mark" aria-hidden="true"></span>
+            <h3>Mochila de ${esc(ch.name)}</h3>
           </div>
-          <p>${esc(x.description)}</p>
-          ${x.notes ? `<p class="inventory-notes">${esc(x.notes)}</p>` : ""}
-          ${x.equipped ? `<span class="status-chip status-online">Equipado</span>` : ""}
-        </div>`).join("") || `<div class="empty-state"><h3>Inventario vazio</h3><p class="muted">O Mestre ainda nao entregou itens a este personagem.</p></div>`}
-    </div>
-    ${sharedItems.length ? `
-      <h3 class="section-heading">Itens compartilhados da mesa</h3>
-      <div class="grid">
-        ${sharedItems.map(item => `
-          <div class="card shared-item-card">
-            ${item.image ? `<img class="avatar" src="${item.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(item.image)}, ${jsArg(item.name)})">` : ""}
-            <h3>${esc(item.name)}</h3>
-            <p>${esc(item.description)}</p>
-          </div>`).join("")}
-      </div>` : ""}`;
+          <span>${items.length ? `${items.length} tipo${items.length === 1 ? "" : "s"} de item` : "Vazia"}</span>
+        </div>
+
+        <div class="inventory-workspace">
+          <div class="inventory-grid-panel">
+            <div class="inventory-slot-grid" role="list" aria-label="Itens carregados">
+              ${items.map((item, index) => {
+                const quantity = Math.max(1, Number(item.quantity) || 1);
+                return `
+                  <button type="button"
+                    class="inventory-slot is-filled${index === 0 ? " is-selected" : ""}${item.equipped ? " is-equipped" : ""}"
+                    role="listitem"
+                    title="${esc(item.name)} (${quantity}x)"
+                    aria-label="${esc(item.name)}, quantidade ${quantity}${item.equipped ? ", equipado" : ""}"
+                    onclick="inspectInventoryItem(${jsArg(item.id)}, this)">
+                    ${inventorySlotVisual(item)}
+                    ${quantity > 1 ? `<span class="inventory-slot-quantity">${quantity}</span>` : ""}
+                    ${item.equipped ? `<span class="inventory-slot-equipped" title="Equipado" aria-hidden="true">&#10003;</span>` : ""}
+                  </button>`;
+              }).join("")}
+              ${Array.from({ length: emptySlots }, () => `<span class="inventory-slot is-empty" aria-hidden="true"></span>`).join("")}
+            </div>
+          </div>
+
+          <aside class="inventory-detail" id="inventoryItemDetails" aria-live="polite">
+            ${inventoryItemDetails(items[0])}
+          </aside>
+        </div>
+      </div>
+    </section>`;
 }
 
 function evidencePlayer(ch) {
@@ -2023,7 +2795,7 @@ function evidencePlayer(ch) {
     <div class="grid" style="margin-top:15px;">
       ${ev.map(x => `
         <div class="card">
-          ${x.image ? `<img class="avatar" src="${x.image}" style="cursor:pointer;" onclick="openImageModal(${jsArg(x.image)}, ${jsArg(x.name)})">` : ""}
+          ${entityVisual(x.image, x.name)}
           <h3>${esc(x.name)}</h3>
           <p>${esc(x.description)}</p>
         </div>`).join("") || "<p class='muted'>Nenhuma evidência revelada.</p>"}

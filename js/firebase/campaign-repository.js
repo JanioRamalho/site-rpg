@@ -1,4 +1,8 @@
-import { SUBCOLLECTION_KEYS } from "./constants.js";
+import {
+  MASTER_ONLY_SUBCOLLECTION_KEYS,
+  SHARED_SUBCOLLECTION_KEYS,
+  SUBCOLLECTION_KEYS
+} from "./constants.js";
 import { makeId, stripUndefined, withRetry } from "./utils.js";
 
 export function createCampaignRepository(ctx) {
@@ -18,13 +22,25 @@ export function createCampaignRepository(ctx) {
     return { base, collections };
   }
 
-  function mergeCampaign(base, collections = {}) {
+  function mergeCampaign(base, collections = {}, options = {}) {
     const campaign = { ...base };
-    SUBCOLLECTION_KEYS.forEach(key => {
+    SHARED_SUBCOLLECTION_KEYS.forEach(key => {
+      const splitItems = collections[key] || [];
+      campaign[key] = splitItems.length ? splitItems : (Array.isArray(base[key]) ? base[key] : []);
+    });
+    MASTER_ONLY_SUBCOLLECTION_KEYS.forEach(key => {
+      if (options.includeMasterOnly === false) {
+        campaign[key] = [];
+        return;
+      }
       const splitItems = collections[key] || [];
       campaign[key] = splitItems.length ? splitItems : (Array.isArray(base[key]) ? base[key] : []);
     });
     return campaign;
+  }
+
+  function readableSubcollectionKeys(base, userId) {
+    return base?.masterId === userId ? SUBCOLLECTION_KEYS : SHARED_SUBCOLLECTION_KEYS;
   }
 
   function cleanSubDoc(item, order) {
@@ -209,14 +225,19 @@ export function createCampaignRepository(ctx) {
     const subcollections = new Map();
     const subUnsubs = new Map();
     const subReady = new Map();
+    const subKeys = new Map();
     let latestMeta = { fromCache: false, hasPendingWrites: false };
     let lastPayload = "";
     let lastMetaPayload = "";
 
     function emit() {
       const baseCampaigns = Array.from(bases.values());
-      if (baseCampaigns.some(base => subReady.get(base.id)?.size !== SUBCOLLECTION_KEYS.length)) return;
-      const campaigns = baseCampaigns.map(base => mergeCampaign(base, subcollections.get(base.id) || {}));
+      if (baseCampaigns.some(base => subReady.get(base.id)?.size !== (subKeys.get(base.id)?.length || 0))) return;
+      const campaigns = baseCampaigns.map(base => mergeCampaign(
+        base,
+        subcollections.get(base.id) || {},
+        { includeMasterOnly: base.masterId === userId }
+      ));
       const payload = JSON.stringify(campaigns);
       const metaPayload = JSON.stringify(latestMeta);
       if (payload === lastPayload && metaPayload === lastMetaPayload) return;
@@ -226,11 +247,12 @@ export function createCampaignRepository(ctx) {
       callback(campaigns, latestMeta);
     }
 
-    function watchCampaignSubcollections(campaignId) {
+    function watchCampaignSubcollections(campaignId, keys) {
       if (subUnsubs.has(campaignId)) return;
-      subcollections.set(campaignId, Object.fromEntries(SUBCOLLECTION_KEYS.map(key => [key, []])));
+      subcollections.set(campaignId, Object.fromEntries(keys.map(key => [key, []])));
       subReady.set(campaignId, new Set());
-      const unsubs = SUBCOLLECTION_KEYS.map(key => api.onSnapshot(
+      subKeys.set(campaignId, keys);
+      const unsubs = keys.map(key => api.onSnapshot(
         api.collection(db, "campaigns", campaignId, key),
         { includeMetadataChanges: true },
         snap => {
@@ -253,7 +275,7 @@ export function createCampaignRepository(ctx) {
         const campaign = { id: d.id, ...d.data() };
         activeIds.add(campaign.id);
         bases.set(campaign.id, campaign);
-        watchCampaignSubcollections(campaign.id);
+        watchCampaignSubcollections(campaign.id, readableSubcollectionKeys(campaign, userId));
       });
 
       Array.from(bases.keys()).forEach(id => {
@@ -261,6 +283,7 @@ export function createCampaignRepository(ctx) {
           bases.delete(id);
           subcollections.delete(id);
           subReady.delete(id);
+          subKeys.delete(id);
           campaignSaveCache.delete(id);
           (subUnsubs.get(id) || []).forEach(unsub => unsub());
           subUnsubs.delete(id);
@@ -274,6 +297,7 @@ export function createCampaignRepository(ctx) {
       subUnsubs.forEach(unsubs => unsubs.forEach(unsub => unsub()));
       subUnsubs.clear();
       subReady.clear();
+      subKeys.clear();
     };
   }
 
@@ -289,12 +313,14 @@ export function createCampaignRepository(ctx) {
       base = await restGetDoc(`campaigns/${campaignId}`);
       if (!base) return null;
     }
-    const collectionEntries = await Promise.all(SUBCOLLECTION_KEYS.map(async key => [
+    const includeMasterOnly = base.masterId === auth.currentUser?.uid;
+    const readableKeys = readableSubcollectionKeys(base, auth.currentUser?.uid);
+    const collectionEntries = await Promise.all(readableKeys.map(async key => [
       key,
       await getSubcollection(campaignId, key)
     ]));
     const collections = Object.fromEntries(collectionEntries);
-    const campaign = mergeCampaign(base, collections);
+    const campaign = mergeCampaign(base, collections, { includeMasterOnly });
     campaignSaveCache.set(campaign.id, cloneCollections(collections));
     return campaign;
   }
@@ -428,6 +454,178 @@ export function createCampaignRepository(ctx) {
     }
   }
 
+  async function assignPlayerCharacter(campaignId, playerId, characterId) {
+    if (!campaignId || !playerId || !auth.currentUser) throw new Error("Vinculo de personagem invalido.");
+
+    const normalizedPlayerId = String(playerId);
+    const nextCharacterId = characterId ? String(characterId) : null;
+    const campaignRef = api.doc(db, "campaigns", campaignId);
+    const playerRef = api.doc(db, "campaigns", campaignId, "players", normalizedPlayerId);
+    const updatedAt = new Date().toISOString();
+    const updatedBy = auth.currentUser.uid;
+
+    const result = await withRetry(() => api.runTransaction(db, async transaction => {
+      const playerSnap = await transaction.get(playerRef);
+      if (!playerSnap.exists()) throw new Error("Jogador nao encontrado.");
+
+      const playerData = playerSnap.data();
+      const previousCharacterId = playerData.characterId ? String(playerData.characterId) : null;
+      const characterIds = Array.from(new Set([previousCharacterId, nextCharacterId].filter(Boolean)));
+      const characterEntries = [];
+
+      for (const id of characterIds) {
+        const ref = api.doc(db, "campaigns", campaignId, "characters", id);
+        characterEntries.push([id, ref, await transaction.get(ref)]);
+      }
+
+      const charactersById = new Map(characterEntries.map(([id, ref, snap]) => [id, { ref, snap }]));
+      const nextEntry = nextCharacterId ? charactersById.get(nextCharacterId) : null;
+      if (nextCharacterId && !nextEntry?.snap.exists()) throw new Error("Personagem nao encontrado.");
+
+      const nextController = nextEntry?.snap.data()?.controllerPlayerId;
+      if (nextController && String(nextController) !== normalizedPlayerId) {
+        throw new Error("Este personagem ja esta vinculado a outro jogador.");
+      }
+
+      const playerUpdate = {
+        characterId: nextCharacterId,
+        characterLinkUpdatedAt: updatedAt,
+        characterLinkUpdatedBy: updatedBy
+      };
+      transaction.update(playerRef, playerUpdate);
+
+      const previousEntry = previousCharacterId ? charactersById.get(previousCharacterId) : null;
+      if (previousEntry?.snap.exists() && previousCharacterId !== nextCharacterId) {
+        const previousController = previousEntry.snap.data()?.controllerPlayerId;
+        if (!previousController || String(previousController) === normalizedPlayerId) {
+          transaction.update(previousEntry.ref, { controllerPlayerId: null });
+        }
+      }
+      if (nextEntry) transaction.update(nextEntry.ref, { controllerPlayerId: normalizedPlayerId });
+
+      const normalizedEmail = String(playerData.emailNormalized || playerData.email || "").trim().toLowerCase();
+      const campaignUpdate = { updatedAt };
+      if (normalizedEmail) {
+        campaignUpdate.readyPlayerEmails = nextCharacterId
+          ? api.arrayUnion(normalizedEmail)
+          : api.arrayRemove(normalizedEmail);
+      }
+      transaction.update(campaignRef, campaignUpdate);
+
+      return {
+        player: { id: playerSnap.id, ...playerData, ...playerUpdate },
+        previousCharacterId,
+        character: nextEntry ? {
+          id: nextEntry.snap.id,
+          ...nextEntry.snap.data(),
+          controllerPlayerId: normalizedPlayerId
+        } : null
+      };
+    }), ctx);
+
+    const cached = campaignSaveCache.get(campaignId);
+    if (cached) {
+      const cachedPlayer = cached.players?.find(player => String(player.id) === normalizedPlayerId);
+      if (cachedPlayer) Object.assign(cachedPlayer, result.player);
+      if (result.previousCharacterId && result.previousCharacterId !== nextCharacterId) {
+        const previousCharacter = cached.characters?.find(character => String(character.id) === result.previousCharacterId);
+        if (String(previousCharacter?.controllerPlayerId || "") === normalizedPlayerId) previousCharacter.controllerPlayerId = null;
+      }
+      if (nextCharacterId) {
+        const nextCharacter = cached.characters?.find(character => String(character.id) === nextCharacterId);
+        if (nextCharacter) nextCharacter.controllerPlayerId = normalizedPlayerId;
+      }
+    }
+
+    return result;
+  }
+
+  async function resolveItemTransfer(campaignId, transferId, decision) {
+    if (!campaignId || !transferId || !auth.currentUser) throw new Error("Transferencia invalida.");
+    if (!["approved", "rejected"].includes(decision)) throw new Error("Decisao de transferencia invalida.");
+
+    const transferRef = api.doc(db, "campaigns", campaignId, "itemTransfers", String(transferId));
+    const resolvedDate = new Date();
+    const resolvedAt = resolvedDate.toISOString();
+    const resolvedBy = auth.currentUser.uid;
+
+    return withRetry(() => api.runTransaction(db, async transaction => {
+      const transferSnap = await transaction.get(transferRef);
+      if (!transferSnap.exists()) throw new Error("Solicitacao de transferencia nao encontrada.");
+      const transfer = { id: transferSnap.id, ...transferSnap.data() };
+
+      if (transfer.status !== "pending") {
+        return { transfer, alreadyResolved: true };
+      }
+
+      const resolution = {
+        status: decision,
+        resolvedAt,
+        resolvedBy,
+        time: resolvedDate.toLocaleString("pt-BR")
+      };
+      if (decision === "rejected" || transfer.type !== "item") {
+        transaction.update(transferRef, resolution);
+        return { transfer: { ...transfer, ...resolution } };
+      }
+
+      if (!transfer.fromCharacterId || !transfer.toCharacterId || !transfer.inventoryId) {
+        throw new Error("A solicitacao nao possui os vinculos de inventario necessarios.");
+      }
+      if (String(transfer.fromCharacterId) === String(transfer.toCharacterId)) {
+        throw new Error("Origem e destino da transferencia sao iguais.");
+      }
+
+      const sourceRef = api.doc(db, "campaigns", campaignId, "characters", String(transfer.fromCharacterId));
+      const targetRef = api.doc(db, "campaigns", campaignId, "characters", String(transfer.toCharacterId));
+      const sourceSnap = await transaction.get(sourceRef);
+      const targetSnap = await transaction.get(targetRef);
+      if (!sourceSnap.exists() || !targetSnap.exists()) throw new Error("Um dos personagens nao existe mais.");
+
+      const sourceData = sourceSnap.data();
+      const targetData = targetSnap.data();
+      const sourceInventory = JSON.parse(JSON.stringify(sourceData.inventory || []));
+      const targetInventory = JSON.parse(JSON.stringify(targetData.inventory || []));
+      const sourceIndex = sourceInventory.findIndex(entry => String(entry.id) === String(transfer.inventoryId));
+      if (sourceIndex < 0) throw new Error("O item nao esta mais no inventario de origem.");
+
+      const amount = Math.max(1, Number.parseInt(transfer.quantity, 10) || 1);
+      const sourceItem = sourceInventory[sourceIndex];
+      if ((Number(sourceItem.quantity) || 0) < amount) throw new Error("Quantidade indisponivel no inventario de origem.");
+
+      const targetEntry = sourceItem.itemId
+        ? targetInventory.find(entry => String(entry.itemId || "") === String(sourceItem.itemId) && String(entry.notes || "") === String(sourceItem.notes || ""))
+        : null;
+      if (targetEntry) {
+        targetEntry.quantity = Math.max(0, Number(targetEntry.quantity) || 0) + amount;
+        if (String(sourceItem.name || "").trim()) targetEntry.name = String(sourceItem.name).trim();
+        if (String(sourceItem.description || "").trim()) targetEntry.description = String(sourceItem.description).trim();
+        if (String(sourceItem.image || "").trim()) targetEntry.image = String(sourceItem.image).trim();
+      } else {
+        targetInventory.push(stripUndefined({
+          ...sourceItem,
+          id: makeId(),
+          quantity: amount,
+          equipped: false,
+          grantedAt: resolvedAt
+        }));
+      }
+
+      sourceItem.quantity = Math.max(0, Number(sourceItem.quantity) || 0) - amount;
+      if (sourceItem.quantity === 0) sourceInventory.splice(sourceIndex, 1);
+
+      transaction.update(sourceRef, { inventory: sourceInventory });
+      transaction.update(targetRef, { inventory: targetInventory });
+      transaction.update(transferRef, resolution);
+
+      return {
+        transfer: { ...transfer, ...resolution },
+        sourceCharacter: { id: sourceSnap.id, inventory: sourceInventory },
+        targetCharacter: { id: targetSnap.id, inventory: targetInventory }
+      };
+    }), ctx);
+  }
+
   async function syncPlayerSubcollection(campaignId, key, items, playerId, userId) {
     const previous = campaignSaveCache.get(campaignId)?.[key] || [];
     const previousById = new Map(previous.map(item => [String(item.id), item]));
@@ -514,10 +712,12 @@ export function createCampaignRepository(ctx) {
 
   return {
     addCampaignMember,
+    assignPlayerCharacter,
     deleteCampaign,
     getCampaign,
     getCampaignForJoin,
     joinCampaign,
+    resolveItemTransfer,
     saveCampaign,
     setPlayerPresence,
     watchCampaigns

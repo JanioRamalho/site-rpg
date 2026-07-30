@@ -56,8 +56,33 @@
     target.controllerPlayerId = target.controllerPlayerId ? String(target.controllerPlayerId) : null;
     target.inventory = Array.isArray(target.inventory)
         ? target.inventory.map(entry => normalizeInventoryEntry(entry, makeId))
-        : []
+        : [];
     return target;
+  }
+
+  function normalizeScene(scene, makeId = defaultId) {
+    const target = scene && typeof scene === "object" ? scene : {};
+    target.id = String(target.id || makeId());
+    target.title = String(target.title || "Cena");
+    target.caption = String(target.caption || "");
+    target.masterNotes = String(target.masterNotes || "");
+    target.image = String(target.image || "");
+    target.createdAt = target.createdAt || new Date().toISOString();
+    return target;
+  }
+
+  function normalizeLiveScene(liveScene) {
+    const target = liveScene && typeof liveScene === "object" ? liveScene : {};
+    return {
+      active: Boolean(target.active),
+      sceneId: target.sceneId ? String(target.sceneId) : null,
+      image: String(target.image || ""),
+      title: String(target.title || ""),
+      caption: String(target.caption || ""),
+      index: Math.max(0, Number.parseInt(target.index, 10) || 0),
+      total: Math.max(0, Number.parseInt(target.total, 10) || 0),
+      updatedAt: target.updatedAt || null
+    };
   }
 
   function normalizeCampaign(campaign, makeId = defaultId) {
@@ -76,6 +101,10 @@
         normalizeCharacter(character, makeId)
       ))
       : [];
+    campaign.scenes = Array.isArray(campaign.scenes)
+      ? campaign.scenes.map(scene => normalizeScene(scene, makeId))
+      : [];
+    campaign.liveScene = normalizeLiveScene(campaign.liveScene);
 
     const playersById = new Map(campaign.players.map(player => [player.id, player]));
     const charactersById = new Map(campaign.characters.map(character => [character.id, character]));
@@ -171,6 +200,9 @@
 
     if (existing) {
       existing.quantity += quantity;
+      if (String(item?.name || "").trim()) existing.name = String(item.name).trim();
+      if (String(item?.description || "").trim()) existing.description = String(item.description).trim();
+      if (String(item?.image || "").trim()) existing.image = String(item.image).trim();
       if (options.equipped !== undefined) existing.equipped = Boolean(options.equipped);
       return existing;
     }
@@ -196,9 +228,26 @@
     const inventoryEntry = character?.inventory.find(entry => entry.id === String(inventoryId));
     if (!inventoryEntry) throw new Error("Item do inventario nao encontrado.");
 
-    if (changes.quantity !== undefined) inventoryEntry.quantity = positiveInteger(changes.quantity);
-    if (changes.equipped !== undefined) inventoryEntry.equipped = Boolean(changes.equipped);
-    if (changes.notes !== undefined) inventoryEntry.notes = String(changes.notes || "");
+    const normalizedChanges = {};
+    if (changes.name !== undefined) {
+      const name = String(changes.name || "").trim();
+      if (!name) throw new Error("Informe o titulo do item.");
+      normalizedChanges.name = name;
+    }
+    if (changes.description !== undefined) {
+      const description = String(changes.description || "").trim();
+      if (!description) throw new Error("Informe a descricao do item.");
+      normalizedChanges.description = description;
+    }
+    if (changes.image !== undefined) {
+      const image = String(changes.image || "").trim();
+      if (!image) throw new Error("Selecione uma foto para o item.");
+      normalizedChanges.image = image;
+    }
+    if (changes.quantity !== undefined) normalizedChanges.quantity = positiveInteger(changes.quantity);
+    if (changes.equipped !== undefined) normalizedChanges.equipped = Boolean(changes.equipped);
+    if (changes.notes !== undefined) normalizedChanges.notes = String(changes.notes || "");
+    Object.assign(inventoryEntry, normalizedChanges);
     return inventoryEntry;
   }
 
@@ -232,9 +281,69 @@
     return targetEntry;
   }
 
+  function reservedTransferQuantity(campaign, characterId, inventoryId, exceptTransferId = null) {
+    normalizeCampaign(campaign);
+    return (campaign.itemTransfers || []).reduce((total, transfer) => {
+      if (transfer.status !== "pending" || transfer.type !== "item") return total;
+      if (String(transfer.fromCharacterId || "") !== String(characterId)) return total;
+      if (String(transfer.inventoryId || "") !== String(inventoryId)) return total;
+      if (exceptTransferId && String(transfer.id) === String(exceptTransferId)) return total;
+      return total + positiveInteger(transfer.quantity);
+    }, 0);
+  }
+
+  function availableInventoryQuantity(campaign, characterId, inventoryId) {
+    normalizeCampaign(campaign);
+    const character = campaign.characters.find(entry => entry.id === String(characterId));
+    const inventoryEntry = character?.inventory.find(entry => entry.id === String(inventoryId));
+    if (!inventoryEntry) return 0;
+    return Math.max(0, inventoryEntry.quantity - reservedTransferQuantity(campaign, characterId, inventoryId));
+  }
+
+  function publishScene(campaign, sceneId, options = {}) {
+    normalizeCampaign(campaign);
+    const scene = campaign.scenes.find(entry => entry.id === String(sceneId || ""));
+    if (!scene) throw new Error("Cena nao encontrada.");
+    const index = campaign.scenes.findIndex(entry => entry.id === scene.id);
+    campaign.liveScene = {
+      active: options.active === undefined ? Boolean(campaign.liveScene.active) : Boolean(options.active),
+      sceneId: scene.id,
+      image: scene.image,
+      title: scene.title,
+      caption: scene.caption,
+      index,
+      total: campaign.scenes.length,
+      updatedAt: new Date().toISOString()
+    };
+    return campaign.liveScene;
+  }
+
+  function setScenePresentationActive(campaign, active) {
+    normalizeCampaign(campaign);
+    if (!active || !campaign.scenes.length) {
+      campaign.liveScene = normalizeLiveScene({
+        active: false,
+        updatedAt: new Date().toISOString()
+      });
+      return campaign.liveScene;
+    }
+    const sceneId = campaign.liveScene.sceneId || campaign.scenes[0].id;
+    return publishScene(campaign, sceneId, { active });
+  }
+
+  function stepScene(campaign, delta) {
+    normalizeCampaign(campaign);
+    if (!campaign.scenes.length) throw new Error("Adicione uma cena primeiro.");
+    const currentIndex = campaign.scenes.findIndex(entry => entry.id === campaign.liveScene.sceneId);
+    const baseIndex = currentIndex >= 0 ? currentIndex : 0;
+    const nextIndex = Math.max(0, Math.min(campaign.scenes.length - 1, baseIndex + Number(delta || 0)));
+    return publishScene(campaign, campaign.scenes[nextIndex].id, { active: campaign.liveScene.active });
+  }
+
   const api = {
     PRESENCE_AWAY_MS,
     PRESENCE_ONLINE_MS,
+    availableInventoryQuantity,
     assignCharacter,
     getControlledParticipants,
     grantItem,
@@ -242,10 +351,16 @@
     normalizeCharacter,
     normalizeEmail,
     normalizeInventoryEntry,
+    normalizeLiveScene,
     normalizePlayer,
+    normalizeScene,
+    publishScene,
     presenceState,
     releasePlayer,
     removeInventoryEntry,
+    reservedTransferQuantity,
+    setScenePresentationActive,
+    stepScene,
     transferInventoryItem,
     updateInventoryEntry
   };

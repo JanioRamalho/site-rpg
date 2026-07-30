@@ -1,4 +1,4 @@
-export const SUBCOLLECTION_KEYS = [
+export const SHARED_SUBCOLLECTION_KEYS = [
   "players",
   "characters",
   "cases",
@@ -9,4 +9,11 @@ export const SUBCOLLECTION_KEYS = [
   "diceLogs",
   "messages",
   "itemTransfers"
+];
+
+export const MASTER_ONLY_SUBCOLLECTION_KEYS = ["scenes"];
+
+export const SUBCOLLECTION_KEYS = [
+  ...SHARED_SUBCOLLECTION_KEYS,
+  ...MASTER_ONLY_SUBCOLLECTION_KEYS
 ];

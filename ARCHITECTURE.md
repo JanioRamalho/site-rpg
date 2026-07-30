@@ -23,7 +23,7 @@ js/media/
 
 js/game/
   campaign-service.js      API de dominio para criar/entrar/excluir campanhas
-  tabletop-model.js        vinculos, participantes, presenca e inventarios
+  tabletop-model.js        vinculos, presenca, inventarios, trocas e cenas
 ```
 
 ## Fluxo Multiplayer
@@ -56,6 +56,13 @@ garante uma relacao individual: um personagem nao pode ser controlado por dois
 jogadores. Personagens sem uma conta autenticada controlando-os nao aparecem na
 tela Sala.
 
+O vinculo e uma configuracao persistente da campanha, independente da presenca.
+`assignPlayerCharacter()` atualiza o `characterId` do jogador, libera o
+personagem anterior, reserva o novo personagem e atualiza `readyPlayerEmails`
+em uma unica transacao Firestore. F5, logout, estado Offline e uma nova entrada
+na sala nao removem o vinculo; ele so e desfeito por uma acao explicita do
+Mestre ou pela exclusao do jogador/personagem.
+
 ## Inventario
 
 `characters/{characterId}.inventory` e a fonte de verdade dos itens possuidos.
@@ -63,8 +70,20 @@ Cada entrada guarda uma copia do nome, descricao e imagem do catalogo, alem de
 quantidade, estado equipado e observacoes. Assim, excluir ou editar um item do
 catalogo nao apaga o que ja foi entregue aos personagens.
 
-Itens antigos marcados como `revealed` continuam aparecendo em uma secao de
-itens compartilhados para manter compatibilidade com campanhas anteriores.
+O Mestre pode entregar itens do catalogo ou criar uma entrada livre diretamente
+no inventario de qualquer personagem, incluindo foto, quantidade, equipamento e
+observacoes. Essa entrega nao depende de aprovacao do jogador e aparece em tempo
+real; somente transferencias iniciadas por jogadores passam pela aprovacao.
+
+Titulo, descricao, foto e quantidade sao obrigatorios para novas entregas. Itens
+do catalogo incompletos ficam bloqueados ate serem editados. O gerenciador do
+inventario tambem permite completar ou substituir esses dados em entradas
+antigas sem remover o item do personagem.
+
+Itens do catalogo, inclusive entradas antigas marcadas como `revealed`, nao
+aparecem na mochila pessoal ate que o Mestre os entregue ao personagem. A tela
+do jogador renderiza somente `characters/{characterId}.inventory`, preservando
+o isolamento entre os inventarios.
 
 ## Presenca
 
@@ -72,6 +91,41 @@ O jogador atualiza `online` e `lastSeen` no proprio documento. Um heartbeat e
 enviado a cada 45 segundos. A interface considera 90 segundos para Online e
 cinco minutos para Ausente; depois disso mostra Offline. Esse mecanismo tambem
 cobre quedas abruptas em que o navegador nao consegue enviar o logout.
+
+## Sessao persistente
+
+O Firebase Auth usa `browserLocalPersistence`, portanto a identidade permanece
+autenticada depois de F5 ou depois de reabrir o navegador. O app salva em
+`cdi_session_context_v2` somente IDs de contexto, papel e ultima tela. Nenhuma
+senha e armazenada. Quando o listener do Firestore termina a primeira carga, o
+app restaura campanha, jogador, personagem e tela; o botao Sair limpa o contexto
+e encerra a sessao Firebase explicitamente.
+
+## Transferencias entre jogadores
+
+Uma solicitacao pendente permanece em `itemTransfers` e reserva logicamente a
+quantidade pedida, sem retirar o item do remetente. O Mestre resolve a
+solicitacao por `resolveItemTransfer()`, que usa uma transacao Firestore para:
+
+1. confirmar que a solicitacao ainda esta pendente;
+2. conferir novamente a quantidade no inventario de origem;
+3. atualizar os inventarios de origem e destino;
+4. marcar a solicitacao como aprovada no mesmo commit.
+
+Uma rejeicao altera somente o estado da solicitacao. Assim, falhas de rede,
+cliques repetidos e aprovacoes concorrentes nao duplicam nem fazem itens sumirem.
+
+## Cenas ao vivo
+
+O roteiro completo fica em `campaigns/{campaignId}/scenes` e contem imagem,
+titulo, legenda publica e notas privadas. Essa subcolecao e lida e escrita
+somente pelo Mestre. Os jogadores nao assinam esse listener.
+
+A campanha principal guarda apenas `liveScene`, uma copia publica e minima da
+cena atualmente apresentada: imagem, titulo, legenda, posicao e estado ativo.
+Ao ocultar a apresentacao, esses campos publicos sao limpos. Isso permite que um
+jogador que entre atrasado veja imediatamente a cena atual sem receber imagens
+futuras ou notas do Mestre.
 
 ## Escritas e Concorrencia
 
@@ -81,7 +135,8 @@ uma alteracao simultanea de saude feita pelo jogador nao e sobrescrita.
 
 As regras em `firestore.rules` permitem ao jogador alterar somente presenca,
 saude, sanidade, habilidades, mensagens, rolagens e solicitacoes pertencentes a
-ele. Vinculos e inventarios continuam sob controle do Mestre.
+ele. Vinculos, inventarios, resolucao de trocas e o roteiro privado de cenas
+continuam sob controle do Mestre.
 
 ## Principio
 
@@ -101,4 +156,7 @@ O arquivo `script.js` ainda concentra a UI atual para preservar todas as telas e
 
 O app usa Cloudinary para imagens quando `window.CDI_CLOUDINARY_CONFIG.cloudName`
 e `uploadPreset` estao preenchidos. Se nao estiverem configurados, o app usa
-Base64 comprimido como fallback para nao quebrar o jogo.
+Base64 comprimido como fallback para nao quebrar o jogo. Personagens, jogadores,
+itens, inventarios, registros, criaturas, evidencias e marcas sempre exibem uma
+area visual; entidades antigas sem foto recebem uma imagem de RPG com inicial ate
+que o Mestre envie a imagem definitiva.
