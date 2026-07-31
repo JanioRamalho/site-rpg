@@ -6,6 +6,8 @@ const vm = require("node:vm");
 const tabletop = require("../js/game/tabletop-model.js");
 
 function createAppContext() {
+  const bodyChildren = [];
+  const timeouts = [];
   const root = {
     innerHTML: "",
     insertAdjacentHTML(_position, html) {
@@ -13,13 +15,49 @@ function createAppContext() {
     }
   };
   const storage = new Map();
+  const createElement = tagName => {
+    const element = {
+      tagName: String(tagName).toUpperCase(),
+      children: [],
+      className: "",
+      id: "",
+      innerHTML: "",
+      textContent: "",
+      isConnected: false,
+      attributes: {},
+      appendChild(child) {
+        child.isConnected = true;
+        this.children.push(child);
+      },
+      setAttribute(name, value) {
+        this.attributes[name] = String(value);
+      },
+      remove() {
+        this.isConnected = false;
+        const index = bodyChildren.indexOf(this);
+        if (index >= 0) bodyChildren.splice(index, 1);
+      }
+    };
+    return element;
+  };
   const document = {
-    body: { appendChild() {} },
+    body: {
+      appendChild(element) {
+        element.isConnected = true;
+        bodyChildren.push(element);
+      }
+    },
     addEventListener() {},
+    createElement,
     getElementById(id) {
       return id === "root" ? root : null;
     },
-    querySelector() { return null; },
+    querySelector(selector) {
+      if (selector === ".trauma-global-alert") {
+        return bodyChildren.find(element => element.className === "trauma-global-alert") || null;
+      }
+      return null;
+    },
     querySelectorAll() { return []; }
   };
   const window = {
@@ -40,7 +78,10 @@ function createAppContext() {
     alert() {},
     confirm() { return true; },
     prompt() {},
-    setTimeout() { return 1; },
+    setTimeout(_callback, delay) {
+      timeouts.push(delay);
+      return timeouts.length;
+    },
     clearTimeout() {},
     setInterval() { return 1; },
     clearInterval() {},
@@ -59,7 +100,7 @@ function createAppContext() {
   window.window = window;
   const source = fs.readFileSync(path.join(__dirname, "..", "script.js"), "utf8");
   vm.runInContext(source, context, { filename: "script.js" });
-  return { context, root, storage };
+  return { bodyChildren, context, root, storage, timeouts };
 }
 
 function seedCampaign(context) {
@@ -77,8 +118,8 @@ function seedCampaign(context) {
           { id: "player-2", name: "Bruno", email: "bruno@example.com", authUid: null, characterId: "char-2" }
         ],
         characters: [
-          { id: "char-1", name: "Morgana", origin: "Medica", image: "portrait-1.jpg", health: 10, healthMax: 10, sanity: 8, sanityMax: 8, attrs: {}, res: {}, skills: [], inventory: [{ id: "inv-1", itemId: "item-1", name: "Pocao", description: "Recupera vida", image: "pocao.jpg", quantity: 2 }] },
-          { id: "char-2", name: "Orion", origin: "Cacador", health: 10, healthMax: 10, sanity: 8, sanityMax: 8, attrs: {}, res: {}, skills: [] }
+          { id: "char-1", name: "Morgana", origin: "Medica", image: "portrait-1.jpg", health: 10, healthMax: 10, sanity: 8, sanityMax: 8, attrs: {}, res: {}, skills: [], inventory: [{ id: "inv-1", itemId: "item-1", name: "Pocao", description: "Recupera vida", image: "pocao.jpg", quantity: 2 }], traumas: [{ id: "trauma-1", title: "Aracnofobia", description: "Medo intenso de aranhas.", image: "aranha.jpg", acquiredAt: "2026-07-30T21:45:00.000Z" }] },
+          { id: "char-2", name: "Orion", origin: "Cacador", health: 10, healthMax: 10, sanity: 8, sanityMax: 8, attrs: {}, res: {}, skills: [], traumas: [{ id: "trauma-2", title: "Claustrofobia", description: "Medo de lugares fechados.", image: "tunel.jpg", acquiredAt: "2026-07-30T21:46:00.000Z" }] }
         ],
         items: [{ id: "shared-1", name: "Mapa da mesa", description: "Compartilhado", revealed: true }],
         evidence: [], messages: [], diceLogs: [], itemTransfers: [], cases: [], creatures: [], marks: [],
@@ -277,6 +318,126 @@ test("renders the player character image as a face portrait instead of a banner"
 
   assert.match(root.innerHTML, /class="character-sheet-portrait entity-visual-image"/);
   assert.doesNotMatch(root.innerHTML, /class="avatar entity-visual-image"/);
+});
+
+test("renders only the owned character traumas in the player tab", () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "traumas" };
+    render();
+  `, context);
+
+  assert.match(root.innerHTML, /Meus Traumas/);
+  assert.match(root.innerHTML, /Aracnofobia/);
+  assert.match(root.innerHTML, /Medo intenso de aranhas/);
+  assert.match(root.innerHTML, /aranha\.jpg/);
+  assert.doesNotMatch(root.innerHTML, /Claustrofobia|tunel\.jpg/);
+  assert.doesNotMatch(root.innerHTML, /removeCharacterTrauma|Aplicar trauma/);
+});
+
+test("renders trauma management and required fields only for the master", () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "traumas" };
+    render();
+    traumaModal("char-1");
+  `, context);
+
+  assert.match(root.innerHTML, /Aracnofobia/);
+  assert.match(root.innerHTML, /Claustrofobia/);
+  assert.match(root.innerHTML, /removeCharacterTrauma/);
+  assert.match(root.innerHTML, /id="traumaTitle"[^>]*required/);
+  assert.match(root.innerHTML, /id="traumaDescription"[^>]*required/);
+  assert.match(root.innerHTML, /id="traumaImage"[^>]*required/);
+  assert.match(root.innerHTML, /value="char-1" selected/);
+});
+
+test("announces a recent trauma once with origin only and a five-second lifetime", () => {
+  const { bodyChildren, context, timeouts } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "traumas" };
+    const event = {
+      id: "trauma-event-1",
+      origin: "Medica",
+      traumaTitle: "Aracnofobia",
+      createdAt: new Date().toISOString()
+    };
+    window.__traumaMessage = traumaAlertMessage(event);
+    window.__firstTraumaAnnouncement = announceTraumaEvent(event, session.campaign);
+    window.__secondTraumaAnnouncement = announceTraumaEvent(event, session.campaign);
+  `, context);
+
+  const alertElement = bodyChildren.find(element => element.className === "trauma-global-alert");
+  assert.equal(context.window.__traumaMessage, "[Medica] - Adquiriu um trauma: [Aracnofobia]");
+  assert.equal(context.window.__firstTraumaAnnouncement, true);
+  assert.equal(context.window.__secondTraumaAnnouncement, false);
+  assert.match(alertElement.innerHTML, /\[Medica\] - Adquiriu um trauma: \[Aracnofobia\]/);
+  assert.doesNotMatch(alertElement.innerHTML, /Morgana|Ana/);
+  assert.equal(timeouts.includes(5000), true);
+});
+
+test("uses the packaged dark fantasy MP3 instead of a synthesized alert", () => {
+  const { context } = createAppContext();
+  vm.runInContext(`
+    window.__traumaSoundUrl = TRAUMA_ALERT_SOUND_URL;
+    window.__traumaSoundPlayer = playTraumaAlertSound.toString();
+  `, context);
+
+  const assetPath = path.join(__dirname, "..", "assets", "audio", "trauma-alert-dark-fantasy.mp3");
+  assert.equal(context.window.__traumaSoundUrl, "assets/audio/trauma-alert-dark-fantasy.mp3");
+  assert.equal(fs.existsSync(assetPath), true);
+  assert.equal(fs.statSync(assetPath).size, 135980);
+  assert.match(context.window.__traumaSoundPlayer, /loadTraumaAlertAudio/);
+  assert.doesNotMatch(context.window.__traumaSoundPlayer, /createOscillator/);
+});
+
+test("shows a trauma alert when the realtime campaign snapshot arrives", () => {
+  const { bodyChildren, context } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    window.CDIFirebase = { enabled: true, currentUser: { uid: "auth-1" } };
+    firebaseUser = { uid: "auth-1", email: "ana@example.com" };
+    firebaseProfile = { id: "auth-1", role: "player", name: "Ana" };
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "traumas" };
+    lastRemoteCampaignJson = JSON.stringify(state.campaigns);
+
+    const realtimeCampaigns = JSON.parse(JSON.stringify(state.campaigns));
+    realtimeCampaigns[0].latestTraumaEvent = {
+      id: "realtime-trauma-event",
+      origin: "Medica",
+      traumaTitle: "Nictofobia",
+      createdAt: new Date().toISOString()
+    };
+    window.__traumaRemoteApplied = applyRemoteCampaignSnapshot(
+      realtimeCampaigns,
+      { fromCache: false, hasPendingWrites: false },
+      firebaseUser
+    );
+  `, context);
+
+  const alertElement = bodyChildren.find(element => element.className === "trauma-global-alert");
+  assert.equal(context.window.__traumaRemoteApplied, true);
+  assert.match(alertElement.innerHTML, /\[Medica\] - Adquiriu um trauma: \[Nictofobia\]/);
+});
+
+test("lets the master remove one trauma without affecting another character", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "traumas" };
+    window.__removeTraumaPromise = removeCharacterTrauma("char-1", "trauma-1");
+  `, context);
+
+  await context.window.__removeTraumaPromise;
+  vm.runInContext(`
+    window.__ownedTraumaCount = state.campaigns[0].characters[0].traumas.length;
+    window.__otherTraumaTitle = state.campaigns[0].characters[1].traumas[0].title;
+  `, context);
+  assert.equal(context.window.__ownedTraumaCount, 0);
+  assert.equal(context.window.__otherTraumaTitle, "Claustrofobia");
 });
 
 test("renders the private scene deck and controls only for the master", () => {

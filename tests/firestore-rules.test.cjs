@@ -116,6 +116,10 @@ async function run() {
       inventory: [{ id: "forged", name: "Item forjado", quantity: 1 }]
     }));
 
+    await assertFails(updateDoc(doc(prepared, "campaigns", "room-1", "characters", "char-1"), {
+      traumas: [{ id: "forged-trauma", title: "Trauma forjado" }]
+    }));
+
     await assertFails(updateDoc(doc(prepared, "campaigns", "room-1", "players", "player-1"), {
       characterId: "another-character"
     }));
@@ -157,6 +161,29 @@ async function run() {
 
     await assertSucceeds(updateDoc(doc(master, "campaigns", "room-1", "characters", "char-1"), {
       inventory: [{ id: "inv-1", name: "Pocao", quantity: 1 }]
+    }));
+
+    await assertSucceeds(runTransaction(master, async transaction => {
+      const eventTime = new Date().toISOString();
+      transaction.update(doc(master, "campaigns", "room-1", "characters", "char-1"), {
+        traumas: [{
+          id: "trauma-1",
+          title: "Aracnofobia",
+          description: "Medo intenso de aranhas.",
+          image: "aranha.jpg",
+          acquiredAt: eventTime
+        }],
+        traumasUpdatedAt: eventTime
+      });
+      transaction.update(doc(master, "campaigns", "room-1"), {
+        updatedAt: eventTime,
+        latestTraumaEvent: {
+          id: "event-1",
+          origin: "Medica",
+          traumaTitle: "Aracnofobia",
+          createdAt: eventTime
+        }
+      });
     }));
 
     await assertSucceeds(runTransaction(master, async transaction => {

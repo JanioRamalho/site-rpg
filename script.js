@@ -56,14 +56,22 @@ const selectedSceneIds = new Map();
 let sceneUploadInProgress = false;
 let boardUploadInProgress = false;
 let chatSendInProgress = false;
+let traumaAudioContext = null;
+let traumaAlertAudioBuffer = null;
+let traumaAlertAudioPromise = null;
+let activeTraumaAudioSource = null;
+const traumaMutations = new Set();
 
 const SESSION_STORAGE_KEY = "cdi_session_context_v2";
+const TRAUMA_ALERT_SOUND_URL = "assets/audio/trauma-alert-dark-fantasy.mp3";
+const TRAUMA_SEEN_STORAGE_KEY = "cdi_seen_trauma_events_v1";
+const TRAUMA_EVENT_MAX_AGE_MS = 60 * 1000;
 const MASTER_VIEWS = new Set([
   "messages", "room", "scenes", "home", "campaigns", "campaign", "characters",
-  "skills", "diceLogs", "cases", "creatures", "items", "evidence", "marks",
+  "traumas", "skills", "diceLogs", "cases", "creatures", "items", "evidence", "marks",
   "transfers", "players", "settings"
 ]);
-const PLAYER_VIEWS = new Set(["messages", "room", "scenes", "sheet", "inventory", "evidencePlayer", "transferPlayer"]);
+const PLAYER_VIEWS = new Set(["messages", "room", "scenes", "sheet", "traumas", "inventory", "evidencePlayer", "transferPlayer"]);
 
 const root = document.getElementById("root");
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
@@ -486,6 +494,152 @@ async function createPlayerAccount() {
   }
 }
 
+function traumaViewerKey(campaign = session.campaign) {
+  const viewerId = firebaseUser?.uid
+    || (session.role === "master" ? session.currentMaster?.id : session.player?.authUid || session.player?.id)
+    || "anonymous";
+  return `${campaign?.id || "campaign"}:${session.role || "guest"}:${viewerId}`;
+}
+
+function traumaAlertMessage(event) {
+  return `[${String(event?.origin || "Sem origem")}] - Adquiriu um trauma: [${String(event?.traumaTitle || "Trauma")}]`;
+}
+
+function readSeenTraumaEvents() {
+  try {
+    const stored = JSON.parse(localStorage.getItem(TRAUMA_SEEN_STORAGE_KEY) || "{}");
+    return stored && typeof stored === "object" ? stored : {};
+  } catch (_err) {
+    return {};
+  }
+}
+
+function shouldAnnounceTraumaEvent(event, campaign = session.campaign) {
+  if (!event?.id || !campaign?.id) return false;
+  const createdAt = Date.parse(event.createdAt);
+  if (!Number.isFinite(createdAt)) return false;
+  const age = Date.now() - createdAt;
+  if (age > TRAUMA_EVENT_MAX_AGE_MS || age < -5 * 60 * 1000) return false;
+  const stored = readSeenTraumaEvents()[traumaViewerKey(campaign)];
+  const seenIds = Array.isArray(stored) ? stored.map(String) : (stored ? [String(stored)] : []);
+  return !seenIds.includes(String(event.id));
+}
+
+function markTraumaEventSeen(event, campaign = session.campaign) {
+  if (!event?.id || !campaign?.id) return;
+  const seen = readSeenTraumaEvents();
+  const key = traumaViewerKey(campaign);
+  const stored = seen[key];
+  const seenIds = Array.isArray(stored) ? stored.map(String) : (stored ? [String(stored)] : []);
+  seen[key] = [String(event.id), ...seenIds.filter(id => id !== String(event.id))].slice(0, 20);
+  localStorage.setItem(TRAUMA_SEEN_STORAGE_KEY, JSON.stringify(seen));
+}
+
+function ensureTraumaAudioContext() {
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  if (!AudioContextClass) return null;
+  try {
+    traumaAudioContext ??= new AudioContextClass();
+    return traumaAudioContext;
+  } catch (_err) {
+    return null;
+  }
+}
+
+async function loadTraumaAlertAudio(audioContext = ensureTraumaAudioContext()) {
+  if (!audioContext) return null;
+  if (traumaAlertAudioBuffer) return traumaAlertAudioBuffer;
+  if (traumaAlertAudioPromise) return traumaAlertAudioPromise;
+
+  traumaAlertAudioPromise = fetch(TRAUMA_ALERT_SOUND_URL, { cache: "force-cache" })
+    .then(response => {
+      if (!response.ok) throw new Error(`Falha ao carregar som de trauma: ${response.status}`);
+      return response.arrayBuffer();
+    })
+    .then(data => audioContext.decodeAudioData(data))
+    .then(buffer => {
+      traumaAlertAudioBuffer = buffer;
+      return buffer;
+    })
+    .catch(err => {
+      console.warn("O efeito sonoro de trauma nao pode ser carregado.", err);
+      traumaAlertAudioPromise = null;
+      return null;
+    });
+
+  return traumaAlertAudioPromise;
+}
+
+function unlockTraumaAudio() {
+  const audioContext = ensureTraumaAudioContext();
+  if (!audioContext) return;
+  const ready = audioContext.state === "suspended"
+    ? audioContext.resume()
+    : Promise.resolve();
+  ready.then(() => loadTraumaAlertAudio(audioContext)).catch(() => {});
+}
+
+function playTraumaAlertSound() {
+  const audioContext = ensureTraumaAudioContext();
+  if (!audioContext) return;
+
+  const play = async () => {
+    const buffer = await loadTraumaAlertAudio(audioContext);
+    if (!buffer) return;
+
+    try {
+      activeTraumaAudioSource?.stop();
+    } catch (_err) {
+      // The previous source may already have ended.
+    }
+
+    const source = audioContext.createBufferSource();
+    const volume = audioContext.createGain();
+    source.buffer = buffer;
+    volume.gain.setValueAtTime(0.78, audioContext.currentTime);
+    source.connect(volume);
+    volume.connect(audioContext.destination);
+    source.onended = () => {
+      if (activeTraumaAudioSource === source) activeTraumaAudioSource = null;
+    };
+    activeTraumaAudioSource = source;
+    source.start();
+  };
+
+  if (audioContext.state === "suspended") {
+    audioContext.resume().then(play).catch(() => {});
+  } else {
+    play().catch(() => {});
+  }
+}
+
+function showTraumaAlert(event) {
+  document.querySelector(".trauma-global-alert")?.remove();
+  const alertElement = document.createElement("aside");
+  alertElement.className = "trauma-global-alert";
+  alertElement.setAttribute("role", "alert");
+  alertElement.setAttribute("aria-live", "assertive");
+  alertElement.innerHTML = `
+    <div class="trauma-global-alert-mark" aria-hidden="true">&#9888;</div>
+    <div>
+      <span>Trauma adquirido</span>
+      <p>${esc(traumaAlertMessage(event))}</p>
+    </div>`;
+  document.body.appendChild(alertElement);
+  playTraumaAlertSound();
+  setTimeout(() => alertElement.remove(), 5000);
+}
+
+function announceTraumaEvent(event, campaign = session.campaign) {
+  if (!shouldAnnounceTraumaEvent(event, campaign)) return false;
+  markTraumaEventSeen(event, campaign);
+  showTraumaAlert(event);
+  return true;
+}
+
+window.addEventListener("pointerdown", unlockTraumaAudio, { passive: true });
+window.addEventListener("keydown", unlockTraumaAudio);
+
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     const modals = document.querySelectorAll(".modal");
@@ -515,6 +669,7 @@ function applyRemoteCampaignSnapshot(campaigns, meta = {}, user = firebaseUser) 
 
   const activeCampaignId = session.campaign?.id ? String(session.campaign.id) : null;
   const activePlayerId = session.player?.id ? String(session.player.id) : null;
+  let pendingTraumaEvent = null;
   lastRemoteCampaignJson = remoteJson;
   isApplyingRemoteState = true;
 
@@ -530,6 +685,7 @@ function applyRemoteCampaignSnapshot(campaigns, meta = {}, user = firebaseUser) 
       const updated = findCampaign(targetCampaignId);
       if (updated) {
         session.campaign = updated;
+        pendingTraumaEvent = updated.latestTraumaEvent || null;
         if (session.player) {
           session.player = updated.players.find(player => (
             String(player.id) === activePlayerId && player.authUid === user?.uid
@@ -544,6 +700,7 @@ function applyRemoteCampaignSnapshot(campaigns, meta = {}, user = firebaseUser) 
   if (session.campaign) lastSavedCampaignJson = JSON.stringify(session.campaign);
   setSyncStatus(syncText);
   render();
+  if (pendingTraumaEvent) announceTraumaEvent(pendingTraumaEvent, session.campaign);
   return true;
 }
 
@@ -908,6 +1065,9 @@ function nav() {
     ["sheet","♙ Meu Personagem"], ["inventory","▦ Inventário"], ["evidencePlayer","⌕ Evidências"], ["transferPlayer","⇄ Dar Item/Evidência"]
   ];
 
+  const traumaPosition = items.findIndex(([view]) => view === (m ? "skills" : "inventory"));
+  items.splice(traumaPosition < 0 ? items.length : traumaPosition, 0, ["traumas", "⚠ Traumas"]);
+
   return `
     <div class="side">
       <div class="brand"><span class="brand-sigil" aria-hidden="true">◉</span><span class="brand-copy"><b>Crônicas</b><small>do Infinito</small></span></div>
@@ -975,7 +1135,7 @@ function masterBody() {
   if (!c) return `<h2>Visão Geral</h2><p class="muted">Nenhuma campanha criada.</p><button onclick="newCampaign()">➕ Criar Campanha</button>`;
 
   const views = {
-    messages: messagesPage, room: roomPage, scenes: masterScenesPage, characters: charactersPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
+    messages: messagesPage, room: roomPage, scenes: masterScenesPage, characters: charactersPage, traumas: masterTraumasPage, skills: masterSkillsManagerPage, diceLogs: masterDiceLogsPage,
     cases: () => recordsPage("cases", "📁 Casos"), creatures: creaturesPage,
     items: itemsMasterPage, evidence: evidencePage, marks: marksPage, players: playersPage
   };
@@ -1468,6 +1628,213 @@ function removeSkill(charId, idx) {
   const ch = session.campaign.characters.find(x => x.id === charId);
   ch.skills.splice(idx, 1);
   save(); render();
+}
+
+function formatTraumaDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
+}
+
+function traumaCard(trauma, characterId = "", canRemove = false) {
+  const acquiredAt = formatTraumaDate(trauma.acquiredAt);
+  const removing = traumaMutations.has(String(characterId));
+  return `
+    <article class="trauma-card" data-trauma-id="${esc(trauma.id)}">
+      ${entityVisual(trauma.image, trauma.title, "trauma-card-image")}
+      <div class="trauma-card-body">
+        <div class="trauma-card-heading">
+          <h3>${esc(trauma.title)}</h3>
+          ${canRemove ? `<button class="danger trauma-remove-button" title="Remover trauma" aria-label="Remover trauma ${esc(trauma.title)}" ${removing ? "disabled" : ""} onclick="removeCharacterTrauma(${jsArg(characterId)}, ${jsArg(trauma.id)})">&#10005;</button>` : ""}
+        </div>
+        <p>${esc(trauma.description)}</p>
+        ${acquiredAt ? `<time datetime="${esc(trauma.acquiredAt)}">Adquirido em ${esc(acquiredAt)}</time>` : ""}
+      </div>
+    </article>`;
+}
+
+function masterTraumasPage() {
+  const campaign = session.campaign;
+  const characters = campaign.characters || [];
+  characters.forEach(character => { character.traumas ??= []; });
+
+  return `
+    <div class="page-heading trauma-page-heading">
+      <div>
+        <h2>&#9888; Traumas</h2>
+        <p class="muted">Aplique e remova traumas individualmente nos personagens da mesa.</p>
+      </div>
+      <button onclick="traumaModal()" ${characters.length ? "" : "disabled"}>Aplicar trauma</button>
+    </div>
+    ${characters.length ? `
+      <div class="trauma-character-list">
+        ${characters.map(character => `
+          <section class="trauma-character-section">
+            <header class="trauma-character-heading">
+              <div class="trauma-character-identity">
+                ${entityVisual(character.image, character.name, "trauma-character-portrait")}
+                <div>
+                  <h3>${esc(character.name)}</h3>
+                  <span class="tag">Origem: ${esc(character.origin || "Sem origem")}</span>
+                </div>
+              </div>
+              <div class="trauma-character-actions">
+                <span class="muted">${character.traumas.length} trauma${character.traumas.length === 1 ? "" : "s"}</span>
+                <button onclick="traumaModal(${jsArg(character.id)})">Aplicar trauma</button>
+              </div>
+            </header>
+            ${character.traumas.length
+              ? `<div class="trauma-card-grid">${character.traumas.map(trauma => traumaCard(trauma, character.id, true)).join("")}</div>`
+              : `<p class="trauma-empty-character muted">Nenhum trauma aplicado a este personagem.</p>`}
+          </section>`).join("")}
+      </div>`
+      : `<div class="empty-state"><h3>Nenhum personagem criado</h3><p>Crie um personagem antes de aplicar um trauma.</p></div>`}`;
+}
+
+function playerTraumasPage(character) {
+  character.traumas ??= [];
+  return `
+    <div class="page-heading trauma-page-heading">
+      <div>
+        <h2>&#9888; Meus Traumas</h2>
+        <p class="muted">${esc(character.origin || "Personagem")} · ${character.traumas.length} trauma${character.traumas.length === 1 ? "" : "s"}</p>
+      </div>
+    </div>
+    ${character.traumas.length
+      ? `<div class="trauma-card-grid trauma-player-grid">${character.traumas.map(trauma => traumaCard(trauma)).join("")}</div>`
+      : `<div class="empty-state trauma-empty-state"><h3>Nenhum trauma</h3><p>Este personagem ainda não adquiriu traumas.</p></div>`}`;
+}
+
+function traumaModal(characterId = "") {
+  if (session.role !== "master") return;
+  const characters = session.campaign?.characters || [];
+  if (!characters.length) return alert("Crie um personagem antes de aplicar um trauma.");
+  const selectedId = characters.some(character => String(character.id) === String(characterId))
+    ? String(characterId)
+    : String(characters[0].id);
+
+  root.insertAdjacentHTML("beforeend", `
+    <div class="modal"><div class="modalbox trauma-modalbox">
+      <h2>Aplicar trauma</h2>
+      <label>Personagem</label>
+      <select id="traumaCharacter" required>
+        ${characters.map(character => `<option value="${esc(character.id)}" ${String(character.id) === selectedId ? "selected" : ""}>${esc(character.name)} · ${esc(character.origin || "Sem origem")}</option>`).join("")}
+      </select>
+      <label>Título <span class="required-marker">*</span></label>
+      <input id="traumaTitle" maxlength="80" required placeholder="Ex.: Aracnofobia">
+      <label>Descrição <span class="required-marker">*</span></label>
+      <textarea id="traumaDescription" maxlength="600" required placeholder="Descreva o trauma e seus efeitos narrativos."></textarea>
+      ${imgInput("traumaImage", "Imagem do trauma", "", true)}
+      <div class="modal-actions">
+        <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
+        <button id="applyTraumaButton" onclick="applyTrauma()">Aplicar trauma</button>
+      </div>
+    </div></div>`);
+}
+
+async function applyTrauma() {
+  if (session.role !== "master" || !session.campaign) return;
+  const characterId = String(document.getElementById("traumaCharacter")?.value || "");
+  const title = String(document.getElementById("traumaTitle")?.value || "").trim().slice(0, 80);
+  const description = String(document.getElementById("traumaDescription")?.value || "").trim().slice(0, 600);
+  const file = document.getElementById("traumaImage")?.files?.[0];
+  const button = document.getElementById("applyTraumaButton");
+  const campaign = session.campaign;
+  const character = campaign.characters.find(entry => String(entry.id) === characterId);
+
+  if (!character || !title || !description || !file) {
+    return alert("Escolha o personagem e preencha título, descrição e imagem do trauma.");
+  }
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Aplicando...";
+  }
+
+  let image = "";
+  try {
+    image = await readImg(file, 1000);
+    if (!image) throw new Error("Nao foi possivel processar a imagem do trauma.");
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
+
+    const acquiredAt = new Date().toISOString();
+    const trauma = tabletop?.normalizeTrauma
+      ? tabletop.normalizeTrauma({ id: uid(), title, description, image, acquiredAt }, uid)
+      : { id: uid(), title, description, image, acquiredAt };
+    const event = {
+      id: uid(),
+      origin: String(character.origin || "Sem origem"),
+      traumaTitle: trauma.title,
+      createdAt: acquiredAt
+    };
+    const previousTraumas = [...(character.traumas || [])];
+    const previousEvent = campaign.latestTraumaEvent;
+
+    character.traumas = [trauma, ...previousTraumas];
+    campaign.latestTraumaEvent = event;
+    traumaMutations.add(characterId);
+    persistLocal();
+
+    try {
+      if (usingFirebase()) {
+        await window.CDIFirebase.updateCharacterTraumas(campaign.id, character.id, character.traumas, event);
+        lastSavedCampaignJson = JSON.stringify(campaign);
+      }
+    } catch (err) {
+      character.traumas = previousTraumas;
+      if (previousEvent === undefined) delete campaign.latestTraumaEvent;
+      else campaign.latestTraumaEvent = previousEvent;
+      persistLocal();
+      throw err;
+    }
+
+    document.querySelector(".modal")?.remove();
+    traumaMutations.delete(characterId);
+    render();
+    announceTraumaEvent(event, campaign);
+    toast("Trauma aplicado.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "Aplicar trauma";
+    }
+  } finally {
+    traumaMutations.delete(characterId);
+  }
+}
+
+async function removeCharacterTrauma(characterId, traumaId) {
+  if (session.role !== "master" || !session.campaign) return;
+  const campaign = session.campaign;
+  const character = campaign.characters.find(entry => String(entry.id) === String(characterId));
+  const trauma = character?.traumas?.find(entry => String(entry.id) === String(traumaId));
+  if (!character || !trauma || traumaMutations.has(String(characterId))) return;
+  if (!confirm(`Remover o trauma "${trauma.title}" deste personagem?`)) return;
+
+  const previousTraumas = [...character.traumas];
+  traumaMutations.add(String(characterId));
+  try {
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
+    character.traumas = character.traumas.filter(entry => String(entry.id) !== String(traumaId));
+    persistLocal();
+    render();
+
+    if (usingFirebase()) {
+      await window.CDIFirebase.updateCharacterTraumas(campaign.id, character.id, character.traumas);
+      lastSavedCampaignJson = JSON.stringify(campaign);
+    }
+    toast("Trauma removido.");
+  } catch (err) {
+    console.error(err);
+    character.traumas = previousTraumas;
+    persistLocal();
+    alert(firebaseErrorMessage(err));
+  } finally {
+    traumaMutations.delete(String(characterId));
+    render();
+  }
 }
 
 function chatMessageIdentity(message, campaign = session.campaign) {
@@ -2011,6 +2378,7 @@ function playerBody() {
       <h2>👤 Meu Personagem</h2>
       <p class="muted">Você ainda não está vinculado a nenhum personagem desta campanha. Peça ao Mestre para associá-lo.</p>`;
   }
+  if (v === "traumas") return playerTraumasPage(ch);
   if (v === "inventory") return inventoryPlayer(ch);
   if (v === "evidencePlayer") return evidencePlayer(ch);
   if (v === "transferPlayer") return transferPlayerPage(ch);

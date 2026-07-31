@@ -21,6 +21,35 @@ test("normalizes legacy links without losing the prepared character", () => {
   assert.equal(campaign.players[0].characterId, "char-1");
   assert.equal(campaign.characters[0].controllerPlayerId, "player-1");
   assert.deepEqual(campaign.characters[0].inventory, []);
+  assert.deepEqual(campaign.characters[0].traumas, []);
+});
+
+test("normalizes individual trauma cards without exposing them on the campaign root", () => {
+  const campaign = {
+    players: [],
+    characters: [{
+      id: "char-1",
+      traumas: [{
+        id: "trauma-1",
+        title: "Aracnofobia",
+        description: "Medo intenso de aranhas.",
+        image: "aranha.jpg",
+        acquiredAt: "2026-07-30T21:45:00.000Z"
+      }]
+    }]
+  };
+
+  tabletop.normalizeCampaign(campaign, sequentialIds());
+
+  assert.equal(campaign.characters[0].traumas.length, 1);
+  assert.deepEqual(campaign.characters[0].traumas[0], {
+    id: "trauma-1",
+    title: "Aracnofobia",
+    description: "Medo intenso de aranhas.",
+    image: "aranha.jpg",
+    acquiredAt: "2026-07-30T21:45:00.000Z"
+  });
+  assert.equal("traumas" in campaign, false);
 });
 
 test("prevents the same character from being assigned to two players", () => {

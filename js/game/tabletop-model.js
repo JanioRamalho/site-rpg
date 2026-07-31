@@ -31,6 +31,16 @@
     return target;
   }
 
+  function normalizeTrauma(trauma, makeId = defaultId) {
+    const target = trauma && typeof trauma === "object" ? trauma : {};
+    target.id = String(target.id || makeId());
+    target.title = String(target.title || "Trauma");
+    target.description = String(target.description || "");
+    target.image = String(target.image || "");
+    target.acquiredAt = target.acquiredAt || new Date().toISOString();
+    return target;
+  }
+
   function normalizePlayer(player, makeId = defaultId) {
     const target = player && typeof player === "object" ? player : {};
     const email = String(target.email || "").trim();
@@ -57,6 +67,9 @@
     target.inventory = Array.isArray(target.inventory)
         ? target.inventory.map(entry => normalizeInventoryEntry(entry, makeId))
         : [];
+    target.traumas = Array.isArray(target.traumas)
+      ? target.traumas.map(trauma => normalizeTrauma(trauma, makeId))
+      : [];
     return target;
   }
 
@@ -360,6 +373,7 @@
     normalizeGameBoard,
     normalizePlayer,
     normalizeScene,
+    normalizeTrauma,
     publishScene,
     presenceState,
     releasePlayer,

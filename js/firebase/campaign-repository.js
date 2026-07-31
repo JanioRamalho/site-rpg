@@ -517,6 +517,39 @@ export function createCampaignRepository(ctx) {
     return update;
   }
 
+  async function updateCharacterTraumas(campaignId, characterId, traumas, traumaEvent = null) {
+    if (!campaignId || !characterId || !auth.currentUser) {
+      throw new Error("Traumas de personagem invalidos.");
+    }
+
+    const cleanTraumas = stripUndefined(Array.isArray(traumas) ? traumas : []);
+    const updatedAt = new Date().toISOString();
+    const characterUpdate = {
+      traumas: cleanTraumas,
+      traumasUpdatedAt: updatedAt
+    };
+    const campaignUpdate = {
+      updatedAt,
+      ...(traumaEvent ? { latestTraumaEvent: stripUndefined(traumaEvent) } : {})
+    };
+    const campaignRef = api.doc(db, "campaigns", campaignId);
+    const characterRef = api.doc(db, "campaigns", campaignId, "characters", String(characterId));
+
+    await withRetry(() => api.runTransaction(db, async transaction => {
+      transaction.update(characterRef, characterUpdate);
+      transaction.update(campaignRef, campaignUpdate);
+    }), ctx);
+
+    const cachedCharacter = campaignSaveCache.get(campaignId)?.characters
+      ?.find(character => String(character.id) === String(characterId));
+    if (cachedCharacter) Object.assign(cachedCharacter, stripUndefined(characterUpdate));
+
+    return {
+      ...characterUpdate,
+      latestTraumaEvent: campaignUpdate.latestTraumaEvent || null
+    };
+  }
+
   async function assignPlayerCharacter(campaignId, playerId, characterId) {
     if (!campaignId || !playerId || !auth.currentUser) throw new Error("Vinculo de personagem invalido.");
 
@@ -784,6 +817,7 @@ export function createCampaignRepository(ctx) {
     saveCampaign,
     sendCampaignMessage,
     setPlayerPresence,
+    updateCharacterTraumas,
     updateCharacterInventory,
     watchCampaigns
   };

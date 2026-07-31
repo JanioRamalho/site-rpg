@@ -144,6 +144,64 @@ test("master inventory delivery writes the character document immediately", asyn
   assert.deepEqual(result.inventory, inventory);
 });
 
+test("applies a trauma and its anonymous public event in one transaction", async () => {
+  const prefix = "db/campaigns/campaign-1";
+  const { context, documents, writes } = createFakeContext({
+    user: { uid: "master-1", email: "master@example.com" },
+    documents: {
+      [`${prefix}`]: { id: "campaign-1", masterId: "master-1" },
+      [`${prefix}/characters/char-1`]: { id: "char-1", traumas: [] }
+    }
+  });
+  const repository = createCampaignRepository(context);
+  const traumas = [{
+    id: "trauma-1",
+    title: "Aracnofobia",
+    description: "Medo intenso de aranhas.",
+    image: "aranha.jpg",
+    acquiredAt: "2026-07-30T21:45:00.000Z"
+  }];
+  const event = {
+    id: "event-1",
+    origin: "Medica",
+    traumaTitle: "Aracnofobia",
+    createdAt: "2026-07-30T21:45:00.000Z"
+  };
+
+  const result = await repository.updateCharacterTraumas("campaign-1", "char-1", traumas, event);
+
+  assert.deepEqual(documents.get(`${prefix}/characters/char-1`).traumas, traumas);
+  assert.deepEqual(documents.get(prefix).latestTraumaEvent, event);
+  assert.equal("characterName" in documents.get(prefix).latestTraumaEvent, false);
+  assert.equal("playerName" in documents.get(prefix).latestTraumaEvent, false);
+  assert.deepEqual(result.latestTraumaEvent, event);
+  assert.equal(writes.filter(write => write.method === "transaction-update").length, 2);
+});
+
+test("removes a trauma without publishing another acquisition event", async () => {
+  const prefix = "db/campaigns/campaign-1";
+  const previousEvent = {
+    id: "event-1",
+    origin: "Medica",
+    traumaTitle: "Aracnofobia",
+    createdAt: "2026-07-30T21:45:00.000Z"
+  };
+  const { context, documents } = createFakeContext({
+    user: { uid: "master-1", email: "master@example.com" },
+    documents: {
+      [`${prefix}`]: { id: "campaign-1", latestTraumaEvent: previousEvent },
+      [`${prefix}/characters/char-1`]: { id: "char-1", traumas: [{ id: "trauma-1" }] }
+    }
+  });
+  const repository = createCampaignRepository(context);
+
+  const result = await repository.updateCharacterTraumas("campaign-1", "char-1", []);
+
+  assert.deepEqual(documents.get(`${prefix}/characters/char-1`).traumas, []);
+  assert.deepEqual(documents.get(prefix).latestTraumaEvent, previousEvent);
+  assert.equal(result.latestTraumaEvent, null);
+});
+
 test("join rejects an account without a character prepared by the master", async () => {
   const baseCampaign = {
     id: "campaign-1",
