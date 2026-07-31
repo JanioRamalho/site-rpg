@@ -83,6 +83,14 @@
     };
   }
 
+  function normalizeGameBoard(board) {
+    const target = board && typeof board === "object" ? board : {};
+    return {
+      image: String(target.image || ""),
+      updatedAt: target.updatedAt || null
+    };
+  }
+
   function normalizeCampaign(campaign, makeId = defaultId) {
     if (!campaign || typeof campaign !== "object") return campaign;
 
@@ -103,6 +111,7 @@
       ? campaign.scenes.map(scene => normalizeScene(scene, makeId))
       : [];
     campaign.liveScene = normalizeLiveScene(campaign.liveScene);
+    campaign.gameBoard = normalizeGameBoard(campaign.gameBoard);
 
     const playersById = new Map(campaign.players.map(player => [player.id, player]));
     const charactersById = new Map(campaign.characters.map(character => [character.id, character]));
@@ -348,6 +357,7 @@
     normalizeEmail,
     normalizeInventoryEntry,
     normalizeLiveScene,
+    normalizeGameBoard,
     normalizePlayer,
     normalizeScene,
     publishScene,

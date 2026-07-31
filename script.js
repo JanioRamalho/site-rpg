@@ -15,6 +15,10 @@ const OFFICIAL_SKILLS = [
 ];
 
 const ICONS_LIST = ["🗡️", "🛡️", "🔮", "🔥", "⚡", "📜", "🗝️", "🎯", "🧬", "🧪", "🕵️", "💣", "🩸", "🕯️", "👻"];
+const CHAT_AUTHOR_COLORS = [
+  "#7dd3fc", "#f9a8d4", "#86efac", "#c4b5fd", "#fdba74",
+  "#fca5a5", "#fde68a", "#67e8f9", "#bef264", "#d8b4fe"
+];
 const tabletop = window.CDITabletop;
 
 // Estado Global
@@ -28,6 +32,7 @@ state.campaigns?.forEach(c => {
   c.items ??= [];
   c.evidence ??= [];
   c.itemTransfers ??= [];
+  c.gameBoard ??= { image: "", updatedAt: null };
 });
 
 let session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
@@ -49,6 +54,8 @@ const resolvingTransfers = new Set();
 const linkingPlayers = new Set();
 const selectedSceneIds = new Map();
 let sceneUploadInProgress = false;
+let boardUploadInProgress = false;
+let chatSendInProgress = false;
 
 const SESSION_STORAGE_KEY = "cdi_session_context_v2";
 const MASTER_VIEWS = new Set([
@@ -237,6 +244,7 @@ function normalizeCampaign(c) {
   c.messages ??= [];
   c.customSkills ??= [...OFFICIAL_SKILLS];
   c.itemTransfers ??= [];
+  c.gameBoard ??= { image: "", updatedAt: null };
   c.members ??= [c.masterId, ...c.players.map(p => p.authUid).filter(Boolean)];
   ["players", "characters", "cases", "creatures", "items", "evidence", "marks", "diceLogs", "messages", "itemTransfers"].forEach(key => {
     c[key].forEach(item => item.id ??= uid());
@@ -887,7 +895,7 @@ function nav() {
   const m = session.role === "master";
   const items = m ? [
     ["messages","✉ Mensagens"],
-    ["room","◉ Sala"],
+    ["room","◉ Game"],
     ["scenes","▣ Cenas"],
     ["home","⌂ Visão Geral"], ["campaigns","▤ Campanhas"], ["characters","♙ Personagens"],
     ["skills","✦ Habilidades"], ["diceLogs","◷ Histórico"], ["cases","▱ Casos"],
@@ -895,7 +903,7 @@ function nav() {
     ["marks","◇ Marcas"], ["transfers", "⇄ Permissões / Trocas"], ["players","♟ Jogadores"], ["settings","⚙ Configurações"]
   ] : [
     ["messages","✉ Mensagens"],
-    ["room","◉ Sala"],
+    ["room","◉ Game"],
     ["scenes","▣ Cenas"],
     ["sheet","♙ Meu Personagem"], ["inventory","▦ Inventário"], ["evidencePlayer","⌕ Evidências"], ["transferPlayer","⇄ Dar Item/Evidência"]
   ];
@@ -942,6 +950,7 @@ function render() {
     c.items ??= [];
     c.evidence ??= [];
     c.itemTransfers ??= [];
+    c.gameBoard ??= { image: "", updatedAt: null };
   }
   root.innerHTML = `
     <div class="app">
@@ -1391,7 +1400,7 @@ function characterModal(index = null) {
     <div class="modal"><div class="modalbox">
       <h2>👑 Ficha (Mestre)</h2>
       <label>Nome</label><input id="cname" value="${esc(x.name)}">
-      ${imgInput("photo", "Foto do personagem", x.image)}
+      ${imgInput("photo", "Foto do rosto do personagem", x.image)}
       <label>Origem</label><select id="origin">${ORIGINS.map(o => `<option ${o === x.origin ? "selected" : ""}>${o}</option>`).join("")}</select>
       <div class="two">
         <div><label>Saúde Máx</label><input id="hm" type="number" value="${x.healthMax}"></div>
@@ -1461,47 +1470,137 @@ function removeSkill(charId, idx) {
   save(); render();
 }
 
+function chatMessageIdentity(message, campaign = session.campaign) {
+  const authorId = String(message?.authorId || "");
+  const rawAuthor = String(message?.author || "").trim();
+  const isSystem = rawAuthor.toLowerCase() === "sistema";
+  const isMaster = !isSystem && Boolean(authorId) && authorId === String(campaign?.masterId || "");
+  let name = rawAuthor || (isMaster ? "Mestre" : "Jogador");
+
+  if (isMaster) {
+    const legacyMasterName = name.match(/^Mestre\s*\((.+)\)$/i);
+    if (legacyMasterName) name = legacyMasterName[1].trim();
+  } else if (!isSystem) {
+    const player = campaign?.players?.find(entry => (
+      String(entry.authUid || entry.id || "") === authorId
+    ));
+    if (player?.name) name = String(player.name).trim();
+  }
+
+  return { authorId, isMaster, isSystem, name: name || "Jogador" };
+}
+
+function chatAuthorColor(identity, campaign = session.campaign) {
+  if (identity.isSystem) return "#aeb7b2";
+  const participantIds = [
+    String(campaign?.masterId || ""),
+    ...(campaign?.players || []).map(player => String(player.authUid || player.id || ""))
+  ].filter((id, index, ids) => id && ids.indexOf(id) === index);
+  const participantIndex = participantIds.indexOf(identity.authorId);
+  if (participantIndex >= 0) {
+    if (participantIndex < CHAT_AUTHOR_COLORS.length) return CHAT_AUTHOR_COLORS[participantIndex];
+    const hue = Math.round((participantIndex * 137.508 + 190) % 360);
+    return `hsl(${hue} 72% 72%)`;
+  }
+
+  let hash = 0;
+  const fallbackKey = identity.authorId || identity.name;
+  for (let index = 0; index < fallbackKey.length; index += 1) {
+    hash = ((hash << 5) - hash + fallbackKey.charCodeAt(index)) | 0;
+  }
+  return CHAT_AUTHOR_COLORS[Math.abs(hash) % CHAT_AUTHOR_COLORS.length];
+}
+
+function scrollChatToLatest(focusComposer = false) {
+  setTimeout(() => {
+    const list = document.getElementById("chatList");
+    if (list) list.scrollTop = list.scrollHeight;
+    if (focusComposer) document.getElementById("msgText")?.focus?.();
+  }, 0);
+}
+
 function messagesPage() {
   const c = session.campaign;
   c.messages ??= [];
-  const messages = c.messages.slice(0, 80);
+  const messages = c.messages.slice(0, 100).reverse();
+  scrollChatToLatest();
   return `
     <h2>💬 Mensagens</h2>
-    <div class="card chat-panel">
-      <div class="chat-list">
-        ${messages.length === 0 ? '<p class="muted">Nenhuma mensagem enviada ainda.</p>' : messages.map(m => `
-          <div class="chat-message">
-            <div><b>${esc(m.author)}</b> <span class="muted">${esc(m.time || "")}</span></div>
-            <p>${esc(m.text)}</p>
-          </div>`).join("")}
+    <section class="chat-panel">
+      <div id="chatList" class="chat-list" role="log" aria-live="polite" aria-relevant="additions text">
+        ${messages.length === 0 ? '<p class="chat-empty muted">Nenhuma mensagem enviada ainda.</p>' : messages.map(message => {
+          const identity = chatMessageIdentity(message, c);
+          const color = chatAuthorColor(identity, c);
+          return `
+            <div class="chat-message ${identity.isMaster ? "is-master" : ""} ${identity.isSystem ? "is-system" : ""}" data-message-id="${esc(message.id)}">
+              <p class="chat-message-line">
+                <span class="chat-author" style="--chat-author-color:${color}">[${esc(identity.name)}${identity.isMaster ? ` <span class="chat-master-crown" title="Mestre da mesa" aria-label="Mestre da mesa">&#9819;</span>` : ""}]</span><span class="chat-colon">:</span>
+                <span class="chat-message-text">${esc(message.text)}</span>
+              </p>
+              ${message.time ? `<time class="chat-message-time" ${message.sentAt ? `datetime="${esc(message.sentAt)}"` : ""}>${esc(message.time)}</time>` : ""}
+            </div>`;
+        }).join("")}
       </div>
       <div class="chat-compose">
-        <input id="msgText" placeholder="Escreva uma mensagem para a mesa" onkeydown="if(event.key==='Enter') sendMessage()">
-        <button onclick="sendMessage()">Enviar</button>
+        <input id="msgText" maxlength="500" autocomplete="off" placeholder="Escreva uma mensagem para a mesa" onkeydown="if(event.key==='Enter' && !event.isComposing) sendMessage()">
+        <button id="chatSendButton" onclick="sendMessage()" ${chatSendInProgress ? "disabled" : ""}>${chatSendInProgress ? "Enviando..." : "Enviar"}</button>
       </div>
-    </div>`;
+    </section>`;
 }
 
-function sendMessage() {
+async function sendMessage() {
   const input = document.getElementById("msgText");
-  const text = input.value.trim();
-  if (!text) return;
+  const text = String(input?.value || "").trim().slice(0, 500);
+  if (!text || chatSendInProgress || !session.campaign) return;
+
   const now = new Date();
   const author = session.role === "master"
-    ? `Mestre (${session.currentMaster?.name || "Mestre"})`
+    ? (session.currentMaster?.name || firebaseProfile?.name || "Mestre")
     : (session.player?.name || firebaseProfile?.name || "Jogador");
-
-  session.campaign.messages ??= [];
-  session.campaign.messages.unshift({
+  const campaign = session.campaign;
+  const message = {
     id: uid(),
     author,
     authorId: firebaseUser?.uid || session.currentMaster?.id || session.player?.id || "",
+    playerId: session.role === "player" ? session.player?.id || "" : "",
     text,
-    time: `${now.getHours().toString().padStart(2,'0')}:${now.getMinutes().toString().padStart(2,'0')}`
-  });
-  if (session.campaign.messages.length > 100) session.campaign.messages.pop();
-  save();
+    time: `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`,
+    sentAt: now.toISOString()
+  };
+
+  campaign.messages ??= [];
+  campaign.messages.unshift(message);
+  if (campaign.messages.length > 100) campaign.messages.length = 100;
+  persistLocal();
+
+  if (!usingFirebase()) {
+    render();
+    scrollChatToLatest(true);
+    return;
+  }
+
+  chatSendInProgress = true;
+  setSyncStatus("Sincronizando...");
   render();
+  scrollChatToLatest();
+
+  try {
+    await window.CDIFirebase.sendCampaignMessage(campaign.id, message);
+    setSyncStatus("Online em tempo real");
+  } catch (err) {
+    console.error(err);
+    const activeCampaign = findCampaign(campaign.id) || campaign;
+    activeCampaign.messages = (activeCampaign.messages || []).filter(entry => String(entry.id) !== message.id);
+    persistLocal();
+    setSyncStatus("Falha de sincronizacao");
+    toast("Nao foi possivel enviar a mensagem.");
+  } finally {
+    chatSendInProgress = false;
+    if (session.view === "messages") {
+      render();
+      scrollChatToLatest(true);
+    }
+  }
 }
 
 function formatLastSeen(value) {
@@ -1511,43 +1610,144 @@ function formatLastSeen(value) {
   return date.toLocaleString("pt-BR", { dateStyle: "short", timeStyle: "short" });
 }
 
+function boundedStat(value, maxValue) {
+  const parsedValue = Math.max(0, Number(value) || 0);
+  const max = Math.max(1, Number(maxValue) || parsedValue || 1);
+  const current = Math.max(0, Math.min(max, parsedValue));
+  return { current, max, percent: Math.round((current / max) * 100) };
+}
+
+function gameStatMeter(character, key, label, cssClass, canEdit) {
+  const stat = boundedStat(character[key], character[`${key}Max`]);
+  const decrease = canEdit
+    ? `<button class="game-stat-step" title="Reduzir ${esc(label)}" aria-label="Reduzir ${esc(label)}" onclick="adjustGameCardStat(${jsArg(character.id)}, ${jsArg(key)}, -1)">-</button>`
+    : "";
+  const increase = canEdit
+    ? `<button class="game-stat-step" title="Aumentar ${esc(label)}" aria-label="Aumentar ${esc(label)}" onclick="adjustGameCardStat(${jsArg(character.id)}, ${jsArg(key)}, 1)">+</button>`
+    : "";
+
+  return `
+    <div class="game-stat-row">
+      <div class="game-stat-head">
+        <span>${esc(label)}</span>
+        <strong>${stat.current}/${stat.max}</strong>
+      </div>
+      <div class="game-stat-track">
+        ${decrease}
+        <div class="bar game-stat-bar"><div class="fill ${cssClass}" style="width:${stat.percent}%"></div></div>
+        ${increase}
+      </div>
+    </div>`;
+}
+
 function roomPage() {
   const c = session.campaign;
   const participants = tabletop?.getControlledParticipants(c) || [];
   const statusLabels = { online: "Online", away: "Ausente", offline: "Offline" };
   const claimedWithoutCharacter = c.players.filter(player => player.authUid && !player.characterId).length;
+  const board = c.gameBoard || {};
+  const boardImage = String(board.image || "");
+  const isMaster = session.role === "master";
 
   return `
-    <div class="page-heading">
+    <div class="page-heading game-heading">
       <div>
-        <h2>Sala</h2>
-        <p class="muted">${participants.length} personagem${participants.length === 1 ? "" : "s"} em jogo</p>
+        <h2>Game</h2>
+        <p class="muted">${participants.length} carta${participants.length === 1 ? "" : "s"} de status em tempo real</p>
       </div>
-      ${session.role === "master" && claimedWithoutCharacter
-        ? `<span class="notice-badge">${claimedWithoutCharacter} jogador${claimedWithoutCharacter === 1 ? "" : "es"} sem personagem</span>`
-        : ""}
+      <div class="game-heading-actions">
+        ${isMaster ? `
+          <input id="gameBoardFile" class="visually-hidden" type="file" accept="image/*" onchange="uploadGameBoard(this.files)">
+          <label class="button-label ${boardUploadInProgress ? "is-disabled" : ""}" for="gameBoardFile">${boardUploadInProgress ? "Enviando..." : "Trocar tabuleiro"}</label>
+        ` : ""}
+        ${isMaster && claimedWithoutCharacter
+          ? `<span class="notice-badge">${claimedWithoutCharacter} jogador${claimedWithoutCharacter === 1 ? "" : "es"} sem personagem</span>`
+          : ""}
+      </div>
     </div>
-    <div class="participant-grid">
-      ${participants.map(({ player, character, presence }) => `
-        <article class="participant-card">
-          ${entityVisual(character.image, character.name, "participant-avatar")}
-          <div class="participant-info">
-            <div class="participant-title">
-              <h3>${esc(character.name)}</h3>
-              <span class="presence presence-${presence}"><span class="presence-dot"></span>${statusLabels[presence]}</span>
+
+    <section class="game-board-area">
+      <figure id="gameBoardStage" class="game-board-stage ${boardImage ? "" : "is-empty"}">
+        ${boardImage
+          ? `<div class="game-board-canvas">
+              <img class="game-board-image" src="${esc(boardImage)}" alt="Tabuleiro compartilhado pelo Mestre" onclick="toggleGameBoardFullscreen()">
+              ${participants.length ? `
+                <section class="game-card-row" aria-label="Status dos personagens">
+                  ${participants.map(({ character, presence }) => {
+                    const label = String(character.origin || character.class || "Sem origem").trim() || "Sem origem";
+                    const defense = Number(character.defense) || 10;
+                    return `
+                      <article class="game-character-card">
+                        <div class="game-card-portrait-wrap">
+                          ${entityVisual(character.image, label, "game-card-portrait")}
+                          <div class="game-card-topline">
+                            <span class="game-card-label">${esc(label)}</span>
+                            <span class="game-card-presence presence-${presence}" title="${esc(statusLabels[presence])}" aria-label="${esc(statusLabels[presence])}">
+                              <span class="presence-dot"></span>
+                            </span>
+                          </div>
+                          <div class="game-defense-pill" title="Defesa ${defense}" aria-label="Defesa ${defense}">
+                            <span>DEF</span>
+                            <strong>${defense}</strong>
+                          </div>
+                          <div class="game-card-body">
+                            ${gameStatMeter(character, "health", "Saude", "health", isMaster)}
+                            ${gameStatMeter(character, "sanity", "Sanidade", "sanity", isMaster)}
+                          </div>
+                        </div>
+                      </article>`;
+                  }).join("")}
+                </section>` : ""}
+            </div>`
+          : `<div class="game-board-placeholder">
+              <span aria-hidden="true">◎</span>
+              <h3>${isMaster ? "Envie o tabuleiro da sessao" : "Aguardando o tabuleiro do Mestre"}</h3>
+              <p class="muted">${isMaster ? "A imagem aparecera aqui para todos os jogadores." : "Quando o Mestre publicar uma imagem, ela aparece aqui em tempo real."}</p>
             </div>
-            <p>${esc(character.origin || "Origem nao definida")}</p>
-            <div class="participant-meta">
-              <span>Jogador: <b>${esc(player.name)}</b></span>
-              <span>Ultima atividade: ${esc(formatLastSeen(player.lastSeen))}</span>
-            </div>
-          </div>
-        </article>`).join("") || `
-        <div class="empty-state">
-          <h3>Nenhum personagem em jogo</h3>
-          <p class="muted">A sala exibira os personagens assim que os jogadores vinculados entrarem.</p>
-        </div>`}
-    </div>`;
+          `}
+      </figure>
+    </section>`;
+}
+
+async function uploadGameBoard(fileList) {
+  const file = Array.from(fileList || []).find(entry => String(entry.type || "").startsWith("image/"));
+  if (!file || boardUploadInProgress || session.role !== "master" || !session.campaign) return;
+
+  boardUploadInProgress = true;
+  render();
+  try {
+    const image = await readImg(file, 2400);
+    if (!image) return alert("Nao foi possivel processar o tabuleiro selecionado.");
+    session.campaign.gameBoard = {
+      image,
+      updatedAt: new Date().toISOString()
+    };
+    save();
+  } catch (err) {
+    console.error(err);
+    alert("Nao foi possivel enviar o tabuleiro.");
+  } finally {
+    boardUploadInProgress = false;
+    render();
+  }
+}
+
+function adjustGameCardStat(characterId, key, delta) {
+  if (session.role !== "master" || !session.campaign) return;
+  if (!["health", "sanity"].includes(key)) return;
+  const character = session.campaign.characters.find(entry => entry.id === String(characterId));
+  if (!character) return;
+  const max = Math.max(1, Number(character[`${key}Max`]) || 1);
+  character[key] = Math.max(0, Math.min(max, (Number(character[key]) || 0) + Number(delta || 0)));
+  save();
+  render();
+}
+
+function toggleGameBoardFullscreen() {
+  const stage = document.getElementById("gameBoardStage");
+  if (!stage) return;
+  const action = document.fullscreenElement ? document.exitFullscreen?.() : stage.requestFullscreen?.();
+  action?.catch?.(() => toast("O navegador nao permitiu abrir em tela cheia."));
 }
 
 function selectedMasterScene(campaign = session.campaign) {

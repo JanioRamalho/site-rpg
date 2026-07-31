@@ -454,6 +454,45 @@ export function createCampaignRepository(ctx) {
     }
   }
 
+  async function sendCampaignMessage(campaignId, message) {
+    if (!campaignId || !auth.currentUser) throw new Error("Mensagem sem campanha ou usuario autenticado.");
+
+    const now = new Date();
+    const sentAt = String(message?.sentAt || now.toISOString());
+    const text = String(message?.text || "").trim().slice(0, 500);
+    if (!text) throw new Error("A mensagem esta vazia.");
+
+    const outgoing = stripUndefined({
+      id: String(message?.id || makeId()),
+      author: String(message?.author || "Jogador").trim().slice(0, 60) || "Jogador",
+      authorId: auth.currentUser.uid,
+      playerId: message?.playerId ? String(message.playerId) : undefined,
+      text,
+      time: String(message?.time || `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`),
+      sentAt
+    });
+    const sentAtMs = Date.parse(sentAt);
+    const order = -(Number.isFinite(sentAtMs) ? sentAtMs : Date.now());
+    const stored = cleanSubDoc(outgoing, order);
+
+    try {
+      await withRetry(() => api.setDoc(
+        api.doc(db, "campaigns", campaignId, "messages", outgoing.id),
+        stored,
+        { merge: false }
+      ), ctx);
+    } catch (err) {
+      console.warn("SDK Firestore falhou ao enviar mensagem; usando REST.", err);
+      await restPatchDoc(`campaigns/${campaignId}/messages/${outgoing.id}`, stored);
+    }
+
+    const cachedMessages = campaignSaveCache.get(campaignId)?.messages;
+    if (cachedMessages && !cachedMessages.some(entry => String(entry.id) === outgoing.id)) {
+      cachedMessages.unshift({ ...outgoing });
+    }
+    return outgoing;
+  }
+
   async function updateCharacterInventory(campaignId, characterId, inventory) {
     if (!campaignId || !characterId || !auth.currentUser) {
       throw new Error("Inventario de personagem invalido.");
@@ -743,6 +782,7 @@ export function createCampaignRepository(ctx) {
     joinCampaign,
     resolveItemTransfer,
     saveCampaign,
+    sendCampaignMessage,
     setPlayerPresence,
     updateCharacterInventory,
     watchCampaigns

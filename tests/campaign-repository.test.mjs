@@ -97,6 +97,30 @@ test("player persistence never writes inventory or master-owned character fields
   assert.equal("inventory" in characterWrite.data, false);
 });
 
+test("chat sends one isolated message document with the authenticated author", async () => {
+  const { context, writes } = createFakeContext();
+  const repository = createCampaignRepository(context);
+
+  const message = await repository.sendCampaignMessage("campaign-1", {
+    id: "message-1",
+    author: "Ana",
+    authorId: "master-forged",
+    playerId: "player-1",
+    text: "Ola, mesa!",
+    time: "21:30",
+    sentAt: "2026-07-30T21:30:00.000Z"
+  });
+
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].method, "set");
+  assert.equal(writes[0].ref, "db/campaigns/campaign-1/messages/message-1");
+  assert.equal(writes[0].data.authorId, "auth-1");
+  assert.equal(writes[0].data.text, "Ola, mesa!");
+  assert.equal(writes[0].data.playerId, "player-1");
+  assert.equal(writes[0].data._order < 0, true);
+  assert.equal(message.authorId, "auth-1");
+});
+
 test("master inventory delivery writes the character document immediately", async () => {
   const { context, writes } = createFakeContext({
     user: { uid: "master-1", email: "master@example.com" }
