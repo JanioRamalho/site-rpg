@@ -22,6 +22,10 @@ service cloud.firestore {
       return /databases/$(database)/documents/campaigns/$(campaignId)/players/$(playerId);
     }
 
+    function characterPath(campaignId, characterId) {
+      return /databases/$(database)/documents/campaigns/$(campaignId)/characters/$(characterId);
+    }
+
     function isCampaignMemberById(campaignId) {
       return signedIn()
         && request.auth.uid in get(campaignPath(campaignId)).data.members;
@@ -106,6 +110,174 @@ service cloud.firestore {
       return signedIn() && request.resource.data.authorId == request.auth.uid;
     }
 
+    function publicChatEnabled(campaignId) {
+      let campaign = get(campaignPath(campaignId)).data;
+      return !campaign.keys().hasAny(['chatSettings'])
+        || campaign.chatSettings.publicEnabled == true;
+    }
+
+    function hasPrivateThreadOverride(settings, threadId) {
+      return settings.keys().hasAny(['privateThreads'])
+        && settings.privateThreads is map
+        && settings.privateThreads.keys().hasAny([threadId]);
+    }
+
+    function privateChatEnabled(campaignId, threadId) {
+      let campaign = get(campaignPath(campaignId)).data;
+      return !campaign.keys().hasAny(['chatSettings'])
+        || (
+          hasPrivateThreadOverride(campaign.chatSettings, threadId)
+          && campaign.chatSettings.privateThreads[threadId] == true
+        )
+        || (
+          !hasPrivateThreadOverride(campaign.chatSettings, threadId)
+          && (
+            !campaign.chatSettings.keys().hasAny(['privateEnabled'])
+            || campaign.chatSettings.privateEnabled == true
+          )
+        );
+    }
+
+    function canReadPrivateMessage(campaignId) {
+      return isCampaignMasterById(campaignId) || (
+        isCampaignMemberById(campaignId)
+        && resource.data.accessUid == request.auth.uid
+      );
+    }
+
+    function isValidPlayerPrivateConversation(campaignId, data) {
+      let playerIds = data.participantPlayerIds;
+      let characterIds = data.participantCharacterIds;
+      let authUids = data.participantAuthUids;
+      let origins = data.participantOrigins;
+      let playerOne = get(playerPath(campaignId, playerIds[0])).data;
+      let playerTwo = get(playerPath(campaignId, playerIds[1])).data;
+      let characterOne = get(characterPath(campaignId, characterIds[0])).data;
+      let characterTwo = get(characterPath(campaignId, characterIds[1])).data;
+      return data.conversationType == 'players'
+        && playerIds.size() == 2
+        && characterIds.size() == 2
+        && playerIds[0] != playerIds[1]
+        && characterIds[0] != characterIds[1]
+        && data.threadId == playerIds[0] + '::' + playerIds[1]
+        && exists(playerPath(campaignId, playerIds[0]))
+        && exists(playerPath(campaignId, playerIds[1]))
+        && exists(characterPath(campaignId, characterIds[0]))
+        && exists(characterPath(campaignId, characterIds[1]))
+        && playerOne.authUid == authUids[0]
+        && playerTwo.authUid == authUids[1]
+        && playerOne.characterId == characterIds[0]
+        && playerTwo.characterId == characterIds[1]
+        && characterOne.controllerPlayerId == playerIds[0]
+        && characterTwo.controllerPlayerId == playerIds[1]
+        && characterOne.origin == origins[0]
+        && characterTwo.origin == origins[1]
+        && (
+          (
+            isCampaignMasterById(campaignId)
+            && data.authorRole == 'master'
+            && data.authorOrigin == 'Mestre'
+          )
+          || (
+            data.authorRole == 'player'
+            && (
+              (
+                request.auth.uid == authUids[0]
+                && data.authorPlayerId == playerIds[0]
+                && data.authorCharacterId == characterIds[0]
+                && data.authorOrigin == origins[0]
+              )
+              || (
+                request.auth.uid == authUids[1]
+                && data.authorPlayerId == playerIds[1]
+                && data.authorCharacterId == characterIds[1]
+                && data.authorOrigin == origins[1]
+              )
+            )
+          )
+        );
+    }
+
+    function isValidMasterPrivateConversation(campaignId, data) {
+      let playerIds = data.participantPlayerIds;
+      let characterIds = data.participantCharacterIds;
+      let authUids = data.participantAuthUids;
+      let origins = data.participantOrigins;
+      let player = get(playerPath(campaignId, playerIds[0])).data;
+      let character = get(characterPath(campaignId, characterIds[0])).data;
+      return data.conversationType == 'master-player'
+        && playerIds.size() == 1
+        && characterIds.size() == 1
+        && data.threadId == 'master::' + playerIds[0]
+        && exists(playerPath(campaignId, playerIds[0]))
+        && exists(characterPath(campaignId, characterIds[0]))
+        && authUids[0] == get(campaignPath(campaignId)).data.masterId
+        && player.authUid == authUids[1]
+        && player.characterId == characterIds[0]
+        && character.controllerPlayerId == playerIds[0]
+        && origins[0] == 'Mestre'
+        && character.origin == origins[1]
+        && (
+          (
+            isCampaignMasterById(campaignId)
+            && data.authorRole == 'master'
+            && data.authorOrigin == 'Mestre'
+          )
+          || (
+            data.authorRole == 'player'
+            && request.auth.uid == authUids[1]
+            && data.authorPlayerId == playerIds[0]
+            && data.authorCharacterId == characterIds[0]
+            && data.authorOrigin == origins[1]
+          )
+        );
+    }
+
+    function isValidPrivateMessage(campaignId, docId) {
+      let data = request.resource.data;
+      let playerIds = data.participantPlayerIds;
+      let characterIds = data.participantCharacterIds;
+      let authUids = data.participantAuthUids;
+      let origins = data.participantOrigins;
+      return signedIn()
+        && privateChatEnabled(campaignId, data.threadId)
+        && data.id is string
+        && data.id.size() > 0
+        && data.threadId is string
+        && data.threadId.size() > 0
+        && data.conversationType is string
+        && data.text is string
+        && data.text.size() > 0
+        && data.text.size() <= 500
+        && playerIds is list
+        && characterIds is list
+        && authUids is list
+        && origins is list
+        && authUids.size() == 2
+        && origins.size() == 2
+        && authUids[0] != authUids[1]
+        && data.accessUid is string
+        && data.accessUid in authUids
+        && docId == data.id + '--' + data.accessUid
+        && data.authorId == request.auth.uid
+        && (
+          (
+            data.conversationType == 'players'
+            && isValidPlayerPrivateConversation(campaignId, data)
+          )
+          || (
+            data.conversationType == 'master-player'
+            && isValidMasterPrivateConversation(campaignId, data)
+          )
+        )
+        && data.keys().hasOnly([
+          'id', 'threadId', 'conversationType', 'participantPlayerIds',
+          'participantCharacterIds', 'participantAuthUids', 'participantOrigins',
+          'accessUid', 'authorId', 'authorRole', 'authorPlayerId',
+          'authorCharacterId', 'authorOrigin', 'text', 'time', 'sentAt', '_order'
+        ]);
+    }
+
     function isOwnIncomingTransfer(campaignId, docId) {
       let sourcePlayer = get(playerPath(campaignId, request.resource.data.fromPlayerId));
       return signedIn()
@@ -117,11 +289,20 @@ service cloud.firestore {
         && request.resource.data.fromCharacterId == sourcePlayer.data.characterId
         && !request.resource.data.keys().hasAny(['resolvedAt', 'resolvedBy'])
         && (
-          request.resource.data.type == 'evidence'
+          (
+            request.resource.data.type == 'evidence'
+            && request.resource.data.evidenceEntryId is string
+            && request.resource.data.evidenceId is string
+            && request.resource.data.toCharacterId is string
+            && request.resource.data.fromCharacterId != request.resource.data.toCharacterId
+            && exists(characterPath(campaignId, request.resource.data.toCharacterId))
+          )
           || (
             request.resource.data.type == 'item'
             && request.resource.data.inventoryId is string
             && request.resource.data.toCharacterId is string
+            && request.resource.data.fromCharacterId != request.resource.data.toCharacterId
+            && exists(characterPath(campaignId, request.resource.data.toCharacterId))
             && request.resource.data.quantity is int
             && request.resource.data.quantity > 0
           )
@@ -176,8 +357,17 @@ service cloud.firestore {
       match /messages/{docId} {
         allow read: if isCampaignMemberById(campaignId);
         allow create: if isCampaignMemberById(campaignId)
+          && publicChatEnabled(campaignId)
           && (isCampaignMasterById(campaignId) || isOwnIncomingMessageOrLog());
         allow update, delete: if isCampaignMasterById(campaignId);
+      }
+
+      match /privateMessages/{docId} {
+        allow read: if canReadPrivateMessage(campaignId);
+        allow create: if isCampaignMemberById(campaignId)
+          && isValidPrivateMessage(campaignId, docId);
+        allow update: if false;
+        allow delete: if isCampaignMasterById(campaignId);
       }
 
       match /diceLogs/{docId} {
@@ -210,10 +400,20 @@ service cloud.firestore {
         allow read, create, update, delete: if isCampaignMasterById(campaignId);
       }
 
+      match /evidence/{docId} {
+        allow read, create, update, delete: if isCampaignMasterById(campaignId);
+      }
+
       match /{subcollection}/{docId} {
         allow read: if subcollection != 'scenes'
+          && subcollection != 'evidence'
+          && subcollection != 'messages'
+          && subcollection != 'privateMessages'
           && isCampaignMemberById(campaignId);
         allow create, update, delete: if subcollection != 'scenes'
+          && subcollection != 'evidence'
+          && subcollection != 'messages'
+          && subcollection != 'privateMessages'
           && isCampaignMasterById(campaignId);
       }
     }

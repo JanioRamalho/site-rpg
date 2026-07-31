@@ -301,6 +301,30 @@ export function createCampaignRepository(ctx) {
     };
   }
 
+  function watchPrivateMessages(campaignId, options = {}, callback, onError) {
+    if (!campaignId || !auth.currentUser || typeof callback !== "function") return () => {};
+    const collectionRef = api.collection(db, "campaigns", campaignId, "privateMessages");
+    const source = options.role === "master"
+      ? collectionRef
+      : api.query(collectionRef, api.where("accessUid", "==", String(auth.currentUser.uid)));
+    return api.onSnapshot(
+      source,
+      { includeMetadataChanges: true },
+      snapshot => {
+        const uniqueMessages = new Map();
+        snapshot.docs.forEach(d => {
+          const message = { id: d.id, ...d.data() };
+          uniqueMessages.set(String(message.id), message);
+        });
+        callback(sortSubDocs([...uniqueMessages.values()]).slice(0, 500), {
+          fromCache: snapshot.metadata.fromCache,
+          hasPendingWrites: snapshot.metadata.hasPendingWrites
+        });
+      },
+      onError
+    );
+  }
+
   async function getCampaign(campaignId) {
     if (!campaignId) return null;
     let base = null;
@@ -413,7 +437,7 @@ export function createCampaignRepository(ctx) {
       await restPatchDoc(`campaigns/${campaignId}/players/${String(player.id)}`, cleanSubDoc(player, playerOrder));
     }
 
-    if (isFirstJoin) {
+    if (isFirstJoin && base.chatSettings?.publicEnabled !== false) {
       const now = new Date();
       const message = {
         id: makeId(),
@@ -493,7 +517,141 @@ export function createCampaignRepository(ctx) {
     return outgoing;
   }
 
-  async function updateCharacterInventory(campaignId, characterId, inventory) {
+  async function recordDiceRoll(campaignId, roll) {
+    if (!campaignId || !auth.currentUser) throw new Error("Rolagem sem campanha ou usuario autenticado.");
+
+    const now = new Date();
+    const createdAt = String(roll?.createdAt || now.toISOString());
+    const sides = Math.max(2, Math.trunc(Number(roll?.sides) || 20));
+    const die = Math.trunc(Number(roll?.die));
+    const bonus = Math.trunc(Number(roll?.bonus) || 0);
+    const total = Math.trunc(Number(roll?.total));
+    if (!Number.isFinite(die) || die < 1 || die > sides || !Number.isFinite(total) || total !== die + bonus) {
+      throw new Error("Resultado de dado invalido.");
+    }
+
+    const rollerRole = roll?.rollerRole === "player" ? "player" : "master";
+    const origin = String(roll?.origin || (rollerRole === "master" ? "Mestre" : "Sem origem")).trim().slice(0, 80)
+      || (rollerRole === "master" ? "Mestre" : "Sem origem");
+    const outgoing = stripUndefined({
+      id: String(roll?.id || makeId()),
+      author: rollerRole === "player" ? origin : "Mestre",
+      authorId: auth.currentUser.uid,
+      playerId: roll?.playerId ? String(roll.playerId) : undefined,
+      characterId: roll?.characterId ? String(roll.characterId) : undefined,
+      rollerRole,
+      origin,
+      sides,
+      die,
+      bonus,
+      bonusText: String(roll?.bonusText || "").slice(0, 80),
+      total,
+      label: String(roll?.label || "").trim().slice(0, 120),
+      time: String(roll?.time || `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`),
+      createdAt
+    });
+    const createdAtMs = Date.parse(createdAt);
+    const order = -(Number.isFinite(createdAtMs) ? createdAtMs : Date.now());
+    const stored = cleanSubDoc(outgoing, order);
+
+    try {
+      await withRetry(() => api.setDoc(
+        api.doc(db, "campaigns", campaignId, "diceLogs", outgoing.id),
+        stored,
+        { merge: false }
+      ), ctx);
+    } catch (err) {
+      console.warn("SDK Firestore falhou ao registrar rolagem; usando REST.", err);
+      await restPatchDoc(`campaigns/${campaignId}/diceLogs/${outgoing.id}`, stored);
+    }
+
+    const cachedLogs = campaignSaveCache.get(campaignId)?.diceLogs;
+    if (cachedLogs && !cachedLogs.some(entry => String(entry.id) === outgoing.id)) {
+      cachedLogs.unshift({ ...outgoing });
+    }
+    return outgoing;
+  }
+
+  async function sendPrivateCampaignMessage(campaignId, message) {
+    if (!campaignId || !auth.currentUser) throw new Error("Mensagem privada sem campanha ou usuario autenticado.");
+
+    const now = new Date();
+    const sentAt = String(message?.sentAt || now.toISOString());
+    const text = String(message?.text || "").trim().slice(0, 500);
+    const conversationType = message?.conversationType === "master-player" ? "master-player" : "players";
+    const participantPlayerIds = (message?.participantPlayerIds || []).map(String);
+    const participantCharacterIds = (message?.participantCharacterIds || []).map(String);
+    const participantAuthUids = (message?.participantAuthUids || []).map(String);
+    const participantOrigins = (message?.participantOrigins || []).map(origin => String(origin || "Sem origem").slice(0, 80));
+    const expectedPlayerCount = conversationType === "master-player" ? 1 : 2;
+    if (!text) throw new Error("A mensagem esta vazia.");
+    if (
+      participantPlayerIds.length !== expectedPlayerCount
+      || participantCharacterIds.length !== expectedPlayerCount
+      || participantAuthUids.length !== 2
+      || participantOrigins.length !== 2
+      || participantPlayerIds.some(id => !id)
+      || participantCharacterIds.some(id => !id)
+      || participantAuthUids.some(id => !id)
+      || new Set(participantPlayerIds).size !== expectedPlayerCount
+      || new Set(participantCharacterIds).size !== expectedPlayerCount
+      || new Set(participantAuthUids).size !== 2
+    ) {
+      throw new Error("Participantes da conversa privada invalidos.");
+    }
+
+    const outgoing = stripUndefined({
+      id: String(message?.id || makeId()),
+      threadId: String(message?.threadId || "").slice(0, 180),
+      conversationType,
+      participantPlayerIds,
+      participantCharacterIds,
+      participantAuthUids,
+      participantOrigins,
+      authorId: auth.currentUser.uid,
+      authorRole: message?.authorRole === "master" ? "master" : "player",
+      authorPlayerId: String(message?.authorPlayerId || ""),
+      authorCharacterId: String(message?.authorCharacterId || ""),
+      authorOrigin: String(message?.authorOrigin || "Sem origem").trim().slice(0, 80) || "Sem origem",
+      text,
+      time: String(message?.time || `${now.getHours().toString().padStart(2, "0")}:${now.getMinutes().toString().padStart(2, "0")}`),
+      sentAt
+    });
+    if (!outgoing.threadId) throw new Error("Conversa privada invalida.");
+
+    const sentAtMs = Date.parse(sentAt);
+    const order = -(Number.isFinite(sentAtMs) ? sentAtMs : Date.now());
+    const copies = participantAuthUids.map(accessUid => ({
+      docId: `${outgoing.id}--${accessUid}`,
+      data: cleanSubDoc({ ...outgoing, accessUid }, order)
+    }));
+    try {
+      await withRetry(() => {
+        if (typeof api.writeBatch !== "function") {
+          return Promise.all(copies.map(copy => api.setDoc(
+            api.doc(db, "campaigns", campaignId, "privateMessages", copy.docId),
+            copy.data,
+            { merge: false }
+          )));
+        }
+        const batch = api.writeBatch(db);
+        copies.forEach(copy => batch.set(
+          api.doc(db, "campaigns", campaignId, "privateMessages", copy.docId),
+          copy.data,
+          { merge: false }
+        ));
+        return batch.commit();
+      }, ctx);
+    } catch (err) {
+      console.warn("SDK Firestore falhou ao enviar mensagem privada; usando REST.", err);
+      await Promise.all(copies.map(copy => (
+        restPatchDoc(`campaigns/${campaignId}/privateMessages/${copy.docId}`, copy.data)
+      )));
+    }
+    return outgoing;
+  }
+
+  async function updateCharacterInventory(campaignId, characterId, inventory, options = {}) {
     if (!campaignId || !characterId || !auth.currentUser) {
       throw new Error("Inventario de personagem invalido.");
     }
@@ -501,6 +659,13 @@ export function createCampaignRepository(ctx) {
     const cleanInventory = stripUndefined(Array.isArray(inventory) ? inventory : []);
     const inventoryUpdatedAt = new Date().toISOString();
     const update = { inventory: cleanInventory, inventoryUpdatedAt };
+    if (Object.prototype.hasOwnProperty.call(options, "appliedOriginLoadouts")) {
+      update.appliedOriginLoadouts = Array.from(new Set(
+        (Array.isArray(options.appliedOriginLoadouts) ? options.appliedOriginLoadouts : [])
+          .map(origin => String(origin || "").trim())
+          .filter(Boolean)
+      ));
+    }
     try {
       await withRetry(() => api.updateDoc(
         api.doc(db, "campaigns", campaignId, "characters", String(characterId)),
@@ -515,6 +680,136 @@ export function createCampaignRepository(ctx) {
       ?.find(character => String(character.id) === String(characterId));
     if (cachedCharacter) Object.assign(cachedCharacter, stripUndefined(update));
     return update;
+  }
+
+  async function updateCharacterEvidenceAssignments(campaignId, characterUpdates) {
+    if (!campaignId || !auth.currentUser || !Array.isArray(characterUpdates)) {
+      throw new Error("Vinculos de evidencias invalidos.");
+    }
+
+    const updatedAt = new Date().toISOString();
+    const updates = Array.from(new Map(characterUpdates
+      .filter(entry => entry?.characterId)
+      .map(entry => [String(entry.characterId), {
+        id: String(entry.characterId),
+        evidence: stripUndefined(Array.isArray(entry.evidence) ? entry.evidence : [])
+      }])).values());
+    const campaignRef = api.doc(db, "campaigns", campaignId);
+
+    await withRetry(() => api.runTransaction(db, async transaction => {
+      updates.forEach(entry => {
+        transaction.update(
+          api.doc(db, "campaigns", campaignId, "characters", entry.id),
+          { evidence: entry.evidence, evidenceUpdatedAt: updatedAt }
+        );
+      });
+      transaction.update(campaignRef, { updatedAt });
+    }), ctx);
+
+    const cachedCharacters = campaignSaveCache.get(campaignId)?.characters || [];
+    updates.forEach(entry => {
+      const cachedCharacter = cachedCharacters.find(character => String(character.id) === entry.id);
+      if (cachedCharacter) {
+        cachedCharacter.evidence = JSON.parse(JSON.stringify(entry.evidence));
+        cachedCharacter.evidenceUpdatedAt = updatedAt;
+      }
+    });
+    return { updatedAt, characters: updates };
+  }
+
+  async function deleteEvidenceCatalogEntry(campaignId, evidenceId, characterUpdates) {
+    if (!campaignId || !evidenceId || !auth.currentUser || !Array.isArray(characterUpdates)) {
+      throw new Error("Exclusao de evidencia invalida.");
+    }
+
+    const normalizedEvidenceId = String(evidenceId);
+    const updatedAt = new Date().toISOString();
+    const updates = Array.from(new Map(characterUpdates
+      .filter(entry => entry?.characterId)
+      .map(entry => [String(entry.characterId), {
+        id: String(entry.characterId),
+        evidence: stripUndefined(Array.isArray(entry.evidence) ? entry.evidence : [])
+      }])).values());
+    const campaignRef = api.doc(db, "campaigns", campaignId);
+    const evidenceRef = api.doc(db, "campaigns", campaignId, "evidence", normalizedEvidenceId);
+
+    await withRetry(() => api.runTransaction(db, async transaction => {
+      transaction.delete(evidenceRef);
+      updates.forEach(entry => {
+        transaction.update(
+          api.doc(db, "campaigns", campaignId, "characters", entry.id),
+          { evidence: entry.evidence, evidenceUpdatedAt: updatedAt }
+        );
+      });
+      transaction.update(campaignRef, { updatedAt });
+    }), ctx);
+
+    const cached = campaignSaveCache.get(campaignId);
+    if (cached) {
+      cached.evidence = (cached.evidence || []).filter(entry => String(entry.id) !== normalizedEvidenceId);
+      updates.forEach(entry => {
+        const cachedCharacter = cached.characters?.find(character => String(character.id) === entry.id);
+        if (cachedCharacter) cachedCharacter.evidence = JSON.parse(JSON.stringify(entry.evidence));
+      });
+    }
+    return { evidenceId: normalizedEvidenceId, updatedAt, characters: updates };
+  }
+
+  async function updateTraumaCatalog(campaignId, traumaCatalog) {
+    if (!campaignId || !auth.currentUser) {
+      throw new Error("Catalogo de traumas invalido.");
+    }
+
+    const update = {
+      traumaCatalog: stripUndefined(Array.isArray(traumaCatalog) ? traumaCatalog : []),
+      updatedAt: new Date().toISOString()
+    };
+    try {
+      await withRetry(() => api.updateDoc(
+        api.doc(db, "campaigns", campaignId),
+        update
+      ), ctx);
+    } catch (err) {
+      console.warn("SDK Firestore falhou ao atualizar catalogo de traumas; usando REST.", err);
+      await restPatchDoc(`campaigns/${campaignId}`, update);
+    }
+    return update;
+  }
+
+  async function updateTraumaCatalogAndCharacters(campaignId, traumaCatalog, characterUpdates) {
+    if (!campaignId || !auth.currentUser || !Array.isArray(characterUpdates)) {
+      throw new Error("Exclusao de trauma invalida.");
+    }
+
+    const updatedAt = new Date().toISOString();
+    const cleanCatalog = stripUndefined(Array.isArray(traumaCatalog) ? traumaCatalog : []);
+    const updates = Array.from(new Map(characterUpdates
+      .filter(entry => entry?.characterId)
+      .map(entry => [String(entry.characterId), {
+        id: String(entry.characterId),
+        traumas: stripUndefined(Array.isArray(entry.traumas) ? entry.traumas : [])
+      }])).values());
+    const campaignRef = api.doc(db, "campaigns", campaignId);
+
+    await withRetry(() => api.runTransaction(db, async transaction => {
+      transaction.update(campaignRef, { traumaCatalog: cleanCatalog, updatedAt });
+      updates.forEach(entry => {
+        transaction.update(
+          api.doc(db, "campaigns", campaignId, "characters", entry.id),
+          { traumas: entry.traumas, traumasUpdatedAt: updatedAt }
+        );
+      });
+    }), ctx);
+
+    const cachedCharacters = campaignSaveCache.get(campaignId)?.characters || [];
+    updates.forEach(entry => {
+      const cachedCharacter = cachedCharacters.find(character => String(character.id) === entry.id);
+      if (cachedCharacter) {
+        cachedCharacter.traumas = JSON.parse(JSON.stringify(entry.traumas));
+        cachedCharacter.traumasUpdatedAt = updatedAt;
+      }
+    });
+    return { traumaCatalog: cleanCatalog, updatedAt, characters: updates };
   }
 
   async function updateCharacterTraumas(campaignId, characterId, traumas, traumaEvent = null) {
@@ -548,6 +843,33 @@ export function createCampaignRepository(ctx) {
       ...characterUpdate,
       latestTraumaEvent: campaignUpdate.latestTraumaEvent || null
     };
+  }
+
+  async function updateCharacterExpressions(campaignId, characterId, expressions, activeExpression = "") {
+    if (!campaignId || !characterId || !auth.currentUser) {
+      throw new Error("Expressoes de personagem invalidas.");
+    }
+
+    const cleanExpressions = stripUndefined(Array.isArray(expressions) ? expressions : []);
+    const update = {
+      expressions: cleanExpressions,
+      activeExpression: String(activeExpression || ""),
+      expressionUpdatedAt: new Date().toISOString()
+    };
+    try {
+      await withRetry(() => api.updateDoc(
+        api.doc(db, "campaigns", campaignId, "characters", String(characterId)),
+        update
+      ), ctx);
+    } catch (err) {
+      console.warn("SDK Firestore falhou ao atualizar expressoes; usando REST.", err);
+      await restPatchDoc(`campaigns/${campaignId}/characters/${String(characterId)}`, update);
+    }
+
+    const cachedCharacter = campaignSaveCache.get(campaignId)?.characters
+      ?.find(character => String(character.id) === String(characterId));
+    if (cachedCharacter) Object.assign(cachedCharacter, stripUndefined(update));
+    return update;
   }
 
   async function assignPlayerCharacter(campaignId, playerId, characterId) {
@@ -645,7 +967,7 @@ export function createCampaignRepository(ctx) {
     const resolvedAt = resolvedDate.toISOString();
     const resolvedBy = auth.currentUser.uid;
 
-    return withRetry(() => api.runTransaction(db, async transaction => {
+    const result = await withRetry(() => api.runTransaction(db, async transaction => {
       const transferSnap = await transaction.get(transferRef);
       if (!transferSnap.exists()) throw new Error("Solicitacao de transferencia nao encontrada.");
       const transfer = { id: transferSnap.id, ...transferSnap.data() };
@@ -660,10 +982,56 @@ export function createCampaignRepository(ctx) {
         resolvedBy,
         time: resolvedDate.toLocaleString("pt-BR")
       };
-      if (decision === "rejected" || transfer.type !== "item") {
+      if (decision === "rejected") {
         transaction.update(transferRef, resolution);
         return { transfer: { ...transfer, ...resolution } };
       }
+
+      if (transfer.type === "evidence") {
+        if (!transfer.fromCharacterId || !transfer.toCharacterId || !transfer.evidenceEntryId || !transfer.evidenceId) {
+          throw new Error("A solicitacao nao possui os vinculos de evidencia necessarios.");
+        }
+        if (String(transfer.fromCharacterId) === String(transfer.toCharacterId)) {
+          throw new Error("Origem e destino da transferencia sao iguais.");
+        }
+
+        const sourceRef = api.doc(db, "campaigns", campaignId, "characters", String(transfer.fromCharacterId));
+        const targetRef = api.doc(db, "campaigns", campaignId, "characters", String(transfer.toCharacterId));
+        const sourceSnap = await transaction.get(sourceRef);
+        const targetSnap = await transaction.get(targetRef);
+        if (!sourceSnap.exists() || !targetSnap.exists()) throw new Error("Um dos personagens nao existe mais.");
+
+        const sourceEvidence = JSON.parse(JSON.stringify(sourceSnap.data().evidence || []));
+        const targetEvidence = JSON.parse(JSON.stringify(targetSnap.data().evidence || []));
+        const sourceIndex = sourceEvidence.findIndex(entry => String(entry.id) === String(transfer.evidenceEntryId));
+        if (sourceIndex < 0) throw new Error("A evidencia nao esta mais com o personagem de origem.");
+
+        const evidence = sourceEvidence[sourceIndex];
+        if (String(evidence.evidenceId || "") !== String(transfer.evidenceId)) {
+          throw new Error("O vinculo da evidencia foi alterado.");
+        }
+        if (targetEvidence.some(entry => String(entry.evidenceId || "") === String(evidence.evidenceId || ""))) {
+          throw new Error("O personagem de destino ja possui esta evidencia.");
+        }
+
+        sourceEvidence.splice(sourceIndex, 1);
+        targetEvidence.unshift(stripUndefined({
+          ...evidence,
+          id: makeId(),
+          grantedAt: resolvedAt
+        }));
+        transaction.update(sourceRef, { evidence: sourceEvidence, evidenceUpdatedAt: resolvedAt });
+        transaction.update(targetRef, { evidence: targetEvidence, evidenceUpdatedAt: resolvedAt });
+        transaction.update(transferRef, resolution);
+
+        return {
+          transfer: { ...transfer, ...resolution },
+          sourceCharacter: { id: sourceSnap.id, evidence: sourceEvidence },
+          targetCharacter: { id: targetSnap.id, evidence: targetEvidence }
+        };
+      }
+
+      if (transfer.type !== "item") throw new Error("Tipo de transferencia invalido.");
 
       if (!transfer.fromCharacterId || !transfer.toCharacterId || !transfer.inventoryId) {
         throw new Error("A solicitacao nao possui os vinculos de inventario necessarios.");
@@ -710,8 +1078,8 @@ export function createCampaignRepository(ctx) {
       sourceItem.quantity = Math.max(0, Number(sourceItem.quantity) || 0) - amount;
       if (sourceItem.quantity === 0) sourceInventory.splice(sourceIndex, 1);
 
-      transaction.update(sourceRef, { inventory: sourceInventory });
-      transaction.update(targetRef, { inventory: targetInventory });
+      transaction.update(sourceRef, { inventory: sourceInventory, inventoryUpdatedAt: resolvedAt });
+      transaction.update(targetRef, { inventory: targetInventory, inventoryUpdatedAt: resolvedAt });
       transaction.update(transferRef, resolution);
 
       return {
@@ -720,6 +1088,23 @@ export function createCampaignRepository(ctx) {
         targetCharacter: { id: targetSnap.id, inventory: targetInventory }
       };
     }), ctx);
+
+    const cached = campaignSaveCache.get(campaignId);
+    if (cached && result?.sourceCharacter) {
+      const source = cached.characters?.find(character => String(character.id) === String(result.sourceCharacter.id));
+      if (source) {
+        if (result.sourceCharacter.inventory) source.inventory = JSON.parse(JSON.stringify(result.sourceCharacter.inventory));
+        if (result.sourceCharacter.evidence) source.evidence = JSON.parse(JSON.stringify(result.sourceCharacter.evidence));
+      }
+    }
+    if (cached && result?.targetCharacter) {
+      const target = cached.characters?.find(character => String(character.id) === String(result.targetCharacter.id));
+      if (target) {
+        if (result.targetCharacter.inventory) target.inventory = JSON.parse(JSON.stringify(result.targetCharacter.inventory));
+        if (result.targetCharacter.evidence) target.evidence = JSON.parse(JSON.stringify(result.targetCharacter.evidence));
+      }
+    }
+    return result;
   }
 
   async function syncPlayerSubcollection(campaignId, key, items, playerId, userId) {
@@ -802,6 +1187,7 @@ export function createCampaignRepository(ctx) {
   async function deleteCampaign(campaignId) {
     if (!campaignId) return;
     for (const key of SUBCOLLECTION_KEYS) await deleteSubcollection(campaignId, key);
+    await deleteSubcollection(campaignId, "privateMessages");
     campaignSaveCache.delete(campaignId);
     await withRetry(() => api.deleteDoc(api.doc(db, "campaigns", campaignId)), ctx);
   }
@@ -809,16 +1195,24 @@ export function createCampaignRepository(ctx) {
   return {
     addCampaignMember,
     assignPlayerCharacter,
+    deleteEvidenceCatalogEntry,
     deleteCampaign,
     getCampaign,
     getCampaignForJoin,
     joinCampaign,
+    recordDiceRoll,
     resolveItemTransfer,
     saveCampaign,
     sendCampaignMessage,
+    sendPrivateCampaignMessage,
     setPlayerPresence,
+    updateCharacterEvidenceAssignments,
+    updateCharacterExpressions,
+    updateTraumaCatalog,
+    updateTraumaCatalogAndCharacters,
     updateCharacterTraumas,
     updateCharacterInventory,
-    watchCampaigns
+    watchCampaigns,
+    watchPrivateMessages
   };
 }

@@ -85,6 +85,19 @@ aparecem na mochila pessoal ate que o Mestre os entregue ao personagem. A tela
 do jogador renderiza somente `characters/{characterId}.inventory`, preservando
 o isolamento entre os inventarios.
 
+O catalogo e reutilizavel: adicionar um item a um personagem nao o remove nem o
+reserva. O mesmo `items/{itemId}` pode alimentar inventarios diferentes. Dentro
+de um personagem, novas entregas com o mesmo `itemId` somam a quantidade na
+entrada existente, portanto varias unidades continuam ocupando um unico slot.
+Entradas livres, que nao possuem `itemId`, permanecem independentes.
+
+`campaigns/{campaignId}.originLoadouts` guarda os kits iniciais por origem como
+pares de `itemId` e quantidade. Ao criar um personagem, o Mestre pode aplicar o
+kit configurado. `characters/{characterId}.appliedOriginLoadouts` registra as
+origens ja aplicadas e impede uma segunda aplicacao acidental; a reaplicacao
+continua disponivel mediante confirmacao explicita do Mestre. Alterar a origem
+nao remove itens que o personagem ja recebeu.
+
 ## Presenca
 
 O jogador atualiza `online` e `lastSeen` no proprio documento. Um heartbeat e

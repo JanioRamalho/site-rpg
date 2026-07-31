@@ -15,16 +15,78 @@ test("normalizes legacy links without losing the prepared character", () => {
 
   tabletop.normalizeCampaign(campaign, sequentialIds());
 
-  assert.equal(campaign.schemaVersion, 2);
+  assert.equal(campaign.schemaVersion, 5);
   assert.equal(campaign.players[0].emailNormalized, "ana@example.com");
   assert.equal(campaign.players[0].status, "pending");
   assert.equal(campaign.players[0].characterId, "char-1");
   assert.equal(campaign.characters[0].controllerPlayerId, "player-1");
   assert.deepEqual(campaign.characters[0].inventory, []);
+  assert.deepEqual(campaign.characters[0].appliedOriginLoadouts, []);
+  assert.deepEqual(campaign.originLoadouts, {});
+  assert.deepEqual(campaign.characters[0].evidence, []);
   assert.deepEqual(campaign.characters[0].traumas, []);
+  assert.deepEqual(campaign.traumaCatalog, []);
+  assert.deepEqual(campaign.characters[0].expressions, []);
+  assert.equal(campaign.characters[0].activeExpression, "");
+  assert.deepEqual(campaign.chatSettings, {
+    publicEnabled: true,
+    privateEnabled: true,
+    privateThreads: {},
+    updatedAt: null
+  });
 });
 
-test("normalizes individual trauma cards without exposing them on the campaign root", () => {
+test("keeps the master chat availability settings", () => {
+  const settings = tabletop.normalizeChatSettings({
+    publicEnabled: false,
+    privateEnabled: true,
+    privateThreads: {
+      "player-1::player-2": false,
+      "player-1::player-3": true,
+      invalid: "yes"
+    },
+    updatedAt: "2026-07-31T12:00:00.000Z"
+  });
+
+  assert.deepEqual(settings, {
+    publicEnabled: false,
+    privateEnabled: true,
+    privateThreads: {
+      "player-1::player-2": false,
+      "player-1::player-3": true
+    },
+    updatedAt: "2026-07-31T12:00:00.000Z"
+  });
+});
+
+test("normalizes reusable character expressions and discards an invalid active selection", () => {
+  const character = {
+    id: "char-1",
+    expressions: [{
+      id: "expression-tense",
+      title: "Tenso",
+      image: "tenso.jpg",
+      createdAt: "2026-07-31T10:00:00.000Z"
+    }],
+    activeExpression: "expression-tense"
+  };
+
+  tabletop.normalizeCharacter(character, sequentialIds());
+
+  assert.deepEqual(character.expressions[0], {
+    id: "expression-tense",
+    title: "Tenso",
+    image: "tenso.jpg",
+    createdAt: "2026-07-31T10:00:00.000Z"
+  });
+  assert.equal(character.activeExpression, "expression-tense");
+
+  character.activeExpression = "expression-missing";
+  tabletop.normalizeCharacter(character, sequentialIds());
+  assert.equal(character.activeExpression, "");
+});
+
+test("migrates legacy character traumas into the reusable campaign catalog", () => {
   const campaign = {
     players: [],
     characters: [{
@@ -44,12 +106,35 @@ test("normalizes individual trauma cards without exposing them on the campaign r
   assert.equal(campaign.characters[0].traumas.length, 1);
   assert.deepEqual(campaign.characters[0].traumas[0], {
     id: "trauma-1",
+    catalogId: "trauma-1",
     title: "Aracnofobia",
     description: "Medo intenso de aranhas.",
     image: "aranha.jpg",
     acquiredAt: "2026-07-30T21:45:00.000Z"
   });
+  assert.deepEqual(campaign.traumaCatalog, [{
+    id: "trauma-1",
+    title: "Aracnofobia",
+    image: "aranha.jpg",
+    createdAt: "2026-07-30T21:45:00.000Z"
+  }]);
   assert.equal("traumas" in campaign, false);
+});
+
+test("reuses one catalog entry for matching legacy traumas on different characters", () => {
+  const campaign = {
+    players: [],
+    characters: [
+      { id: "char-1", traumas: [{ id: "owned-1", title: "Aracnofobia", image: "aranha.jpg" }] },
+      { id: "char-2", traumas: [{ id: "owned-2", title: "Aracnofobia", image: "aranha.jpg" }] }
+    ]
+  };
+
+  tabletop.normalizeCampaign(campaign, sequentialIds());
+
+  assert.equal(campaign.traumaCatalog.length, 1);
+  assert.equal(campaign.characters[0].traumas[0].catalogId, campaign.traumaCatalog[0].id);
+  assert.equal(campaign.characters[1].traumas[0].catalogId, campaign.traumaCatalog[0].id);
 });
 
 test("prevents the same character from being assigned to two players", () => {
@@ -168,6 +253,74 @@ test("grants, stacks and edits items in an individual inventory", () => {
   assert.equal(stacked.name, "Pocao maior");
 });
 
+test("keeps catalog items reusable and stacks one slot per character", () => {
+  const campaign = {
+    players: [],
+    items: [{ id: "item-lanterna", name: "Lanterna", description: "Ilumina", image: "lanterna.jpg", revealed: true }],
+    characters: [
+      { id: "char-padre", origin: "Padre", inventory: [] },
+      { id: "char-cacador", origin: "Cacador", inventory: [] }
+    ]
+  };
+
+  tabletop.normalizeCampaign(campaign);
+  assert.equal(campaign.items[0].revealed, undefined);
+
+  tabletop.grantItem(campaign, "char-padre", campaign.items[0], { quantity: 1, notes: "Na mochila" });
+  tabletop.grantItem(campaign, "char-padre", campaign.items[0], { quantity: 2, notes: "Na cintura" });
+  tabletop.grantItem(campaign, "char-cacador", campaign.items[0], { quantity: 4 });
+
+  assert.equal(campaign.characters[0].inventory.length, 1);
+  assert.equal(campaign.characters[0].inventory[0].quantity, 3);
+  assert.equal(campaign.characters[0].inventory[0].notes, "Na mochila");
+  assert.equal(campaign.characters[1].inventory.length, 1);
+  assert.equal(campaign.characters[1].inventory[0].quantity, 4);
+  assert.notEqual(campaign.characters[0].inventory[0], campaign.characters[1].inventory[0]);
+});
+
+test("configures and applies an origin kit without accidental duplication", () => {
+  const ids = sequentialIds();
+  const campaign = {
+    players: [],
+    items: [
+      { id: "crossbow", name: "Besta", description: "Arma", image: "besta.jpg" },
+      { id: "arrows", name: "Flechas", description: "Municao", image: "flechas.jpg" },
+      { id: "knife", name: "Faca de cacada", description: "Lamina", image: "faca.jpg" }
+    ],
+    characters: [{ id: "char-1", origin: "Cacador", inventory: [] }]
+  };
+
+  const loadout = tabletop.setOriginLoadout(campaign, "Cacador", [
+    { itemId: "crossbow", quantity: 1 },
+    { itemId: "arrows", quantity: 10 },
+    { itemId: "arrows", quantity: 5 },
+    { itemId: "knife", quantity: 1 },
+    { itemId: "missing", quantity: 99 }
+  ]);
+  assert.deepEqual(loadout, [
+    { itemId: "crossbow", quantity: 1 },
+    { itemId: "arrows", quantity: 15 },
+    { itemId: "knife", quantity: 1 }
+  ]);
+
+  tabletop.applyOriginLoadout(campaign, "char-1", {}, ids);
+  assert.deepEqual(campaign.characters[0].inventory.map(item => [item.itemId, item.quantity]), [
+    ["crossbow", 1],
+    ["arrows", 15],
+    ["knife", 1]
+  ]);
+  assert.deepEqual(campaign.characters[0].appliedOriginLoadouts, ["Cacador"]);
+  assert.throws(() => tabletop.applyOriginLoadout(campaign, "char-1", {}, ids), /ja foi aplicado/);
+
+  tabletop.applyOriginLoadout(campaign, "char-1", { force: true }, ids);
+  assert.deepEqual(campaign.characters[0].inventory.map(item => [item.itemId, item.quantity]), [
+    ["crossbow", 2],
+    ["arrows", 30],
+    ["knife", 2]
+  ]);
+  assert.deepEqual(campaign.characters[0].appliedOriginLoadouts, ["Cacador"]);
+});
+
 test("adds a freeform item directly to a character inventory", () => {
   const campaign = {
     players: [],
@@ -234,6 +387,85 @@ test("reserves quantities while item transfer requests are pending", () => {
   assert.equal(tabletop.reservedTransferQuantity(campaign, "char-1", "inv-1"), 2);
   assert.equal(tabletop.availableInventoryQuantity(campaign, "char-1", "inv-1"), 3);
   assert.equal(tabletop.reservedTransferQuantity(campaign, "char-1", "inv-1", "transfer-1"), 0);
+});
+
+test("normalizes legacy evidence titles and keeps a single character owner", () => {
+  const campaign = {
+    players: [],
+    evidence: [{ id: "evidence-1", name: "Fotografia", description: "Uma pista", image: "pista.jpg" }],
+    characters: [
+      {
+        id: "char-1",
+        evidence: [{ id: "owned-1", evidenceId: "evidence-1", name: "Nome antigo", image: "old.jpg" }]
+      },
+      {
+        id: "char-2",
+        evidence: [{ id: "owned-2", evidenceId: "evidence-1", title: "Duplicada" }]
+      }
+    ]
+  };
+
+  tabletop.normalizeCampaign(campaign, sequentialIds());
+
+  assert.equal(campaign.evidence[0].title, "Fotografia");
+  assert.equal(campaign.evidence[0].name, "Fotografia");
+  assert.equal(campaign.characters[0].evidence[0].title, "Fotografia");
+  assert.equal(campaign.characters[0].evidence[0].description, "Uma pista");
+  assert.equal(campaign.characters[0].evidence[0].image, "pista.jpg");
+  assert.equal(campaign.characters[1].evidence.length, 0);
+});
+
+test("links, moves and unlinks one catalog evidence without duplicating ownership", () => {
+  const ids = sequentialIds();
+  const campaign = {
+    players: [],
+    evidence: [{ id: "evidence-1", title: "Carta", description: "Carta rasgada", image: "carta.jpg" }],
+    characters: [
+      { id: "char-1", evidence: [] },
+      { id: "char-2", evidence: [] }
+    ]
+  };
+
+  const first = tabletop.assignEvidence(campaign, "evidence-1", "char-1", ids);
+  assert.equal(first.evidenceId, "evidence-1");
+  assert.equal(tabletop.findEvidenceOwner(campaign, "evidence-1").character.id, "char-1");
+
+  tabletop.assignEvidence(campaign, "evidence-1", "char-2", ids);
+  assert.equal(campaign.characters[0].evidence.length, 0);
+  assert.equal(campaign.characters[1].evidence.length, 1);
+
+  tabletop.assignEvidence(campaign, "evidence-1", null, ids);
+  assert.equal(tabletop.findEvidenceOwner(campaign, "evidence-1"), null);
+});
+
+test("moves an owned evidence only after approval and reserves pending requests", () => {
+  const ids = sequentialIds();
+  const campaign = {
+    players: [],
+    evidence: [{ id: "evidence-1", title: "Gravacao", description: "Audio", image: "audio.jpg" }],
+    characters: [
+      {
+        id: "char-1",
+        evidence: [{ id: "owned-1", evidenceId: "evidence-1", title: "Gravacao", description: "Audio", image: "audio.jpg" }]
+      },
+      { id: "char-2", evidence: [] }
+    ],
+    itemTransfers: [{
+      id: "transfer-1",
+      type: "evidence",
+      status: "pending",
+      fromCharacterId: "char-1",
+      evidenceEntryId: "owned-1"
+    }]
+  };
+
+  assert.equal(tabletop.isEvidenceTransferPending(campaign, "char-1", "owned-1"), true);
+  assert.equal(tabletop.isEvidenceTransferPending(campaign, "char-1", "owned-1", "transfer-1"), false);
+
+  const moved = tabletop.transferCharacterEvidence(campaign, "char-1", "char-2", "owned-1", ids);
+  assert.equal(moved.evidenceId, "evidence-1");
+  assert.equal(campaign.characters[0].evidence.length, 0);
+  assert.equal(campaign.characters[1].evidence.length, 1);
 });
 
 test("publishes only public scene fields and clears them when hidden", () => {

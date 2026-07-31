@@ -31,13 +31,92 @@
     return target;
   }
 
+  function normalizeItemCatalogEntry(item, makeId = defaultId) {
+    const target = item && typeof item === "object" ? item : {};
+    target.id = String(target.id || makeId());
+    target.name = String(target.name || "Item");
+    target.description = String(target.description || "");
+    target.image = String(target.image || "");
+    target.createdAt = target.createdAt || new Date().toISOString();
+    delete target.revealed;
+    return target;
+  }
+
+  function normalizeOriginLoadouts(loadouts, catalog = []) {
+    if (!loadouts || typeof loadouts !== "object" || Array.isArray(loadouts)) return {};
+    const catalogIds = new Set(catalog.map(item => String(item.id)));
+    const normalized = {};
+
+    Object.entries(loadouts).forEach(([origin, entries]) => {
+      const normalizedOrigin = String(origin || "").trim();
+      if (!normalizedOrigin || !Array.isArray(entries)) return;
+      const quantities = new Map();
+      entries.forEach(entry => {
+        const itemId = String(entry?.itemId || "");
+        const quantity = Number.parseInt(entry?.quantity, 10);
+        if (!itemId || !catalogIds.has(itemId) || !Number.isFinite(quantity) || quantity <= 0) return;
+        quantities.set(itemId, (quantities.get(itemId) || 0) + quantity);
+      });
+      const normalizedEntries = Array.from(quantities, ([itemId, quantity]) => ({ itemId, quantity }));
+      if (normalizedEntries.length) normalized[normalizedOrigin] = normalizedEntries;
+    });
+
+    return normalized;
+  }
+
+  function normalizeEvidenceCatalogEntry(evidence, makeId = defaultId) {
+    const target = evidence && typeof evidence === "object" ? evidence : {};
+    target.id = String(target.id || makeId());
+    target.title = String(target.title || target.name || "Evidencia");
+    target.name = target.title;
+    target.description = String(target.description || "");
+    target.image = String(target.image || "");
+    target.createdAt = target.createdAt || new Date().toISOString();
+    return target;
+  }
+
+  function normalizeCharacterEvidenceEntry(evidence, makeId = defaultId) {
+    const target = evidence && typeof evidence === "object" ? evidence : {};
+    target.id = String(target.id || makeId());
+    target.evidenceId = String(target.evidenceId || target.catalogId || target.id);
+    target.title = String(target.title || target.name || "Evidencia");
+    target.name = target.title;
+    target.description = String(target.description || "");
+    target.image = String(target.image || "");
+    target.grantedAt = target.grantedAt || target.acquiredAt || new Date().toISOString();
+    return target;
+  }
+
   function normalizeTrauma(trauma, makeId = defaultId) {
     const target = trauma && typeof trauma === "object" ? trauma : {};
     target.id = String(target.id || makeId());
+    target.catalogId = target.catalogId ? String(target.catalogId) : null;
     target.title = String(target.title || "Trauma");
     target.description = String(target.description || "");
     target.image = String(target.image || "");
     target.acquiredAt = target.acquiredAt || new Date().toISOString();
+    return target;
+  }
+
+  function normalizeTraumaCatalogEntry(trauma, makeId = defaultId) {
+    const target = trauma && typeof trauma === "object" ? trauma : {};
+    target.id = String(target.id || makeId());
+    target.title = String(target.title || "Trauma");
+    target.image = String(target.image || "");
+    target.createdAt = target.createdAt || new Date().toISOString();
+    return target;
+  }
+
+  function traumaCatalogSignature(trauma) {
+    return `${String(trauma?.title || "").trim().toLowerCase()}\u0000${String(trauma?.image || "")}`;
+  }
+
+  function normalizeExpression(expression, makeId = defaultId) {
+    const target = expression && typeof expression === "object" ? expression : {};
+    target.id = String(target.id || makeId());
+    target.title = String(target.title || "Expressao");
+    target.image = String(target.image || "");
+    target.createdAt = target.createdAt || new Date().toISOString();
     return target;
   }
 
@@ -67,8 +146,22 @@
     target.inventory = Array.isArray(target.inventory)
         ? target.inventory.map(entry => normalizeInventoryEntry(entry, makeId))
         : [];
+    target.evidence = Array.isArray(target.evidence)
+      ? target.evidence.map(entry => normalizeCharacterEvidenceEntry(entry, makeId))
+      : [];
     target.traumas = Array.isArray(target.traumas)
       ? target.traumas.map(trauma => normalizeTrauma(trauma, makeId))
+      : [];
+    target.expressions = Array.isArray(target.expressions)
+      ? target.expressions.map(expression => normalizeExpression(expression, makeId))
+      : [];
+    const activeExpression = String(target.activeExpression || "");
+    target.activeExpression = target.expressions.some(expression => expression.id === activeExpression)
+      ? activeExpression
+      : "";
+    target.expressionUpdatedAt = target.expressionUpdatedAt || null;
+    target.appliedOriginLoadouts = Array.isArray(target.appliedOriginLoadouts)
+      ? Array.from(new Set(target.appliedOriginLoadouts.map(origin => String(origin || "").trim()).filter(Boolean)))
       : [];
     return target;
   }
@@ -104,10 +197,25 @@
     };
   }
 
+  function normalizeChatSettings(settings) {
+    const target = settings && typeof settings === "object" ? settings : {};
+    const privateThreads = target.privateThreads && typeof target.privateThreads === "object"
+      ? Object.fromEntries(Object.entries(target.privateThreads)
+        .filter(([threadId, enabled]) => String(threadId).trim() && typeof enabled === "boolean")
+        .map(([threadId, enabled]) => [String(threadId), enabled]))
+      : {};
+    return {
+      publicEnabled: target.publicEnabled !== false,
+      privateEnabled: target.privateEnabled !== false,
+      privateThreads,
+      updatedAt: target.updatedAt || null
+    };
+  }
+
   function normalizeCampaign(campaign, makeId = defaultId) {
     if (!campaign || typeof campaign !== "object") return campaign;
 
-    campaign.schemaVersion = Math.max(Number(campaign.schemaVersion) || 0, 2);
+    campaign.schemaVersion = Math.max(Number(campaign.schemaVersion) || 0, 5);
     campaign.players = Array.isArray(campaign.players)
       ? campaign.players.map(player => Object.assign(
         player && typeof player === "object" ? player : {},
@@ -120,11 +228,79 @@
         normalizeCharacter(character, makeId)
       ))
       : [];
+    campaign.items = Array.isArray(campaign.items)
+      ? campaign.items.map(item => normalizeItemCatalogEntry(item, makeId))
+      : [];
+    const itemCatalogIds = new Set();
+    campaign.items.forEach(item => {
+      if (itemCatalogIds.has(item.id)) item.id = String(makeId());
+      itemCatalogIds.add(item.id);
+    });
+    campaign.originLoadouts = normalizeOriginLoadouts(campaign.originLoadouts, campaign.items);
+    campaign.traumaCatalog = Array.isArray(campaign.traumaCatalog)
+      ? campaign.traumaCatalog.map(trauma => normalizeTraumaCatalogEntry(trauma, makeId))
+      : [];
+    campaign.evidence = Array.isArray(campaign.evidence)
+      ? campaign.evidence.map(entry => normalizeEvidenceCatalogEntry(entry, makeId))
+      : [];
+
+    const evidenceCatalogIds = new Set();
+    campaign.evidence.forEach(entry => {
+      if (evidenceCatalogIds.has(entry.id)) entry.id = String(makeId());
+      evidenceCatalogIds.add(entry.id);
+    });
+    const evidenceCatalogById = new Map(campaign.evidence.map(entry => [entry.id, entry]));
+    const ownedEvidenceIds = new Set();
+    campaign.characters.forEach(character => {
+      character.evidence = character.evidence.filter(entry => {
+        const evidenceId = String(entry.evidenceId || "");
+        if (!evidenceId || ownedEvidenceIds.has(evidenceId)) return false;
+        ownedEvidenceIds.add(evidenceId);
+        const catalogEntry = evidenceCatalogById.get(evidenceId);
+        if (catalogEntry) {
+          entry.title = catalogEntry.title;
+          entry.name = catalogEntry.title;
+          entry.description = catalogEntry.description;
+          entry.image = catalogEntry.image;
+        }
+        return true;
+      });
+    });
+
+    const catalogIds = new Set();
+    campaign.traumaCatalog.forEach(trauma => {
+      if (catalogIds.has(trauma.id)) trauma.id = String(makeId());
+      catalogIds.add(trauma.id);
+    });
+    const traumaCatalogById = new Map(campaign.traumaCatalog.map(trauma => [trauma.id, trauma]));
+    const traumaCatalogBySignature = new Map(campaign.traumaCatalog.map(trauma => [traumaCatalogSignature(trauma), trauma]));
+
+    campaign.characters.forEach(character => {
+      character.traumas.forEach(trauma => {
+        let catalogTrauma = trauma.catalogId ? traumaCatalogById.get(trauma.catalogId) : null;
+        if (!catalogTrauma) catalogTrauma = traumaCatalogBySignature.get(traumaCatalogSignature(trauma));
+        if (!catalogTrauma) {
+          let catalogId = String(trauma.catalogId || trauma.id || makeId());
+          if (traumaCatalogById.has(catalogId)) catalogId = String(makeId());
+          catalogTrauma = normalizeTraumaCatalogEntry({
+            id: catalogId,
+            title: trauma.title,
+            image: trauma.image,
+            createdAt: trauma.acquiredAt
+          }, makeId);
+          campaign.traumaCatalog.push(catalogTrauma);
+          traumaCatalogById.set(catalogTrauma.id, catalogTrauma);
+          traumaCatalogBySignature.set(traumaCatalogSignature(catalogTrauma), catalogTrauma);
+        }
+        trauma.catalogId = catalogTrauma.id;
+      });
+    });
     campaign.scenes = Array.isArray(campaign.scenes)
       ? campaign.scenes.map(scene => normalizeScene(scene, makeId))
       : [];
     campaign.liveScene = normalizeLiveScene(campaign.liveScene);
     campaign.gameBoard = normalizeGameBoard(campaign.gameBoard);
+    campaign.chatSettings = normalizeChatSettings(campaign.chatSettings);
 
     const playersById = new Map(campaign.players.map(player => [player.id, player]));
     const charactersById = new Map(campaign.characters.map(character => [character.id, character]));
@@ -215,7 +391,7 @@
     const quantity = positiveInteger(options.quantity);
     const itemId = (item?.itemId || item?.id) ? String(item.itemId || item.id) : null;
     const existing = itemId && options.stack !== false
-      ? character.inventory.find(entry => entry.itemId === itemId && entry.notes === String(options.notes || ""))
+      ? character.inventory.find(entry => entry.itemId === itemId)
       : null;
 
     if (existing) {
@@ -223,7 +399,8 @@
       if (String(item?.name || "").trim()) existing.name = String(item.name).trim();
       if (String(item?.description || "").trim()) existing.description = String(item.description).trim();
       if (String(item?.image || "").trim()) existing.image = String(item.image).trim();
-      if (options.equipped !== undefined) existing.equipped = Boolean(options.equipped);
+      if (options.equipped === true) existing.equipped = true;
+      if (!existing.notes && String(options.notes || "").trim()) existing.notes = String(options.notes).trim();
       return existing;
     }
 
@@ -240,6 +417,59 @@
     }, makeId);
     character.inventory.push(entry);
     return entry;
+  }
+
+  function setOriginLoadout(campaign, origin, entries = []) {
+    normalizeCampaign(campaign);
+    const normalizedOrigin = String(origin || "").trim();
+    if (!normalizedOrigin) throw new Error("Selecione uma origem.");
+    const catalogIds = new Set(campaign.items.map(item => String(item.id)));
+    const quantities = new Map();
+
+    entries.forEach(entry => {
+      const itemId = String(entry?.itemId || "");
+      const quantity = Number.parseInt(entry?.quantity, 10);
+      if (!itemId || !catalogIds.has(itemId) || !Number.isFinite(quantity) || quantity <= 0) return;
+      quantities.set(itemId, (quantities.get(itemId) || 0) + quantity);
+    });
+
+    campaign.originLoadouts ??= {};
+    const normalizedEntries = Array.from(quantities, ([itemId, quantity]) => ({ itemId, quantity }));
+    if (normalizedEntries.length) campaign.originLoadouts[normalizedOrigin] = normalizedEntries;
+    else delete campaign.originLoadouts[normalizedOrigin];
+    return normalizedEntries;
+  }
+
+  function getOriginLoadout(campaign, origin) {
+    normalizeCampaign(campaign);
+    return campaign.originLoadouts[String(origin || "").trim()] || [];
+  }
+
+  function hasAppliedOriginLoadout(character, origin) {
+    return (character?.appliedOriginLoadouts || []).includes(String(origin || "").trim());
+  }
+
+  function applyOriginLoadout(campaign, characterId, options = {}, makeId = defaultId) {
+    normalizeCampaign(campaign, makeId);
+    const character = campaign.characters.find(entry => entry.id === String(characterId));
+    if (!character) throw new Error("Personagem nao encontrado.");
+
+    const origin = String(options.origin || character.origin || "").trim();
+    const loadout = campaign.originLoadouts[origin] || [];
+    if (!loadout.length) throw new Error("Nenhum kit inicial foi configurado para esta origem.");
+    if (hasAppliedOriginLoadout(character, origin) && !options.force) {
+      throw new Error("O kit inicial desta origem ja foi aplicado ao personagem.");
+    }
+
+    const catalogById = new Map(campaign.items.map(item => [String(item.id), item]));
+    const granted = loadout.map(entry => {
+      const item = catalogById.get(String(entry.itemId));
+      if (!item) throw new Error("Um item do kit nao existe mais no catalogo.");
+      return grantItem(campaign, character.id, item, { quantity: entry.quantity }, makeId);
+    });
+
+    if (!hasAppliedOriginLoadout(character, origin)) character.appliedOriginLoadouts.push(origin);
+    return { character, granted, origin, reapplied: Boolean(options.force) };
   }
 
   function updateInventoryEntry(campaign, characterId, inventoryId, changes = {}) {
@@ -320,6 +550,82 @@
     return Math.max(0, inventoryEntry.quantity - reservedTransferQuantity(campaign, characterId, inventoryId));
   }
 
+  function findEvidenceOwner(campaign, evidenceId) {
+    normalizeCampaign(campaign);
+    const normalizedEvidenceId = String(evidenceId || "");
+    for (const character of campaign.characters) {
+      const evidence = character.evidence.find(entry => String(entry.evidenceId) === normalizedEvidenceId);
+      if (evidence) return { character, evidence };
+    }
+    return null;
+  }
+
+  function assignEvidence(campaign, evidenceId, characterId = null, makeId = defaultId) {
+    normalizeCampaign(campaign, makeId);
+    const normalizedEvidenceId = String(evidenceId || "");
+    const catalogEntry = campaign.evidence.find(entry => String(entry.id) === normalizedEvidenceId);
+    if (!catalogEntry) throw new Error("Evidencia nao encontrada na biblioteca.");
+
+    const normalizedCharacterId = characterId ? String(characterId) : null;
+    const targetCharacter = normalizedCharacterId
+      ? campaign.characters.find(entry => String(entry.id) === normalizedCharacterId)
+      : null;
+    if (normalizedCharacterId && !targetCharacter) throw new Error("Personagem nao encontrado.");
+
+    const existingTargetEntry = targetCharacter?.evidence.find(entry => String(entry.evidenceId) === normalizedEvidenceId);
+    campaign.characters.forEach(character => {
+      character.evidence = character.evidence.filter(entry => String(entry.evidenceId) !== normalizedEvidenceId);
+    });
+    if (!targetCharacter) return null;
+
+    const assigned = normalizeCharacterEvidenceEntry({
+      id: existingTargetEntry?.id || makeId(),
+      evidenceId: catalogEntry.id,
+      title: catalogEntry.title,
+      description: catalogEntry.description,
+      image: catalogEntry.image,
+      grantedAt: existingTargetEntry?.grantedAt || new Date().toISOString()
+    }, makeId);
+    targetCharacter.evidence = [assigned, ...targetCharacter.evidence];
+    return assigned;
+  }
+
+  function transferCharacterEvidence(campaign, fromCharacterId, toCharacterId, evidenceEntryId, makeId = defaultId) {
+    normalizeCampaign(campaign, makeId);
+    if (String(fromCharacterId) === String(toCharacterId)) throw new Error("Escolha outro personagem.");
+
+    const sourceCharacter = campaign.characters.find(entry => String(entry.id) === String(fromCharacterId));
+    const targetCharacter = campaign.characters.find(entry => String(entry.id) === String(toCharacterId));
+    if (!sourceCharacter || !targetCharacter) throw new Error("Um dos personagens nao existe mais.");
+
+    const sourceIndex = sourceCharacter.evidence.findIndex(entry => String(entry.id) === String(evidenceEntryId));
+    if (sourceIndex < 0) throw new Error("A evidencia nao esta mais com o personagem de origem.");
+    const sourceEvidence = sourceCharacter.evidence[sourceIndex];
+    if (targetCharacter.evidence.some(entry => String(entry.evidenceId) === String(sourceEvidence.evidenceId))) {
+      throw new Error("O personagem de destino ja possui esta evidencia.");
+    }
+
+    sourceCharacter.evidence.splice(sourceIndex, 1);
+    const transferred = normalizeCharacterEvidenceEntry({
+      ...sourceEvidence,
+      id: makeId(),
+      grantedAt: new Date().toISOString()
+    }, makeId);
+    targetCharacter.evidence = [transferred, ...targetCharacter.evidence];
+    return transferred;
+  }
+
+  function isEvidenceTransferPending(campaign, characterId, evidenceEntryId, exceptTransferId = null) {
+    normalizeCampaign(campaign);
+    return (campaign.itemTransfers || []).some(transfer => (
+      transfer.status === "pending"
+      && transfer.type === "evidence"
+      && String(transfer.fromCharacterId || "") === String(characterId)
+      && String(transfer.evidenceEntryId || "") === String(evidenceEntryId)
+      && (!exceptTransferId || String(transfer.id) !== String(exceptTransferId))
+    ));
+  }
+
   function publishScene(campaign, sceneId, options = {}) {
     normalizeCampaign(campaign);
     const scene = campaign.scenes.find(entry => entry.id === String(sceneId || ""));
@@ -362,26 +668,41 @@
     PRESENCE_AWAY_MS,
     PRESENCE_ONLINE_MS,
     availableInventoryQuantity,
+    applyOriginLoadout,
     assignCharacter,
+    assignEvidence,
+    findEvidenceOwner,
     getControlledParticipants,
+    getOriginLoadout,
     grantItem,
+    hasAppliedOriginLoadout,
     normalizeCampaign,
+    normalizeChatSettings,
     normalizeCharacter,
+    normalizeCharacterEvidenceEntry,
     normalizeEmail,
+    normalizeEvidenceCatalogEntry,
+    normalizeExpression,
     normalizeInventoryEntry,
+    normalizeItemCatalogEntry,
     normalizeLiveScene,
     normalizeGameBoard,
     normalizePlayer,
+    normalizeOriginLoadouts,
     normalizeScene,
     normalizeTrauma,
+    normalizeTraumaCatalogEntry,
     publishScene,
     presenceState,
     releasePlayer,
     removeInventoryEntry,
     reservedTransferQuantity,
+    isEvidenceTransferPending,
     setScenePresentationActive,
+    setOriginLoadout,
     stepScene,
     transferInventoryItem,
+    transferCharacterEvidence,
     updateInventoryEntry
   };
 

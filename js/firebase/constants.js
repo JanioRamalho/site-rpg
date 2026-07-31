@@ -4,14 +4,13 @@ export const SHARED_SUBCOLLECTION_KEYS = [
   "cases",
   "creatures",
   "items",
-  "evidence",
   "marks",
   "diceLogs",
   "messages",
   "itemTransfers"
 ];
 
-export const MASTER_ONLY_SUBCOLLECTION_KEYS = ["scenes"];
+export const MASTER_ONLY_SUBCOLLECTION_KEYS = ["scenes", "evidence"];
 
 export const SUBCOLLECTION_KEYS = [
   ...SHARED_SUBCOLLECTION_KEYS,
