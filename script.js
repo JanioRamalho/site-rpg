@@ -115,6 +115,15 @@ const root = document.getElementById("root");
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 const campaignSaveClientId = uid();
 const usingFirebase = () => Boolean(window.CDIFirebase?.enabled);
+const firebaseConfiguredForStartup = () => {
+  const config = window.CDI_FIREBASE_CONFIG || {};
+  return Boolean(
+    config.apiKey
+    && config.projectId
+    && !String(config.apiKey).includes("COLE_")
+    && !String(config.projectId).includes("SEU_")
+  );
+};
 const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 const jsArg = value => esc(JSON.stringify(String(value ?? "")));
 
@@ -1530,6 +1539,13 @@ function applyRemoteCampaignSnapshot(campaigns, meta = {}, user = firebaseUser) 
     : (meta.fromCache ? "Usando cache local" : "Online em tempo real");
   const remoteJson = JSON.stringify(campaigns);
   if (remoteJson === lastRemoteCampaignJson) {
+    if (!session.role && user) {
+      const restored = restoreFirebaseSession(user, firebaseProfile);
+      if (restored) {
+        sessionRestoreCompleted = true;
+        requestPassiveRender();
+      }
+    }
     setSyncStatus(syncText);
     return false;
   }
@@ -1612,6 +1628,10 @@ async function initFirebaseBridge() {
 
   window.CDIFirebase.onAuthChanged(async user => {
     firebaseUser = user;
+    if (user) {
+      sessionRestoreCompleted = false;
+      renderSessionLoading("Restaurando sua campanha...");
+    }
     try {
       firebaseProfile = user ? await window.CDIFirebase.getUserProfile(user.uid) : null;
     } catch (err) {
@@ -1638,6 +1658,14 @@ async function initFirebaseBridge() {
       return render();
     }
 
+    const restoredFromCache = restoreFirebaseSession(user, firebaseProfile);
+    if (restoredFromCache) {
+      sessionRestoreCompleted = true;
+      render();
+    } else {
+      renderSessionLoading("Carregando os dados da sua campanha...");
+    }
+
     try {
       const pendingCampaignIds = await hydrateCampaignSaveOutbox(user.uid);
       await Promise.all(pendingCampaignIds.map(campaignId => (
@@ -1654,11 +1682,13 @@ async function initFirebaseBridge() {
       applyRemoteCampaignSnapshot(campaigns, meta, user);
     }, err => {
       console.error(err);
+      sessionRestoreCompleted = true;
       setSyncStatus("Falha de conexao");
       toast("Falha ao acompanhar campanhas em tempo real.");
+      if (!session.role) renderSessionRestoreFailure();
     });
 
-    if (!session.role && sessionRestoreCompleted) render();
+    if (!session.role) renderSessionLoading("Carregando os dados da sua campanha...");
   });
 }
 
@@ -1742,6 +1772,31 @@ function openImageModal(imgSrc, title = "Visualizar Imagem") {
 }
 
 // --- TELAS DE AUTENTICAÇÃO E HOME ---
+function renderSessionLoading(message = "Restaurando sua sessao...") {
+  root.innerHTML = `
+    <div class="modal home-screen"><main class="modalbox home-gateway" role="status" aria-live="polite">
+      <header class="gateway-heading">
+        <span class="gateway-sigil" aria-hidden="true">&#9673;</span>
+        <span class="gateway-eyebrow">Reconectando ao arquivo</span>
+        <h1>Restaurando sua sessao</h1>
+        <p>${esc(message)}</p>
+      </header>
+    </main></div>`;
+}
+
+function renderSessionRestoreFailure() {
+  root.innerHTML = `
+    <div class="modal home-screen"><main class="modalbox home-gateway" role="alert">
+      <header class="gateway-heading">
+        <span class="gateway-sigil" aria-hidden="true">!</span>
+        <span class="gateway-eyebrow">Falha temporaria de conexao</span>
+        <h1>Sua sessao continua salva</h1>
+        <p>Nao foi possivel carregar a campanha agora. Verifique a internet e tente novamente.</p>
+        <button onclick="location.reload()">Tentar novamente</button>
+      </header>
+    </main></div>`;
+}
+
 function home() {
   root.innerHTML = `
     <div class="modal home-screen"><main class="modalbox home-gateway">
@@ -7613,5 +7668,6 @@ document.addEventListener("fullscreenchange", () => {
   document.querySelectorAll("#sceneStage, #gameBoardStage").forEach(restoreImageAfterFullscreen);
 });
 if (window.CDIFirebase) initFirebaseBridge();
-render();
+if (firebaseConfiguredForStartup() && !sessionRestoreCompleted) renderSessionLoading();
+else render();
             

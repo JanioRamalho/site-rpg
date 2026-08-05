@@ -1236,6 +1236,112 @@ test("restores the Firebase player session without storing a password", () => {
   assert.doesNotMatch(saved, /secret|password/i);
 });
 
+test("restores a cached Firebase player before the realtime snapshot arrives after F5", async () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    let authCallback = null;
+    let campaignWatchStarted = false;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "auth-1" },
+      getUserProfile: async () => ({ id: "auth-1", role: "player", name: "Ana" }),
+      onAuthChanged: callback => { authCallback = callback; return () => {}; },
+      watchCampaigns: () => { campaignWatchStarted = true; return () => {}; },
+      setPlayerPresence: async () => {}
+    };
+    firebaseUser = { uid: "auth-1", email: "ana@example.com" };
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "inventory" };
+    render();
+
+    session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
+    firebaseUser = null;
+    firebaseProfile = null;
+    firebaseReady = false;
+    sessionRestoreCompleted = false;
+    await initFirebaseBridge();
+    await authCallback({ uid: "auth-1", email: "ana@example.com" });
+
+    return {
+      role: session.role,
+      campaignId: session.campaign?.id,
+      playerId: session.player?.id,
+      view: session.view,
+      campaignWatchStarted,
+      restoreCompleted: sessionRestoreCompleted
+    };
+  })()`, context);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result)),
+    {
+      role: "player",
+      campaignId: "campaign-1",
+      playerId: "player-1",
+      view: "inventory",
+      campaignWatchStarted: true,
+      restoreCompleted: true
+    }
+  );
+  assert.match(root.innerHTML, /Pocao/);
+  assert.doesNotMatch(root.innerHTML, /Entrar como Jogador/);
+});
+
+test("restores the Firebase master campaign and view after F5", () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = vm.runInContext(`(() => {
+    window.CDIFirebase = { enabled: true, currentUser: { uid: "master-1" } };
+    firebaseUser = { uid: "master-1", email: "master@example.com" };
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: { id: "master-1", role: "master", name: "Mestre" }, view: "room" };
+    render();
+    session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
+    const restored = restoreFirebaseSession(firebaseUser, { id: "master-1", role: "master", name: "Mestre" });
+    return { restored, role: session.role, campaignId: session.campaign?.id, view: session.view };
+  })()`, context);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result)),
+    { restored: true, role: "master", campaignId: "campaign-1", view: "room" }
+  );
+});
+
+test("keeps Firebase authentication locally persistent until explicit sign-out", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "js", "firebase", "client.js"), "utf8");
+  assert.match(source, /setPersistence\(auth,\s*firebaseAuth\.browserLocalPersistence\)/);
+});
+
+test("clears the saved session only when the user presses Sair", async () => {
+  const { context, storage } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    let signOutCalls = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "auth-1" },
+      setPlayerPresence: async () => {},
+      signOut: async () => { signOutCalls += 1; }
+    };
+    firebaseUser = { uid: "auth-1", email: "ana@example.com" };
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "inventory" };
+    render();
+    const savedBeforeLogout = Boolean(localStorage.getItem(SESSION_STORAGE_KEY));
+    await logout();
+    return {
+      savedBeforeLogout,
+      savedAfterLogout: Boolean(localStorage.getItem(SESSION_STORAGE_KEY)),
+      signOutCalls,
+      role: session.role
+    };
+  })()`, context);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(result)),
+    { savedBeforeLogout: true, savedAfterLogout: false, signOutCalls: 1, role: null }
+  );
+  assert.equal(storage.has("cdi_session_context_v2"), false);
+});
+
 test("configures Firestore persistent multi-tab cache for offline pending writes", () => {
   const source = fs.readFileSync(path.join(__dirname, "..", "js", "firebase", "client.js"), "utf8");
   assert.match(source, /localCache:\s*firebaseFirestore\.persistentLocalCache\s*\(/);
