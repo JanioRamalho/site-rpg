@@ -14,7 +14,10 @@ export async function createFirebaseClient(cfg) {
   await firebaseAuth.setPersistence(auth, firebaseAuth.browserLocalPersistence);
   const db = firebaseFirestore.initializeFirestore(app, {
     experimentalForceLongPolling: true,
-    useFetchStreams: false
+    useFetchStreams: false,
+    localCache: firebaseFirestore.persistentLocalCache({
+      tabManager: firebaseFirestore.persistentMultipleTabManager()
+    })
   });
   const api = { ...firebaseAuth, ...firebaseFirestore };
 

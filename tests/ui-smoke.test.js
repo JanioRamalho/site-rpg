@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { webcrypto } = require("node:crypto");
 const tabletop = require("../js/game/tabletop-model.js");
 
 function createAppContext() {
@@ -32,6 +33,7 @@ function createAppContext() {
       setAttribute(name, value) {
         this.attributes[name] = String(value);
       },
+      click() {},
       remove() {
         this.isConnected = false;
         const index = bodyChildren.indexOf(this);
@@ -96,7 +98,12 @@ function createAppContext() {
     Array,
     Object,
     Boolean,
-    Promise
+    Promise,
+    URL,
+    Blob,
+    TextEncoder,
+    Uint8Array,
+    crypto: webcrypto
   });
   window.window = window;
   const source = fs.readFileSync(path.join(__dirname, "..", "script.js"), "utf8");
@@ -737,6 +744,81 @@ test("updates a game card vital immediately when the master uses its controls", 
   assert.match(root.innerHTML, /9\/10/);
 });
 
+test("serializes rapid game vital changes through the dedicated realtime API", async () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "room" };
+    let remoteHealth = 10;
+    let activeVitalWrites = 0;
+    let maxActiveVitalWrites = 0;
+    let genericCampaignSaves = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => { genericCampaignSaves += 1; },
+      adjustCharacterVital: async (campaignId, characterId, key, delta) => {
+        activeVitalWrites += 1;
+        maxActiveVitalWrites = Math.max(maxActiveVitalWrites, activeVitalWrites);
+        await Promise.resolve();
+        remoteHealth = Math.max(0, Math.min(10, remoteHealth + delta));
+        activeVitalWrites -= 1;
+        return { campaignId, characterId, key, value: remoteHealth, max: 10 };
+      }
+    };
+    const operations = [
+      adjustGameCardStat("char-1", "health", -1),
+      adjustGameCardStat("char-1", "health", -1),
+      adjustGameCardStat("char-1", "health", -1)
+    ];
+    window.__optimisticHealth = session.campaign.characters[0].health;
+    window.__rapidVitalPromise = Promise.all(operations).then(() => ({
+      remoteHealth,
+      localHealth: session.campaign.characters[0].health,
+      maxActiveVitalWrites,
+      genericCampaignSaves
+    }));
+  `, context);
+
+  const result = await context.window.__rapidVitalPromise;
+  assert.equal(context.window.__optimisticHealth, 7);
+  assert.equal(result.remoteHealth, 7);
+  assert.equal(result.localHealth, 7);
+  assert.equal(result.maxActiveVitalWrites, 1);
+  assert.equal(result.genericCampaignSaves, 0);
+  assert.match(root.innerHTML, /7\/10/);
+});
+
+test("player health and sanity controls use the same dedicated character API", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "sheet" };
+    let received = null;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "auth-1" },
+      adjustCharacterVital: async (campaignId, characterId, key, delta) => {
+        received = { campaignId, characterId, key, delta };
+        return { ...received, value: 7, max: 8 };
+      }
+    };
+    window.__playerVitalPromise = changeStatDirect("sanity", -1).then(() => ({
+      received,
+      localSanity: session.campaign.characters[0].sanity
+    }));
+  `, context);
+
+  const result = await context.window.__playerVitalPromise;
+  assert.deepEqual({ ...result.received }, {
+    campaignId: "campaign-1",
+    characterId: "char-1",
+    key: "sanity",
+    delta: -1
+  });
+  assert.equal(result.localSanity, 7);
+});
+
 test("renders only the owned inventory in an immersive slot grid", () => {
   const { context, root } = createAppContext();
   seedCampaign(context);
@@ -1154,6 +1236,12 @@ test("restores the Firebase player session without storing a password", () => {
   assert.doesNotMatch(saved, /secret|password/i);
 });
 
+test("configures Firestore persistent multi-tab cache for offline pending writes", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "js", "firebase", "client.js"), "utf8");
+  assert.match(source, /localCache:\s*firebaseFirestore\.persistentLocalCache\s*\(/);
+  assert.match(source, /tabManager:\s*firebaseFirestore\.persistentMultipleTabManager\s*\(\)/);
+});
+
 test("waits for the saved campaign instead of switching campaigns during refresh", () => {
   const { context } = createAppContext();
   seedCampaign(context);
@@ -1273,4 +1361,977 @@ test("keeps an open registration modal intact during realtime updates", () => {
   vm.runInContext(`window.__deferredRenderFlushed = flushDeferredRenderAfterModalClose()`, context);
   assert.equal(context.window.__deferredRenderFlushed, true);
   assert.doesNotMatch(root.innerHTML, /Rascunho em andamento/);
+});
+
+test("renders a 40-scene Cloudinary deck with proportional delivery URLs and lazy thumbnails", () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    state.campaigns[0].scenes = Array.from({ length: 40 }, (_, index) => ({
+      id: "scene-" + index,
+      title: "Cena " + (index + 1),
+      caption: "",
+      masterNotes: "",
+      image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/scene-" + index + ".png"
+    }));
+    state.campaigns[0].liveScene = { active: false, sceneId: null, image: "", index: 0, total: 0 };
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    render();
+  `, context);
+
+  const lazyImages = root.innerHTML.match(/loading="lazy"/g) || [];
+  assert.equal(lazyImages.length, 40);
+  assert.match(root.innerHTML, /image\/upload\/c_limit,w_360,h_360\/f_auto,fl_preserve_transparency\/q_auto:good\//);
+  assert.match(root.innerHTML, /image\/upload\/c_limit,w_1920,h_1920\/f_auto,fl_preserve_transparency\/q_auto:best\//);
+  assert.match(root.innerHTML, /data-original-image="https:\/\/res\.cloudinary\.com/);
+  assert.match(root.innerHTML, /width="164" height="104"/);
+});
+
+test("refuses a scene upload batch that would exceed 40 active scenes before uploading", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    state.campaigns[0].scenes = Array.from({ length: 39 }, (_, index) => ({
+      id: "scene-" + index,
+      title: "Cena " + index,
+      image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/scene-" + index + ".png"
+    }));
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    let uploads = 0;
+    let warning = "";
+    alert = message => { warning = String(message); };
+    readImg = async () => {
+      uploads += 1;
+      return "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/unexpected.png";
+    };
+    await addSceneImages([
+      { name: "one.png", type: "image/png", size: 1000 },
+      { name: "two.png", type: "image/png", size: 1000 }
+    ]);
+    return { uploads, warning, count: session.campaign.scenes.length };
+  })()`, context);
+
+  assert.equal(result.uploads, 0);
+  assert.equal(result.count, 39);
+  assert.match(result.warning, /limite seguro e 40 cenas ativas/);
+});
+
+test("moves a scene to master-only trash and restores every scene field without changing progress", async () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    const originalScene = JSON.stringify(session.campaign.scenes[0]);
+    const originalPlayers = JSON.stringify(session.campaign.players);
+    const originalCharacters = JSON.stringify(session.campaign.characters);
+    await deleteScene("scene-1");
+    const masterHtml = document.getElementById("root").innerHTML;
+    const trashedScene = session.campaign.sceneTrash[0];
+    await restoreSceneFromTrash("scene-1");
+    const restoredScene = session.campaign.scenes.find(scene => scene.id === "scene-1");
+    session = { role: "player", campaign: state.campaigns[0], player: state.campaigns[0].players[0], currentMaster: null, view: "scenes" };
+    render();
+    return {
+      masterSawTrash: masterHtml.includes("Lixeira privada") && masterHtml.includes("Restaurar"),
+      playerSawTrash: document.getElementById("root").innerHTML.includes("Lixeira privada"),
+      trashUsedSameImage: trashedScene.image === "scene-1.jpg",
+      restoredExactly: JSON.stringify(restoredScene) === originalScene,
+      playersUnchanged: JSON.stringify(session.campaign.players) === originalPlayers,
+      charactersUnchanged: JSON.stringify(session.campaign.characters) === originalCharacters,
+      trashCount: session.campaign.sceneTrash.length
+    };
+  })()`, context);
+
+  assert.equal(result.masterSawTrash, true);
+  assert.equal(result.playerSawTrash, false);
+  assert.equal(result.trashUsedSameImage, true);
+  assert.equal(result.restoredExactly, true);
+  assert.equal(result.playersUnchanged, true);
+  assert.equal(result.charactersUnchanged, true);
+  assert.equal(result.trashCount, 0);
+});
+
+test("reduces scene upload concurrency for large originals", () => {
+  const { context } = createAppContext();
+  const result = vm.runInContext(`({
+    normal: sceneUploadConcurrency([{ size: 2 * 1024 * 1024 }]),
+    large: sceneUploadConcurrency([{ size: 10 * 1024 * 1024 }]),
+    veryLarge: sceneUploadConcurrency([{ size: 20 * 1024 * 1024 }])
+  })`, context);
+
+  assert.deepEqual({ ...result }, { normal: 3, large: 2, veryLarge: 1 });
+});
+
+test("keeps Cloudinary delivery transformations proportional, transparent and non-duplicated", () => {
+  const { context } = createAppContext();
+  const result = vm.runInContext(`(() => {
+    window.CDI_CLOUDINARY_CONFIG = { cloudName: "sbyfm34m", uploadPreset: "site-rpg" };
+    const original = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/portrait.png";
+    const delivered = cloudinaryDeliveryUrl(original, "stage");
+    return {
+      delivered,
+      repeated: cloudinaryDeliveryUrl(delivered, "stage"),
+      external: cloudinaryDeliveryUrl("https://example.com/image.png", "stage"),
+      foreignCloud: cloudinaryDeliveryUrl("https://res.cloudinary.com/another-cloud/image/upload/v1/image.png", "stage")
+    };
+  })()`, context);
+
+  assert.match(result.delivered, /c_limit,w_1920,h_1920\/f_auto,fl_preserve_transparency\/q_auto:best/);
+  assert.equal(result.repeated, result.delivered);
+  assert.equal(result.external, "https://example.com/image.png");
+  assert.equal(result.foreignCloud, "https://res.cloudinary.com/another-cloud/image/upload/v1/image.png");
+});
+
+test("uses the untouched Cloudinary original only while an image stage is fullscreen", () => {
+  const { context } = createAppContext();
+  const result = vm.runInContext(`(() => {
+    const stageUrl = "https://res.cloudinary.com/sbyfm34m/image/upload/c_limit,w_1920,h_1920/v1/scene.png";
+    const original = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/scene.png";
+    const image = {
+      src: stageUrl,
+      dataset: { originalImage: original },
+      getAttribute: () => image.src
+    };
+    const stage = { querySelector: () => image };
+    prepareOriginalForFullscreen(stage);
+    const duringFullscreen = image.src;
+    image.onerror();
+    return { duringFullscreen, afterFallback: image.src, marker: image.dataset.standardImage };
+  })()`, context);
+
+  assert.equal(result.duringFullscreen, "https://res.cloudinary.com/sbyfm34m/image/upload/v1/scene.png");
+  assert.match(result.afterFallback, /c_limit,w_1920,h_1920/);
+  assert.equal(result.marker, undefined);
+});
+
+test("links a board image locally only after its atomic Firebase media commit", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "room" };
+    session.campaign.gameBoard = {
+      image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/board-old.png",
+      updatedAt: "2026-08-01T12:00:00.000Z"
+    };
+    let mediaCommits = 0;
+    let committedUrl = "";
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      commitCampaignMediaMutation: async (_campaignId, mutation) => {
+        mediaCommits += 1;
+        committedUrl = mutation.basePatch.gameBoard.image;
+        return { status: "committed", verified: true };
+      }
+    };
+    readImg = async () => {
+      const url = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/board-new.png";
+      uploadedImageMetadata.set(url, { provider: "cloudinary", width: 2400, height: 1350 });
+      return url;
+    };
+    await uploadGameBoard([{ name: "board.png", type: "image/png", size: 1000 }]);
+    return {
+      mediaCommits,
+      committedUrl,
+      localUrl: session.campaign.gameBoard.image,
+      previousUrl: session.campaign.previousGameBoard.image,
+      width: session.campaign.gameBoard.imageMeta?.width
+    };
+  })()`, context);
+
+  assert.equal(result.mediaCommits, 1);
+  assert.equal(result.localUrl, result.committedUrl);
+  assert.match(result.previousUrl, /board-old\.png$/);
+  assert.equal(result.width, 2400);
+});
+
+test("swaps current and previous boards atomically without uploading again", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "room" };
+    session.campaign.gameBoard = { image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/board-current.png" };
+    session.campaign.previousGameBoard = { image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/board-previous.png" };
+    const playersBefore = JSON.stringify(session.campaign.players);
+    const charactersBefore = JSON.stringify(session.campaign.characters);
+    let mutation = null;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      commitCampaignMediaMutation: async (_campaignId, nextMutation) => {
+        mutation = nextMutation;
+        return { status: "committed", verified: true };
+      }
+    };
+    await restorePreviousGameBoard();
+    return {
+      current: session.campaign.gameBoard.image,
+      previous: session.campaign.previousGameBoard.image,
+      committedCurrent: mutation.basePatch.gameBoard.image,
+      committedPrevious: mutation.basePatch.previousGameBoard.image,
+      playersUnchanged: JSON.stringify(session.campaign.players) === playersBefore,
+      charactersUnchanged: JSON.stringify(session.campaign.characters) === charactersBefore
+    };
+  })()`, context);
+
+  assert.match(result.current, /board-previous\.png$/);
+  assert.match(result.previous, /board-current\.png$/);
+  assert.equal(result.committedCurrent, result.current);
+  assert.equal(result.committedPrevious, result.previous);
+  assert.equal(result.playersUnchanged, true);
+  assert.equal(result.charactersUnchanged, true);
+});
+
+test("captures a debounced save by campaign even when the user switches campaigns", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    const second = JSON.parse(JSON.stringify(state.campaigns[0]));
+    second.id = "campaign-2";
+    second.name = "Segunda mesa";
+    state.campaigns.push(second);
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    const saved = [];
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async campaign => { saved.push({ id: campaign.id, name: campaign.name }); }
+    };
+    session.campaign.name = "Primeira mesa editada";
+    save();
+    session.campaign = second;
+    await flushCampaignSave("campaign-1");
+    return { savedId: saved[0]?.id, savedName: saved[0]?.name, activeId: session.campaign.id };
+  })()`, context);
+
+  assert.equal(result.savedId, "campaign-1");
+  assert.equal(result.savedName, "Primeira mesa editada");
+  assert.equal(result.activeId, "campaign-2");
+});
+
+test("does not replace a campaign while its captured save is pending", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => {}
+    };
+    session.campaign.name = "Edicao local protegida";
+    save();
+    const remote = JSON.parse(JSON.stringify(state.campaigns));
+    remote[0].name = "Snapshot anterior";
+    applyRemoteCampaignSnapshot(remote, { fromCache: false, hasPendingWrites: false }, { uid: "master-1" });
+    const beforeFlush = session.campaign.name;
+    await flushCampaignSave("campaign-1");
+    return { beforeFlush, afterFlush: session.campaign.name };
+  })()`, context);
+
+  assert.equal(result.beforeFlush, "Edicao local protegida");
+  assert.equal(result.afterFlush, "Edicao local protegida");
+});
+
+test("rehydrates a failed campaign save from the durable local marker", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => { throw new Error("offline"); }
+    };
+    session.campaign.name = "Alteracao recuperavel";
+    save();
+    try { await flushCampaignSave("campaign-1"); } catch {}
+    clearCampaignSaveStates();
+    const restoredIds = await hydrateCampaignSaveOutbox("master-1");
+    return {
+      restored: restoredIds.includes("campaign-1"),
+      queuedName: campaignSaveState("campaign-1").queued?.campaign?.name || ""
+    };
+  })()`, context);
+
+  assert.equal(result.restored, true);
+  assert.equal(result.queuedName, "Alteracao recuperavel");
+});
+
+test("keeps another tab's durable mutation when an older acknowledgement is cleaned", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    const campaign = JSON.parse(JSON.stringify(state.campaigns[0]));
+    const job = {
+      campaign,
+      role: "master",
+      playerId: null,
+      revision: 2,
+      authUid: "master-1",
+      mutationId: "campaign-1:newer-tab",
+      baseCampaign: JSON.parse(JSON.stringify(campaign)),
+      clientId: "tab-new",
+      queuedAt: "2026-08-02T12:00:00.000Z"
+    };
+    await persistCampaignSaveJob(job);
+    await clearPersistedCampaignSave("master-1", "campaign-1", "campaign-1:older-tab");
+    const afterOlderAck = readCampaignSaveFallbacks().get("master-1:campaign-1")?.mutationId || "";
+    await clearPersistedCampaignSave("master-1", "campaign-1", "campaign-1:newer-tab");
+    return {
+      afterOlderAck,
+      clearedAfterMatchingAck: !readCampaignSaveFallbacks().has("master-1:campaign-1")
+    };
+  })()`, context);
+
+  assert.equal(result.afterOlderAck, "campaign-1:newer-tab");
+  assert.equal(result.clearedAfterMatchingAck, true);
+});
+
+test("falls back to local storage when an IndexedDB campaign write aborts", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    openMediaOutboxDb = async () => ({
+      close() {},
+      transaction() {
+        const transaction = {
+          error: new Error("quota"),
+          objectStore() {
+            return {
+              get() {
+                const request = { result: null };
+                Promise.resolve().then(() => request.onsuccess?.());
+                return request;
+              },
+              put() { Promise.resolve().then(() => transaction.onabort?.()); }
+            };
+          }
+        };
+        return transaction;
+      }
+    });
+    const campaign = JSON.parse(JSON.stringify(state.campaigns[0]));
+    await persistCampaignSaveJob({
+      campaign,
+      role: "master",
+      revision: 1,
+      authUid: "master-1",
+      mutationId: "campaign-1:quota-fallback",
+      baseCampaign: campaign,
+      clientId: "tab-1",
+      queuedAt: "2026-08-02T12:00:00.000Z"
+    });
+    return readCampaignSaveFallbacks().get("master-1:campaign-1")?.mutationId || "";
+  })()`, context);
+
+  assert.equal(result, "campaign-1:quota-fallback");
+});
+
+test("keeps the newest durable campaign revision when an older in-flight save fails", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    const durableNames = [];
+    let rejectFirstSave;
+    let announceFirstSave;
+    const firstSaveStarted = new Promise(resolve => { announceFirstSave = resolve; });
+    persistCampaignSaveJob = async job => { durableNames.push(job.campaign.name); };
+    clearPersistedCampaignSave = async () => {};
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: campaign => {
+        if (campaign.name !== "Revisao antiga") return Promise.resolve();
+        announceFirstSave();
+        return new Promise((_, reject) => { rejectFirstSave = reject; });
+      }
+    };
+
+    session.campaign.name = "Revisao antiga";
+    save();
+    const firstFlush = flushCampaignSave("campaign-1");
+    await firstSaveStarted;
+    session.campaign.name = "Revisao nova";
+    save();
+    await campaignSaveState("campaign-1").queued.durabilityPromise;
+    rejectFirstSave(new Error("offline"));
+    try { await firstFlush; } catch {}
+    return {
+      queuedName: campaignSaveState("campaign-1").queued?.campaign?.name || "",
+      durableNames
+    };
+  })()`, context);
+
+  assert.equal(result.queuedName, "Revisao nova");
+  assert.equal(result.durableNames.at(-1), "Revisao nova");
+});
+
+test("passes the captured remote baseline and mutation identity to a generic save", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    const baseline = JSON.parse(JSON.stringify(session.campaign));
+    campaignRemoteBaselines.set("campaign-1", baseline);
+    let received = null;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async (campaign, options) => { received = { campaign, options }; }
+    };
+    session.campaign.name = "Edicao intencional";
+    save();
+    await flushCampaignSave("campaign-1");
+    return {
+      baselineName: received.options.baseCampaign.name,
+      savedName: received.campaign.name,
+      mutationId: received.options.mutationId,
+      revision: received.options.mutationRevision
+    };
+  })()`, context);
+
+  assert.equal(result.baselineName, "Mesa de teste");
+  assert.equal(result.savedName, "Edicao intencional");
+  assert.match(result.mutationId, /^campaign-1:/);
+  assert.equal(result.revision, 1);
+});
+
+test("creates a campaign through the durable queue with an atomic creation identity", async () => {
+  const { context } = createAppContext();
+  const result = await vm.runInContext(`(async () => {
+    state = { masters: [{ id: "master-1", name: "Mestre" }], campaigns: [] };
+    session = { role: "master", campaign: null, player: null, currentMaster: state.masters[0], view: "campaigns" };
+    const originalGetElementById = document.getElementById;
+    document.getElementById = id => ({
+      cn: { value: "Mesa duravel" },
+      cp: { value: "segredo" },
+      cd: { value: "Criada com fila" }
+    }[id] || originalGetElementById(id));
+    let received = null;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async (campaign, options) => { received = { campaign, options }; }
+    };
+    await createCampaign();
+    return {
+      campaignCount: state.campaigns.length,
+      queuedAsCreation: received?.options?.isCreation === true,
+      baselineIsNull: received?.options?.baseCampaign === null,
+      mutationId: received?.options?.mutationId || ""
+    };
+  })()`, context);
+
+  assert.equal(result.campaignCount, 1);
+  assert.equal(result.queuedAsCreation, true);
+  assert.equal(result.baselineIsNull, true);
+  assert.match(result.mutationId, /:/);
+});
+
+test("does not replay a durable job already acknowledged by Firebase", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    campaignRemoteBaselines.set("campaign-1", JSON.parse(JSON.stringify(session.campaign)));
+    let saves = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => { saves += 1; }
+    };
+    session.campaign.name = "Job que ja foi confirmado";
+    save();
+    const job = campaignSaveState("campaign-1").queued;
+    job.needsRebase = true;
+    const authoritative = JSON.parse(JSON.stringify(job.campaign));
+    authoritative.name = "Progresso remoto posterior";
+    authoritative.lastClientMutation = { id: job.mutationId, authUid: job.authUid, revision: job.revision };
+    window.CDIFirebase.getCampaign = async () => authoritative;
+    await flushCampaignSave("campaign-1");
+    return { saves, localName: findCampaign("campaign-1")?.name || "" };
+  })()`, context);
+
+  assert.equal(result.saves, 0);
+  assert.equal(result.localName, "Progresso remoto posterior");
+});
+
+test("rebases a replayed local edit over newer remote progress", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    const baseline = JSON.parse(JSON.stringify(session.campaign));
+    campaignRemoteBaselines.set("campaign-1", baseline);
+    let received = null;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async (campaign, options) => { received = { campaign, options }; }
+    };
+    session.campaign.name = "Nome local pendente";
+    save();
+    const job = campaignSaveState("campaign-1").queued;
+    job.needsRebase = true;
+    const authoritative = JSON.parse(JSON.stringify(baseline));
+    authoritative.characters[0].health = 3;
+    window.CDIFirebase.getCampaign = async () => authoritative;
+    await flushCampaignSave("campaign-1");
+    return {
+      savedName: received.campaign.name,
+      savedHealth: received.campaign.characters[0].health,
+      baselineHealth: received.options.baseCampaign.characters[0].health
+    };
+  })()`, context);
+
+  assert.equal(result.savedName, "Nome local pendente");
+  assert.equal(result.savedHealth, 3);
+  assert.equal(result.baselineHealth, 3);
+});
+
+test("does not automatically replay a legacy durable snapshot without a baseline", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    let saves = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      getCampaign: async () => JSON.parse(JSON.stringify(state.campaigns[0])),
+      saveCampaign: async () => { saves += 1; }
+    };
+    const pending = campaignSaveState("campaign-1");
+    pending.queued = {
+      campaign: JSON.parse(JSON.stringify(state.campaigns[0])),
+      role: "master",
+      playerId: null,
+      revision: 1,
+      authUid: "master-1",
+      mutationId: "campaign-1:legacy",
+      baseCampaign: null,
+      needsRebase: true,
+      isCreation: false,
+      durabilityPromise: Promise.resolve()
+    };
+    let code = "";
+    try { await flushCampaignSave("campaign-1"); } catch (error) { code = error.code || ""; }
+    return { code, saves, stillQueued: Boolean(pending.queued), retryTimer: pending.timer };
+  })()`, context);
+
+  assert.equal(result.code, "campaign/replay-baseline-missing");
+  assert.equal(result.saves, 0);
+  assert.equal(result.stillQueued, true);
+  assert.equal(result.retryTimer, null);
+});
+
+test("reconciles before retrying when durable cleanup fails after a confirmed save", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "campaign" };
+    campaignRemoteBaselines.set("campaign-1", JSON.parse(JSON.stringify(session.campaign)));
+    persistCampaignSaveJob = async () => {};
+    clearPersistedCampaignSave = async () => { throw new Error("storage busy"); };
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => ({ completed: true })
+    };
+    session.campaign.name = "Confirmada remotamente";
+    save();
+    let failed = false;
+    try { await flushCampaignSave("campaign-1"); } catch { failed = true; }
+    const job = campaignSaveState("campaign-1").queued;
+    return { failed, queued: Boolean(job), needsRebase: job?.needsRebase === true };
+  })()`, context);
+
+  assert.equal(result.failed, true);
+  assert.equal(result.queued, true);
+  assert.equal(result.needsRebase, true);
+});
+
+test("aborts a dedicated scene write when a queued campaign save fails", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    session.campaign.scenes.forEach(scene => {
+      scene.image = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/" + scene.id + ".jpg";
+    });
+    session.campaign.liveScene.image = session.campaign.scenes[0].image;
+    let liveWrites = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => { throw new Error("offline"); },
+      updateLiveScene: async () => { liveWrites += 1; }
+    };
+    session.campaign.name = "Edicao ainda pendente";
+    save();
+    let rejected = false;
+    try {
+      await commitLiveScene("campaign-1", {
+        active: true,
+        sceneId: "scene-1",
+        image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/scene-1.jpg",
+        index: 0,
+        total: 2
+      });
+    } catch {
+      rejected = true;
+    }
+    return { rejected, liveWrites, stillQueued: Boolean(campaignSaveState("campaign-1").queued) };
+  })()`, context);
+
+  assert.equal(result.rejected, true);
+  assert.equal(result.liveWrites, 0);
+  assert.equal(result.stillQueued, true);
+});
+
+test("fills the 40-scene limit from uploaded Cloudinary images and commits once", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    session.campaign.scenes.forEach(scene => {
+      scene.image = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/" + scene.id + ".jpg";
+    });
+    session.campaign.liveScene.image = session.campaign.scenes[0].image;
+    let sceneCommits = 0;
+    let fullSaves = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      mediaConfigured: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => { fullSaves += 1; },
+      updateCampaignScenes: async (_campaignId, scenes, options) => {
+        sceneCommits += 1;
+        return { scenes, liveScene: options.liveScene || null };
+      }
+    };
+    assertSceneOutboxAvailable = async () => {};
+    writePendingSceneCommit = async (campaignId, scenes) => {
+      pendingSceneCommits.set(String(campaignId), { campaignId: String(campaignId), scenes });
+    };
+    clearPendingSceneCommit = async campaignId => { pendingSceneCommits.delete(String(campaignId)); };
+    let replacedBySnapshot = false;
+    readImg = async file => {
+      if (!replacedBySnapshot) {
+        replacedBySnapshot = true;
+        const latest = JSON.parse(JSON.stringify(session.campaign));
+        latest.name = "Snapshot novo";
+        state.campaigns[0] = latest;
+        session.campaign = latest;
+      }
+      return "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/" + file.name + ".jpg";
+    };
+    const files = Array.from({ length: 38 }, (_, index) => ({ name: "cena-" + index, type: "image/png", size: 1000 }));
+    await addSceneImages(files);
+    return {
+      count: session.campaign.scenes.length,
+      name: session.campaign.name,
+      sceneCommits,
+      addedAreRemote: session.campaign.scenes.slice(2).every(scene => scene.image.startsWith("https://res.cloudinary.com/"))
+    };
+  })()`, context);
+
+  assert.equal(result.count, 40);
+  assert.equal(result.name, "Snapshot novo");
+  assert.equal(result.sceneCommits, 1);
+  assert.equal(result.addedAreRemote, true);
+});
+
+test("keeps a failed scene commit recoverable and blocks a second upload batch", async () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    let uploads = 0;
+    let sceneCommits = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      mediaConfigured: true,
+      currentUser: { uid: "master-1" },
+      updateCampaignScenes: async () => { sceneCommits += 1; }
+    };
+    pendingSceneCommits.set("campaign-1", {
+      campaignId: "campaign-1",
+      scenes: [{
+        id: "pending-scene",
+        title: "Cena preservada",
+        image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/pending.png"
+      }]
+    });
+    readImg = async () => {
+      uploads += 1;
+      return "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/new.png";
+    };
+    await addSceneImages([{ name: "novo-lote.png", type: "image/png", size: 1000 }]);
+    render();
+    return { uploads, sceneCommits, sceneCount: session.campaign.scenes.length };
+  })()`, context);
+
+  assert.equal(result.uploads, 0);
+  assert.equal(result.sceneCommits, 0);
+  assert.equal(result.sceneCount, 2);
+  assert.match(root.innerHTML, /id="sceneImageFiles"[^>]*disabled/);
+  assert.match(root.innerHTML, /Cena preservada|1 cena pronta/);
+  assert.match(root.innerHTML, /Tentar novamente/);
+});
+
+test("does not start scene uploads when durable browser storage is unavailable", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const uploads = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    session.campaign.scenes.forEach(scene => {
+      scene.image = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/" + scene.id + ".jpg";
+    });
+    let count = 0;
+    readImg = async () => {
+      count += 1;
+      return "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/new.jpg";
+    };
+    await addSceneImages([{ name: "nova.jpg", type: "image/jpeg", size: 1000 }]);
+    return count;
+  })()`, context);
+
+  assert.equal(uploads, 0);
+});
+
+test("does not upload a scene when the durable outbox opens but its write probe aborts", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    session.campaign.scenes.forEach(scene => {
+      scene.image = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/" + scene.id + ".jpg";
+    });
+    window.CDIFirebase = { enabled: true, currentUser: { uid: "master-1" } };
+    readPendingSceneCommit = async () => null;
+    let uploads = 0;
+    let closes = 0;
+    readImg = async () => {
+      uploads += 1;
+      return "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/new.jpg";
+    };
+    openMediaOutboxDb = async () => ({
+      close() { closes += 1; },
+      transaction() {
+        const transaction = {
+          error: new Error("QuotaExceededError"),
+          objectStore() {
+            return {
+              put() { Promise.resolve().then(() => transaction.onabort?.()); },
+              delete() {}
+            };
+          }
+        };
+        return transaction;
+      }
+    });
+    await addSceneImages([{ name: "nova.jpg", type: "image/jpeg", size: 1000 }]);
+    return { uploads, closes };
+  })()`, context);
+
+  assert.equal(result.uploads, 0);
+  assert.equal(result.closes, 1);
+});
+
+test("publishes a scene through the dedicated live API instead of a full campaign save", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "scenes" };
+    session.campaign.scenes.forEach(scene => {
+      scene.image = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/" + scene.id + ".jpg";
+    });
+    session.campaign.liveScene.image = session.campaign.scenes[0].image;
+    let liveWrites = 0;
+    let fullSaves = 0;
+    window.CDIFirebase = {
+      enabled: true,
+      currentUser: { uid: "master-1" },
+      saveCampaign: async () => { fullSaves += 1; },
+      updateLiveScene: async (_campaignId, liveScene) => {
+        liveWrites += 1;
+        return liveScene;
+      }
+    };
+    lastSavedCampaignJson = JSON.stringify(session.campaign);
+    await toggleScenePresentation();
+    return { liveWrites, fullSaves, active: session.campaign.liveScene.active };
+  })()`, context);
+
+  assert.equal(result.liveWrites, 1);
+  assert.equal(result.fullSaves, 0);
+  assert.equal(result.active, false);
+});
+
+test("shows a deduplicated legacy-image migration summary", () => {
+  const { context, root } = createAppContext();
+  seedCampaign(context);
+  vm.runInContext(`
+    const legacy = "data:image/png;base64,AAAA";
+    collectLegacyImageReferences(state.campaigns[0]).forEach(reference => {
+      reference.parent[reference.key] = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/already-managed.png";
+    });
+    state.campaigns[0].characters[0].image = legacy;
+    state.campaigns[0].scenes[0].image = legacy;
+    state.campaigns[0].liveScene.image = legacy;
+    window.CDI_CLOUDINARY_CONFIG = { cloudName: "sbyfm34m", uploadPreset: "site-rpg" };
+    window.CDIFirebase = { enabled: true, mediaConfigured: true };
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "settings" };
+    render();
+  `, context);
+
+  assert.match(root.innerHTML, /Imagens no Cloudinary/);
+  assert.match(root.innerHTML, /<strong>3<\/strong><span>referencias fora do Cloudinary<\/span>/);
+  assert.match(root.innerHTML, /<strong>1<\/strong><span>imagens unicas<\/span>/);
+  assert.match(root.innerHTML, /Migrar imagens antigas/);
+  assert.match(root.innerHTML, /Verificar backup JSON/);
+});
+
+test("builds an integrity-checked migration backup with campaign progress counts", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const backup = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "settings" };
+    return buildMasterImageBackup([state.campaigns[0]]);
+  })()`, context);
+
+  assert.equal(backup.format, "site-rpg-cloudinary-migration-backup");
+  assert.equal(backup.version, 2);
+  assert.equal(backup.masterId, "master-1");
+  assert.match(backup.integrity.campaignsDigest, /^[a-f0-9]{64}$/);
+  assert.equal(backup.manifest.length, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(backup.manifest[0])),
+    {
+      id: "campaign-1",
+      name: "Mesa de teste",
+      players: 2,
+      characters: 2,
+      scenes: 2,
+      sceneTrash: 0,
+      items: 1,
+      evidence: 2,
+      traumaCatalog: 2,
+      inventoryEntries: 1,
+      assignedEvidence: 1,
+      assignedTraumas: 2,
+      legacyImageReferences: 15
+    }
+  );
+  assert.equal(backup.campaigns[0].characters[0].health, 10);
+});
+
+test("verifies a migration backup and rejects any later progress alteration", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "settings" };
+    const backup = await buildMasterImageBackup([state.campaigns[0]]);
+    const verified = await verifyMasterImageBackupPayload(backup);
+    backup.campaigns[0].characters[0].health = 1;
+    let rejected = false;
+    let message = "";
+    try {
+      await verifyMasterImageBackupPayload(backup);
+    } catch (error) {
+      rejected = true;
+      message = error.message;
+    }
+    return { verified, rejected, message };
+  })()`, context);
+
+  assert.equal(result.verified.verified, true);
+  assert.equal(result.verified.campaigns, 1);
+  assert.equal(result.verified.references, 15);
+  assert.equal(result.rejected, true);
+  assert.match(result.message, /integridade/i);
+});
+
+test("stops the migration before any Cloudinary upload when remote preflight fails", async () => {
+  const { context } = createAppContext();
+  seedCampaign(context);
+  const result = await vm.runInContext(`(async () => {
+    session = { role: "master", campaign: state.campaigns[0], player: null, currentMaster: state.masters[0], view: "settings" };
+    let uploads = 0;
+    let commits = 0;
+    let preflights = 0;
+    let layoutPreparations = 0;
+    const order = [];
+    saveMasterImageBackup = async () => ({ verified: true });
+    window.CDIFirebase = {
+      enabled: true,
+      mediaConfigured: true,
+      currentUser: { uid: "master-1" },
+      uploadImage: async () => {
+        uploads += 1;
+        return { secureUrl: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/unexpected.png" };
+      },
+      getCampaign: async () => cloneCampaignForSave(state.campaigns[0]),
+      upgradeLegacyCampaignStorageLayout: async () => {
+        layoutPreparations += 1;
+        order.push("layout");
+        return { status: "noop", verified: true };
+      },
+      preflightCampaignImageMigration: async () => {
+        preflights += 1;
+        order.push("preflight");
+        const error = new Error("A campanha remota mudou");
+        error.code = "campaign/migration-snapshot-stale";
+        throw error;
+      },
+      migrateCampaignImages: async () => { commits += 1; }
+    };
+    await migrateLegacyImages();
+    return { uploads, commits, preflights, layoutPreparations, order, inProgress: imageMigrationInProgress };
+  })()`, context);
+
+  assert.equal(result.preflights, 1);
+  assert.equal(result.layoutPreparations, 1);
+  assert.deepEqual(Array.from(result.order), ["layout", "preflight"]);
+  assert.equal(result.uploads, 0);
+  assert.equal(result.commits, 0);
+  assert.equal(result.inProgress, false);
+});
+
+test("reconciles local migration edits without reverting concurrent remote progress", () => {
+  const { context } = createAppContext();
+  const result = vm.runInContext(`(() => {
+    const base = {
+      id: "campaign-1",
+      characters: [{ id: "char-1", name: "Original", health: 10, image: "legacy.png" }]
+    };
+    const local = {
+      id: "campaign-1",
+      characters: [{ id: "char-1", name: "Nome editado", health: 10, image: "legacy.png" }]
+    };
+    const remote = {
+      id: "campaign-1",
+      characters: [{
+        id: "char-1",
+        name: "Original",
+        health: 8,
+        image: "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg/character.png"
+      }]
+    };
+    return mergeLocalChangesOntoRemote(base, local, remote).characters[0];
+  })()`, context);
+
+  assert.equal(result.name, "Nome editado");
+  assert.equal(result.health, 8);
+  assert.match(result.image, /^https:\/\/res\.cloudinary\.com\//);
+});
+
+test("contains no persistent Base64 fallback in the image upload path", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "script.js"), "utf8");
+  assert.doesNotMatch(source, /toDataURL\s*\(/);
+  assert.doesNotMatch(source, /Salvando localmente/);
+  assert.match(source, /O Cloudinary nao confirmou uma URL valida/);
 });

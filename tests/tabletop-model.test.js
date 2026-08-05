@@ -86,6 +86,60 @@ test("normalizes reusable character expressions and discards an invalid active s
   assert.equal(character.activeExpression, "");
 });
 
+test("preserves image metadata and unknown properties while normalizing visual assets", () => {
+  const campaign = {
+    players: [],
+    gameBoard: {
+      image: "board.jpg",
+      imageMeta: { assetId: "board-asset", width: 2400, height: 1600 },
+      viewportMode: "contain"
+    },
+    previousGameBoard: {
+      image: "board-previous.jpg",
+      imageMeta: { assetId: "previous-board-asset", width: 1920, height: 1080 },
+      viewportMode: "contain"
+    },
+    traumaCatalog: [],
+    characters: [{
+      id: "char-1",
+      expressions: [{
+        id: "expression-1",
+        title: "Tenso",
+        image: "expression.jpg",
+        imageMeta: { assetId: "expression-asset" },
+        focusPoint: "center"
+      }],
+      traumas: [{
+        id: "trauma-1",
+        title: "Escuro",
+        image: "trauma.jpg",
+        imageMeta: { assetId: "trauma-asset" },
+        visualVariant: "night"
+      }]
+    }],
+    scenes: [{
+      id: "scene-1",
+      title: "Entrada",
+      image: "scene.jpg",
+      imageMeta: { assetId: "scene-asset", publicId: "scenes/entry" },
+      assetAuditId: "private-audit-1"
+    }]
+  };
+
+  tabletop.normalizeCampaign(campaign, sequentialIds());
+
+  assert.deepEqual(campaign.gameBoard.imageMeta, { assetId: "board-asset", width: 2400, height: 1600 });
+  assert.equal(campaign.gameBoard.viewportMode, "contain");
+  assert.deepEqual(campaign.previousGameBoard.imageMeta, { assetId: "previous-board-asset", width: 1920, height: 1080 });
+  assert.equal(campaign.characters[0].expressions[0].focusPoint, "center");
+  assert.equal(campaign.characters[0].expressions[0].imageMeta.assetId, "expression-asset");
+  assert.equal(campaign.characters[0].traumas[0].visualVariant, "night");
+  assert.equal(campaign.traumaCatalog[0].visualVariant, "night");
+  assert.equal(campaign.traumaCatalog[0].imageMeta.assetId, "trauma-asset");
+  assert.equal(campaign.scenes[0].assetAuditId, "private-audit-1");
+  assert.equal(campaign.scenes[0].imageMeta.publicId, "scenes/entry");
+});
+
 test("migrates legacy character traumas into the reusable campaign catalog", () => {
   const campaign = {
     players: [],
@@ -251,6 +305,44 @@ test("grants, stacks and edits items in an individual inventory", () => {
     /titulo/
   );
   assert.equal(stacked.name, "Pocao maior");
+});
+
+test("copies and refreshes item image metadata when granting or stacking", () => {
+  const ids = sequentialIds();
+  const campaign = { players: [], characters: [{ id: "char-1", inventory: [] }] };
+  const originalMeta = { assetId: "asset-old", publicId: "items/potion", width: 800, height: 800 };
+
+  const first = tabletop.grantItem(campaign, "char-1", {
+    id: "item-1",
+    name: "Pocao",
+    image: "old.jpg",
+    imageMeta: originalMeta
+  }, {}, ids);
+
+  assert.deepEqual(first.imageMeta, originalMeta);
+  assert.notEqual(first.imageMeta, originalMeta);
+
+  const refreshedMeta = { assetId: "asset-new", publicId: "items/potion-v2", width: 1200, height: 900 };
+  const stacked = tabletop.grantItem(campaign, "char-1", {
+    id: "item-1",
+    name: "Pocao",
+    image: "new.jpg",
+    imageMeta: refreshedMeta
+  }, {}, ids);
+
+  assert.equal(stacked.id, first.id);
+  assert.equal(stacked.image, "new.jpg");
+  assert.deepEqual(stacked.imageMeta, refreshedMeta);
+  assert.notEqual(stacked.imageMeta, refreshedMeta);
+
+  const editedMeta = { assetId: "asset-edited", publicId: "items/potion-v3", width: 1600, height: 1200 };
+  tabletop.updateInventoryEntry(campaign, "char-1", first.id, {
+    image: "edited.jpg",
+    imageMeta: editedMeta
+  });
+  assert.equal(first.image, "edited.jpg");
+  assert.deepEqual(first.imageMeta, editedMeta);
+  assert.notEqual(first.imageMeta, editedMeta);
 });
 
 test("keeps catalog items reusable and stacks one slot per character", () => {
@@ -438,6 +530,43 @@ test("links, moves and unlinks one catalog evidence without duplicating ownershi
   assert.equal(tabletop.findEvidenceOwner(campaign, "evidence-1"), null);
 });
 
+test("keeps evidence metadata and unknown properties across assignment and transfer", () => {
+  const ids = sequentialIds();
+  const campaign = {
+    players: [],
+    evidence: [{
+      id: "evidence-1",
+      title: "Carta",
+      image: "carta.jpg",
+      imageMeta: { assetId: "evidence-asset", publicId: "evidence/letter" },
+      catalogMarker: "catalog-value"
+    }],
+    characters: [
+      {
+        id: "char-1",
+        evidence: [{
+          id: "owned-1",
+          evidenceId: "evidence-1",
+          title: "Carta",
+          image: "old.jpg",
+          ownerMarker: "owner-value"
+        }]
+      },
+      { id: "char-2", evidence: [] }
+    ]
+  };
+
+  const assigned = tabletop.assignEvidence(campaign, "evidence-1", "char-2", ids);
+  assert.deepEqual(assigned.imageMeta, { assetId: "evidence-asset", publicId: "evidence/letter" });
+  assert.equal(assigned.catalogMarker, "catalog-value");
+  assert.equal(assigned.ownerMarker, "owner-value");
+
+  const transferred = tabletop.transferCharacterEvidence(campaign, "char-2", "char-1", assigned.id, ids);
+  assert.deepEqual(transferred.imageMeta, assigned.imageMeta);
+  assert.equal(transferred.catalogMarker, "catalog-value");
+  assert.equal(transferred.ownerMarker, "owner-value");
+});
+
 test("moves an owned evidence only after approval and reserves pending requests", () => {
   const ids = sequentialIds();
   const campaign = {
@@ -473,7 +602,15 @@ test("publishes only public scene fields and clears them when hidden", () => {
     players: [],
     characters: [],
     scenes: [
-      { id: "scene-1", title: "Entrada", caption: "A porta se abre", masterNotes: "Emboscada", image: "one.jpg" },
+      {
+        id: "scene-1",
+        title: "Entrada",
+        caption: "A porta se abre",
+        masterNotes: "Emboscada",
+        image: "one.jpg",
+        imageMeta: { assetId: "private-asset", publicId: "scenes/one" },
+        assetAuditId: "private-audit"
+      },
       { id: "scene-2", title: "Sala", caption: "Uma sala vazia", masterNotes: "Teste secreto", image: "two.jpg" }
     ]
   };
@@ -484,6 +621,10 @@ test("publishes only public scene fields and clears them when hidden", () => {
   assert.equal("title" in live, false);
   assert.equal("caption" in live, false);
   assert.equal("masterNotes" in live, false);
+  assert.equal("imageMeta" in live, false);
+  assert.equal("assetAuditId" in live, false);
+  assert.equal(campaign.scenes[0].imageMeta.assetId, "private-asset");
+  assert.equal(campaign.scenes[0].assetAuditId, "private-audit");
 
   tabletop.stepScene(campaign, 1);
   assert.equal(campaign.liveScene.sceneId, "scene-2");

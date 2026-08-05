@@ -333,7 +333,16 @@ service cloud.firestore {
         signedIn() && resource.data.masterId == request.auth.uid
       ) || (
         isCampaignMember()
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['updatedAt'])
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['updatedAt', 'lastClientMutation'])
+        && (
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['lastClientMutation'])
+          || (
+            request.resource.data.lastClientMutation is map
+            && request.resource.data.lastClientMutation.keys().hasOnly(['id', 'revision', 'authUid', 'completedAt'])
+            && request.resource.data.lastClientMutation.id is string
+            && request.resource.data.lastClientMutation.authUid == request.auth.uid
+          )
+        )
       ) || (
         signedIn()
         && !(request.auth.uid in resource.data.members)
@@ -400,17 +409,23 @@ service cloud.firestore {
         allow read, create, update, delete: if isCampaignMasterById(campaignId);
       }
 
+      match /sceneTrash/{docId} {
+        allow read, create, update, delete: if isCampaignMasterById(campaignId);
+      }
+
       match /evidence/{docId} {
         allow read, create, update, delete: if isCampaignMasterById(campaignId);
       }
 
       match /{subcollection}/{docId} {
         allow read: if subcollection != 'scenes'
+          && subcollection != 'sceneTrash'
           && subcollection != 'evidence'
           && subcollection != 'messages'
           && subcollection != 'privateMessages'
           && isCampaignMemberById(campaignId);
         allow create, update, delete: if subcollection != 'scenes'
+          && subcollection != 'sceneTrash'
           && subcollection != 'evidence'
           && subcollection != 'messages'
           && subcollection != 'privateMessages'

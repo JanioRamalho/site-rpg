@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const assert = require("node:assert/strict");
 const os = require("node:os");
 const path = require("node:path");
 const Module = require("node:module");
@@ -14,22 +15,34 @@ const {
 const {
   arrayUnion,
   collection,
+  deleteField,
   doc,
   getDoc,
   getDocs,
+  onSnapshot,
   query,
   runTransaction,
   setDoc,
   updateDoc,
+  writeBatch,
   where
 } = require("firebase/firestore");
 
+async function waitUntil(predicate, label, timeoutMs = 15000) {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) throw new Error(`Tempo esgotado: ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
 async function run() {
+  const emulatorPort = Number(process.env.FIRESTORE_EMULATOR_PORT || 8086);
   const testEnv = await initializeTestEnvironment({
     projectId: "demo-site-rpg",
     firestore: {
       host: "127.0.0.1",
-      port: 8085,
+      port: emulatorPort,
       rules: fs.readFileSync(path.join(__dirname, "..", "firestore.rules"), "utf8")
     }
   });
@@ -45,6 +58,12 @@ async function run() {
         password: "secret",
         readyPlayerEmails: ["ana@example.com"],
         chatSettings: { publicEnabled: true, privateEnabled: true, privateThreads: {} },
+        scenes: [{
+          id: "legacy-scene",
+          title: "Cena antiga",
+          image: "data:image/png;base64,LEGACY",
+          masterNotes: "Preservar"
+        }],
         updatedAt: new Date().toISOString()
       });
       await setDoc(doc(db, "campaigns", "room-1", "players", "player-1"), {
@@ -134,6 +153,29 @@ async function run() {
     const master = testEnv.authenticatedContext("master-auth", { email: "master@example.com" }).firestore();
     const second = testEnv.authenticatedContext("second-auth", { email: "bruno@example.com" }).firestore();
     const observer = testEnv.authenticatedContext("observer-auth", { email: "observer@example.com" }).firestore();
+
+    await assertSucceeds(runTransaction(master, async transaction => {
+      const campaignRef = doc(master, "campaigns", "room-1");
+      const legacySceneRef = doc(master, "campaigns", "room-1", "scenes", "legacy-scene");
+      const campaignSnapshot = await transaction.get(campaignRef);
+      const legacySceneSnapshot = await transaction.get(legacySceneRef);
+      if (!campaignSnapshot.exists() || legacySceneSnapshot.exists()) throw new Error("Fixture de compatibilidade invalida.");
+      const legacyScene = campaignSnapshot.data().scenes[0];
+      transaction.set(legacySceneRef, { ...legacyScene, _order: 0 });
+      transaction.update(campaignRef, {
+        scenes: deleteField(),
+        storageLayoutMigration: {
+          version: 1,
+          completedAt: new Date().toISOString(),
+          movedCollections: ["scenes"],
+          movedDocuments: 1,
+          verified: true
+        },
+        updatedAt: new Date().toISOString()
+      });
+    }));
+    await assertSucceeds(getDoc(doc(master, "campaigns", "room-1", "scenes", "legacy-scene")));
+    await assertFails(getDoc(doc(prepared, "campaigns", "room-1", "scenes", "legacy-scene")));
 
     await assertFails(updateDoc(doc(outsider, "campaigns", "room-1"), {
       members: arrayUnion("outsider-auth"),
@@ -536,11 +578,221 @@ async function run() {
       masterNotes: "Informacao privada",
       _order: 0
     }));
+    await assertSucceeds(setDoc(doc(master, "campaigns", "room-1", "sceneTrash", "scene-trash-1"), {
+      id: "scene-trash-1",
+      title: "Cena removida",
+      image: "https://example.com/scene-trash.jpg",
+      masterNotes: "Continua privada",
+      deletedAt: new Date().toISOString(),
+      _order: -1
+    }));
 
     await assertFails(getDoc(doc(prepared, "campaigns", "room-1", "scenes", "scene-1")));
     await assertSucceeds(getDoc(doc(master, "campaigns", "room-1", "scenes", "scene-1")));
+    await assertFails(getDoc(doc(prepared, "campaigns", "room-1", "sceneTrash", "scene-trash-1")));
+    await assertSucceeds(getDoc(doc(master, "campaigns", "room-1", "sceneTrash", "scene-trash-1")));
     await assertFails(getDoc(doc(prepared, "campaigns", "room-1", "evidence", "evidence-1")));
     await assertSucceeds(getDoc(doc(master, "campaigns", "room-1", "evidence", "evidence-1")));
+
+    const loadCampaignId = "six-client-room";
+    const loadPlayerUids = Array.from({ length: 5 }, (_, index) => `load-player-${index + 1}`);
+    const cloudinaryBase = "https://res.cloudinary.com/sbyfm34m/image/upload/v1/site-rpg-teste";
+    await testEnv.withSecurityRulesDisabled(async context => {
+      const db = context.firestore();
+      const batch = writeBatch(db);
+      batch.set(doc(db, "campaigns", loadCampaignId), {
+        id: loadCampaignId,
+        masterId: "master-auth",
+        members: ["master-auth", ...loadPlayerUids],
+        name: "Mesa com seis clientes",
+        gameBoard: { image: `${cloudinaryBase}/boards/board-0.jpg`, revision: 0 },
+        previousGameBoard: null,
+        liveScene: { active: false, sceneId: null, image: "", index: -1, total: 40, revision: 0 },
+        updatedAt: new Date().toISOString()
+      });
+      loadPlayerUids.forEach((uid, index) => {
+        const playerId = `player-${index + 1}`;
+        const characterId = `character-${index + 1}`;
+        batch.set(doc(db, "campaigns", loadCampaignId, "players", playerId), {
+          id: playerId,
+          authUid: uid,
+          email: `${uid}@example.com`,
+          emailNormalized: `${uid}@example.com`,
+          characterId,
+          status: "claimed",
+          online: true,
+          _order: index
+        });
+        batch.set(doc(db, "campaigns", loadCampaignId, "characters", characterId), {
+          id: characterId,
+          controllerPlayerId: playerId,
+          name: `Personagem ${index + 1}`,
+          health: 10,
+          healthMax: 10,
+          sanity: 8,
+          sanityMax: 8,
+          inventory: [],
+          evidence: [],
+          traumas: [],
+          expressions: [],
+          _order: index
+        });
+      });
+      Array.from({ length: 40 }, (_, index) => {
+        batch.set(doc(db, "campaigns", loadCampaignId, "scenes", `scene-${index + 1}`), {
+          id: `scene-${index + 1}`,
+          title: `Cena ${index + 1}`,
+          image: `${cloudinaryBase}/scenes/scene-${index + 1}.jpg`,
+          masterNotes: `Nota privada ${index + 1}`,
+          _order: index
+        });
+      });
+      await batch.commit();
+    });
+
+    const loadMaster = testEnv.authenticatedContext("master-auth", { email: "master@example.com" }).firestore();
+    const loadPlayers = loadPlayerUids.map(uid => (
+      testEnv.authenticatedContext(uid, { email: `${uid}@example.com` }).firestore()
+    ));
+    const seenScenes = loadPlayers.map(() => new Set());
+    const seenBoards = loadPlayers.map(() => new Set());
+    const seenVitals = loadPlayers.map(() => new Set());
+    const listenerErrors = [];
+    const unsubs = [];
+
+    loadPlayers.forEach((playerDb, index) => {
+      unsubs.push(onSnapshot(doc(playerDb, "campaigns", loadCampaignId), snapshot => {
+        if (!snapshot.exists()) return;
+        const data = snapshot.data();
+        if (Number.isInteger(data.liveScene?.index) && data.liveScene.index >= 0) {
+          seenScenes[index].add(data.liveScene.index);
+        }
+        if (data.gameBoard?.image) seenBoards[index].add(data.gameBoard.image);
+      }, error => listenerErrors.push(error)));
+      unsubs.push(onSnapshot(
+        doc(playerDb, "campaigns", loadCampaignId, "characters", `character-${index + 1}`),
+        snapshot => {
+          if (!snapshot.exists()) return;
+          const data = snapshot.data();
+          seenVitals[index].add(`${data.health}:${data.sanity}`);
+        },
+        error => listenerErrors.push(error)
+      ));
+    });
+
+    try {
+      await waitUntil(
+        () => seenBoards.every(entries => entries.has(`${cloudinaryBase}/boards/board-0.jpg`)),
+        "os cinco jogadores receberem o tabuleiro inicial"
+      );
+      assert.equal((await getDocs(collection(loadMaster, "campaigns", loadCampaignId, "scenes"))).size, 40);
+      for (const playerDb of loadPlayers) {
+        await assertFails(getDocs(collection(playerDb, "campaigns", loadCampaignId, "scenes")));
+      }
+
+      for (let index = 0; index < 40; index += 1) {
+        await updateDoc(doc(loadMaster, "campaigns", loadCampaignId), {
+          liveScene: {
+            active: true,
+            sceneId: `scene-${index + 1}`,
+            image: `${cloudinaryBase}/scenes/scene-${index + 1}.jpg`,
+            index,
+            total: 40,
+            revision: index + 1,
+            updatedAt: new Date().toISOString()
+          },
+          updatedAt: new Date().toISOString()
+        });
+        await waitUntil(
+          () => seenScenes.every(entries => entries.has(index)),
+          `os cinco jogadores receberem a cena ${index + 1}`
+        );
+      }
+      assert.ok(seenScenes.every(entries => entries.size === 40));
+
+      for (let revision = 1; revision <= 25; revision += 1) {
+        const nextBoard = `${cloudinaryBase}/boards/board-${revision}.jpg`;
+        await runTransaction(loadMaster, async transaction => {
+          const campaignRef = doc(loadMaster, "campaigns", loadCampaignId);
+          const snapshot = await transaction.get(campaignRef);
+          transaction.update(campaignRef, {
+            previousGameBoard: snapshot.data().gameBoard,
+            gameBoard: { image: nextBoard, revision },
+            updatedAt: new Date().toISOString()
+          });
+        });
+        await waitUntil(
+          () => seenBoards.every(entries => entries.has(nextBoard)),
+          `os cinco jogadores receberem o tabuleiro ${revision}`
+        );
+      }
+
+      for (let index = 0; index < 5; index += 1) {
+        const characterRef = doc(loadMaster, "campaigns", loadCampaignId, "characters", `character-${index + 1}`);
+        const health = 9 - index;
+        const sanity = 7 - index;
+        await updateDoc(characterRef, {
+          health,
+          sanity,
+          inventory: [{
+            id: `inventory-${index + 1}`,
+            name: "Lanterna",
+            quantity: 1,
+            image: `${cloudinaryBase}/items/lanterna.jpg`
+          }],
+          evidence: [{
+            id: `owned-evidence-${index + 1}`,
+            evidenceId: "evidence-1",
+            title: "Fotografia",
+            image: `${cloudinaryBase}/evidence/fotografia.jpg`
+          }],
+          traumas: [{
+            id: `owned-trauma-${index + 1}`,
+            catalogId: "trauma-1",
+            title: "Aracnofobia",
+            image: `${cloudinaryBase}/traumas/aranha.jpg`
+          }],
+          expressions: [{
+            id: `expression-${index + 1}`,
+            title: "Tenso",
+            image: `${cloudinaryBase}/expressions/tenso.jpg`
+          }]
+        });
+        await waitUntil(
+          () => seenVitals[index].has(`${health}:${sanity}`),
+          `o jogador ${index + 1} receber saude e sanidade`
+        );
+      }
+
+      for (let index = 0; index < 5; index += 1) {
+        const refreshed = await getDoc(doc(
+          loadPlayers[index],
+          "campaigns",
+          loadCampaignId,
+          "characters",
+          `character-${index + 1}`
+        ));
+        const data = refreshed.data();
+        assert.equal(data.health, 9 - index);
+        assert.equal(data.sanity, 7 - index);
+        assert.equal(data.inventory.length, 1);
+        assert.equal(data.evidence.length, 1);
+        assert.equal(data.traumas.length, 1);
+        assert.equal(data.expressions.length, 1);
+        assert.match(data.inventory[0].image, /^https:\/\/res\.cloudinary\.com\/sbyfm34m\//);
+      }
+
+      const finalCampaign = (await getDoc(doc(loadMaster, "campaigns", loadCampaignId))).data();
+      assert.equal(finalCampaign.masterId, "master-auth");
+      assert.deepEqual(finalCampaign.members, ["master-auth", ...loadPlayerUids]);
+      assert.equal(finalCampaign.liveScene.index, 39);
+      assert.equal(finalCampaign.gameBoard.revision, 25);
+      assert.equal(finalCampaign.previousGameBoard.revision, 24);
+      assert.equal(listenerErrors.length, 0);
+      console.log("Six-client session: 40 scenes, 25 boards and persistent progress passed.");
+    } finally {
+      unsubs.forEach(unsubscribe => unsubscribe());
+    }
 
     console.log("Firestore rules: permission checks passed.");
   } finally {

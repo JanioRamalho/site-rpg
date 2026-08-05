@@ -4,10 +4,24 @@ import { createFirebaseClient, isPlaceholderConfig } from "./js/firebase/client.
 import { createCloudinaryService } from "./js/media/cloudinary-service.js";
 
 const cfg = window.CDI_FIREBASE_CONFIG || {};
+const media = createCloudinaryService(window.CDI_CLOUDINARY_CONFIG || {});
+
+function mediaTags(tags) {
+  const values = Array.isArray(tags) ? tags : String(tags || "").split(",");
+  return [...new Set(["site-rpg", ...values].map(tag => String(tag).trim()).filter(Boolean))];
+}
+
+function uploadMedia(pathOrBlob, blobOrOptions, maybeOptions) {
+  const hasLegacyPath = typeof pathOrBlob === "string";
+  const blob = hasLegacyPath ? blobOrOptions : pathOrBlob;
+  const options = (hasLegacyPath ? maybeOptions : blobOrOptions) || {};
+  return media.uploadImage(blob, { ...options, tags: mediaTags(options.tags) });
+}
 
 function disabledService() {
   return {
     enabled: false,
+    get mediaConfigured() { return media.isConfigured(); },
     get currentUser() { return null; },
     onAuthChanged: () => () => {},
     signUp: () => Promise.reject(new Error("Firebase nao configurado.")),
@@ -29,27 +43,38 @@ function disabledService() {
     sendCampaignMessage: () => Promise.reject(new Error("Firebase nao configurado.")),
     sendPrivateCampaignMessage: () => Promise.reject(new Error("Firebase nao configurado.")),
     setPlayerPresence: () => Promise.resolve(),
+    adjustCharacterVital: () => Promise.reject(new Error("Firebase nao configurado.")),
     updateCharacterExpressions: () => Promise.reject(new Error("Firebase nao configurado.")),
     updateTraumaCatalog: () => Promise.reject(new Error("Firebase nao configurado.")),
     updateCharacterTraumas: () => Promise.reject(new Error("Firebase nao configurado.")),
     updateCharacterInventory: () => Promise.reject(new Error("Firebase nao configurado.")),
     updateCharacterEvidenceAssignments: () => Promise.reject(new Error("Firebase nao configurado.")),
+    commitCampaignMediaMutation: () => Promise.reject(new Error("Firebase nao configurado.")),
+    migrateCampaignImages: () => Promise.reject(new Error("Firebase nao configurado.")),
+    preflightCampaignImageMigration: () => Promise.reject(new Error("Firebase nao configurado.")),
+    upgradeLegacyCampaignStorageLayout: () => Promise.reject(new Error("Firebase nao configurado.")),
+    updateCampaignScenes: () => Promise.reject(new Error("Firebase nao configurado.")),
+    updateLiveScene: () => Promise.reject(new Error("Firebase nao configurado.")),
     updateTraumaCatalogAndCharacters: () => Promise.reject(new Error("Firebase nao configurado.")),
     assignPlayerCharacter: () => Promise.reject(new Error("Firebase nao configurado.")),
     resolveItemTransfer: () => Promise.reject(new Error("Firebase nao configurado.")),
+    restoreCampaignScene: () => Promise.reject(new Error("Firebase nao configurado.")),
+    trashCampaignScene: () => Promise.reject(new Error("Firebase nao configurado.")),
     addCampaignMember: () => Promise.resolve(),
     deleteCampaign: () => Promise.resolve(),
-    uploadImage: () => Promise.resolve("")
+    uploadImage: uploadMedia
   };
 }
 
 function composeService(ctx) {
   const auth = createAuthService(ctx);
-  const campaigns = createCampaignRepository(ctx);
-  const media = createCloudinaryService(window.CDI_CLOUDINARY_CONFIG || {});
-
+  const campaigns = createCampaignRepository({
+    ...ctx,
+    cloudinaryCloudName: window.CDI_CLOUDINARY_CONFIG?.cloudName || ""
+  });
   return {
     enabled: true,
+    get mediaConfigured() { return media.isConfigured(); },
     get currentUser() { return auth.currentUser; },
     onAuthChanged: auth.onAuthChanged,
     signUp: auth.signUp,
@@ -71,17 +96,26 @@ function composeService(ctx) {
     sendCampaignMessage: campaigns.sendCampaignMessage,
     sendPrivateCampaignMessage: campaigns.sendPrivateCampaignMessage,
     setPlayerPresence: campaigns.setPlayerPresence,
+    adjustCharacterVital: campaigns.adjustCharacterVital,
     updateCharacterExpressions: campaigns.updateCharacterExpressions,
     updateTraumaCatalog: campaigns.updateTraumaCatalog,
     updateCharacterTraumas: campaigns.updateCharacterTraumas,
     updateCharacterInventory: campaigns.updateCharacterInventory,
     updateCharacterEvidenceAssignments: campaigns.updateCharacterEvidenceAssignments,
+    commitCampaignMediaMutation: campaigns.commitCampaignMediaMutation,
+    migrateCampaignImages: campaigns.migrateCampaignImages,
+    preflightCampaignImageMigration: campaigns.preflightCampaignImageMigration,
+    upgradeLegacyCampaignStorageLayout: campaigns.upgradeLegacyCampaignStorageLayout,
+    updateCampaignScenes: campaigns.updateCampaignScenes,
+    updateLiveScene: campaigns.updateLiveScene,
     updateTraumaCatalogAndCharacters: campaigns.updateTraumaCatalogAndCharacters,
     assignPlayerCharacter: campaigns.assignPlayerCharacter,
     resolveItemTransfer: campaigns.resolveItemTransfer,
+    restoreCampaignScene: campaigns.restoreCampaignScene,
+    trashCampaignScene: campaigns.trashCampaignScene,
     addCampaignMember: campaigns.addCampaignMember,
     deleteCampaign: campaigns.deleteCampaign,
-    uploadImage: (_path, blob) => media.uploadImage(blob, { tags: "site-rpg" })
+    uploadImage: uploadMedia
   };
 }
 

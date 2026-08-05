@@ -10,7 +10,7 @@ export const SHARED_SUBCOLLECTION_KEYS = [
   "itemTransfers"
 ];
 
-export const MASTER_ONLY_SUBCOLLECTION_KEYS = ["scenes", "evidence"];
+export const MASTER_ONLY_SUBCOLLECTION_KEYS = ["scenes", "sceneTrash", "evidence"];
 
 export const SUBCOLLECTION_KEYS = [
   ...SHARED_SUBCOLLECTION_KEYS,

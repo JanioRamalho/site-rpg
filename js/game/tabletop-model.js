@@ -17,6 +17,21 @@
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   }
 
+  function hasOwn(target, property) {
+    return Boolean(target) && Object.prototype.hasOwnProperty.call(target, property);
+  }
+
+  function cloneImageMeta(imageMeta) {
+    if (!imageMeta || typeof imageMeta !== "object" || Array.isArray(imageMeta)) return imageMeta;
+    return { ...imageMeta };
+  }
+
+  function unknownProperties(source, knownProperties) {
+    if (!source || typeof source !== "object") return {};
+    const known = new Set(knownProperties);
+    return Object.fromEntries(Object.entries(source).filter(([property]) => !known.has(property)));
+  }
+
   function normalizeInventoryEntry(entry, makeId = defaultId) {
     const target = entry && typeof entry === "object" ? entry : {};
     target.id = String(target.id || makeId());
@@ -191,10 +206,13 @@
 
   function normalizeGameBoard(board) {
     const target = board && typeof board === "object" ? board : {};
-    return {
+    const normalized = {
+      ...target,
       image: String(target.image || ""),
       updatedAt: target.updatedAt || null
     };
+    if (hasOwn(target, "imageMeta")) normalized.imageMeta = cloneImageMeta(target.imageMeta);
+    return normalized;
   }
 
   function normalizeChatSettings(settings) {
@@ -262,6 +280,7 @@
           entry.name = catalogEntry.title;
           entry.description = catalogEntry.description;
           entry.image = catalogEntry.image;
+          if (hasOwn(catalogEntry, "imageMeta")) entry.imageMeta = cloneImageMeta(catalogEntry.imageMeta);
         }
         return true;
       });
@@ -283,6 +302,7 @@
           let catalogId = String(trauma.catalogId || trauma.id || makeId());
           if (traumaCatalogById.has(catalogId)) catalogId = String(makeId());
           catalogTrauma = normalizeTraumaCatalogEntry({
+            ...unknownProperties(trauma, ["id", "catalogId", "title", "description", "image", "acquiredAt"]),
             id: catalogId,
             title: trauma.title,
             image: trauma.image,
@@ -298,8 +318,12 @@
     campaign.scenes = Array.isArray(campaign.scenes)
       ? campaign.scenes.map(scene => normalizeScene(scene, makeId))
       : [];
+    campaign.sceneTrash = Array.isArray(campaign.sceneTrash)
+      ? campaign.sceneTrash.map(scene => normalizeScene(scene, makeId))
+      : [];
     campaign.liveScene = normalizeLiveScene(campaign.liveScene);
     campaign.gameBoard = normalizeGameBoard(campaign.gameBoard);
+    campaign.previousGameBoard = normalizeGameBoard(campaign.previousGameBoard);
     campaign.chatSettings = normalizeChatSettings(campaign.chatSettings);
 
     const playersById = new Map(campaign.players.map(player => [player.id, player]));
@@ -399,12 +423,13 @@
       if (String(item?.name || "").trim()) existing.name = String(item.name).trim();
       if (String(item?.description || "").trim()) existing.description = String(item.description).trim();
       if (String(item?.image || "").trim()) existing.image = String(item.image).trim();
+      if (hasOwn(item, "imageMeta")) existing.imageMeta = cloneImageMeta(item.imageMeta);
       if (options.equipped === true) existing.equipped = true;
       if (!existing.notes && String(options.notes || "").trim()) existing.notes = String(options.notes).trim();
       return existing;
     }
 
-    const entry = normalizeInventoryEntry({
+    const entryData = {
       id: makeId(),
       itemId,
       name: item?.name || "Item",
@@ -414,7 +439,9 @@
       equipped: Boolean(options.equipped),
       notes: options.notes || "",
       grantedAt: new Date().toISOString()
-    }, makeId);
+    };
+    if (hasOwn(item, "imageMeta")) entryData.imageMeta = cloneImageMeta(item.imageMeta);
+    const entry = normalizeInventoryEntry(entryData, makeId);
     character.inventory.push(entry);
     return entry;
   }
@@ -494,6 +521,7 @@
       if (!image) throw new Error("Selecione uma foto para o item.");
       normalizedChanges.image = image;
     }
+    if (hasOwn(changes, "imageMeta")) normalizedChanges.imageMeta = cloneImageMeta(changes.imageMeta);
     if (changes.quantity !== undefined) normalizedChanges.quantity = positiveInteger(changes.quantity);
     if (changes.equipped !== undefined) normalizedChanges.equipped = Boolean(changes.equipped);
     if (changes.notes !== undefined) normalizedChanges.notes = String(changes.notes || "");
@@ -572,20 +600,33 @@
       : null;
     if (normalizedCharacterId && !targetCharacter) throw new Error("Personagem nao encontrado.");
 
+    const existingOwnerEntry = campaign.characters
+      .flatMap(character => character.evidence)
+      .find(entry => String(entry.evidenceId) === normalizedEvidenceId);
     const existingTargetEntry = targetCharacter?.evidence.find(entry => String(entry.evidenceId) === normalizedEvidenceId);
     campaign.characters.forEach(character => {
       character.evidence = character.evidence.filter(entry => String(entry.evidenceId) !== normalizedEvidenceId);
     });
     if (!targetCharacter) return null;
 
-    const assigned = normalizeCharacterEvidenceEntry({
+    const previousEntry = existingTargetEntry || existingOwnerEntry;
+    const knownEvidenceProperties = [
+      "id", "evidenceId", "catalogId", "title", "name", "description", "image", "imageMeta",
+      "grantedAt", "acquiredAt", "createdAt"
+    ];
+    const assignedData = {
+      ...unknownProperties(catalogEntry, knownEvidenceProperties),
+      ...unknownProperties(previousEntry, knownEvidenceProperties),
       id: existingTargetEntry?.id || makeId(),
       evidenceId: catalogEntry.id,
       title: catalogEntry.title,
       description: catalogEntry.description,
       image: catalogEntry.image,
       grantedAt: existingTargetEntry?.grantedAt || new Date().toISOString()
-    }, makeId);
+    };
+    if (hasOwn(catalogEntry, "imageMeta")) assignedData.imageMeta = cloneImageMeta(catalogEntry.imageMeta);
+    else if (hasOwn(previousEntry, "imageMeta")) assignedData.imageMeta = cloneImageMeta(previousEntry.imageMeta);
+    const assigned = normalizeCharacterEvidenceEntry(assignedData, makeId);
     targetCharacter.evidence = [assigned, ...targetCharacter.evidence];
     return assigned;
   }

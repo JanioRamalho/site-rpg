@@ -19,7 +19,7 @@ js/firebase/
   utils.js                 retry, ids, limpeza de dados
 
 js/media/
-  cloudinary-service.js    upload de imagens via Cloudinary unsigned preset
+  cloudinary-service.js    upload Cloudinary com validacao, timeout e retry
 
 js/game/
   campaign-service.js      API de dominio para criar/entrar/excluir campanhas
@@ -114,6 +114,12 @@ senha e armazenada. Quando o listener do Firestore termina a primeira carga, o
 app restaura campanha, jogador, personagem e tela; o botao Sair limpa o contexto
 e encerra a sessao Firebase explicitamente.
 
+O Firestore usa `persistentLocalCache` com gerenciador de multiplas abas. Leituras
+recentes e mutacoes ainda nao enviadas permanecem no IndexedDB entre recargas;
+ao recuperar a conexao, o SDK sincroniza a fila automaticamente. A fila propria
+do app continua protegendo o intervalo anterior ao envio e fazendo a
+reconciliacao por baseline e identidade de mutacao.
+
 ## Transferencias entre jogadores
 
 Uma solicitacao pendente permanece em `itemTransfers` e reserva logicamente a
@@ -135,16 +141,66 @@ titulo, legenda publica e notas privadas. Essa subcolecao e lida e escrita
 somente pelo Mestre. Os jogadores nao assinam esse listener.
 
 A campanha principal guarda apenas `liveScene`, uma copia publica e minima da
-cena atualmente apresentada: imagem, titulo, legenda, posicao e estado ativo.
-Ao ocultar a apresentacao, esses campos publicos sao limpos. Isso permite que um
+cena atualmente apresentada: URL da imagem, posicao e estado ativo. Ao ocultar
+a apresentacao, esses campos publicos sao limpos. Isso permite que um
 jogador que entre atrasado veja imediatamente a cena atual sem receber imagens
 futuras ou notas do Mestre.
+
+O roteiro aceita no maximo 40 cenas ativas e usa `updateCampaignScenes` para
+gravar inclusoes e ordenacao em um unico batch atomico. Remover uma cena usa uma
+transacao dedicada que move o documento para `sceneTrash`; restaurar move o mesmo
+documento de volta, sem novo upload. A lixeira e privada do Mestre e fica fora do
+salvamento geral da campanha, impedindo que uma aba antiga a apague. Nenhum desses
+fluxos grava jogadores, personagens, logins ou progresso. Iniciar, avancar ou
+ocultar usa `updateLiveScene`, que altera apenas a cena ao vivo. Um lote de imagens
+e enviado com concorrencia
+limitada a tres arquivos e seus resultados ficam em uma fila IndexedDB ate o
+Firestore confirmar o roteiro. A fila e separada por usuario e campanha, valida
+seu proprio conteudo ao reabrir o navegador e impede um segundo lote enquanto
+existir um commit pendente recuperavel. Antes do primeiro upload ela confirma
+uma gravacao e remocao reais no IndexedDB; cada worker so avanca depois que o
+checkpoint das URLs ja enviadas foi confirmado. Assim, falta de cota e abortos
+de transacao sao detectados antes de iniciar o lote ou interrompem novas
+transferencias sem descartar o checkpoint ja duravel.
 
 ## Escritas e Concorrencia
 
 O repositorio grava somente os campos realmente alterados. Por exemplo, quando
 o Mestre entrega um item, apenas `inventory` muda no documento do personagem;
 uma alteracao simultanea de saude feita pelo jogador nao e sobrescrita.
+
+As alteracoes genericas tambem entram em uma fila por campanha, persistida em
+IndexedDB antes do envio e reidratada ao reabrir o app. Falhas temporarias usam
+tentativas com espera progressiva. Operacoes especializadas aguardam essa fila e
+protegem o estado local contra snapshots antigos antes de executar seu commit.
+
+Cada job captura a campanha remota usada como base e uma identidade de mutacao.
+O repositorio grava apenas o delta intencional entre essa base e o estado local;
+campos atualizados em paralelo por outro participante permanecem intactos. Ao
+terminar, o Firebase grava `lastClientMutation` como confirmacao. Depois de uma
+queda, a fila consulta essa confirmacao, evita repetir jobs ja concluidos e faz
+uma reconciliacao de tres vias sobre a versao remota atual. Registros antigos
+sem base segura sao preservados, mas nunca reaplicados automaticamente. A
+criacao de campanha usa a mesma fila e grava seu ACK junto do primeiro documento.
+
+Se o IndexedDB falhar, o payload completo usa um fallback local; sair da conta e
+bloqueado quando nenhum armazenamento duravel consegue preservar o job. A
+limpeza confere a identidade da mutacao para nao apagar um trabalho mais novo de
+outra aba. Timeouts limitam apenas quanto a interface espera antes de liberar a
+operacao: a gravacao original continua unica na fila, sem ser cancelada ou
+duplicada.
+
+Imagens de tabuleiro, personagens, casos, criaturas, itens, evidencias e marcas
+sao vinculadas por `commitCampaignMediaMutation`, que confirma URL e metadados
+do Cloudinary em um unico batch Firestore antes de alterar o estado local.
+Ao trocar o tabuleiro, o mesmo batch grava o novo em `gameBoard` e conserva
+somente o anterior em `previousGameBoard`. O botao de retorno apenas troca esses
+dois campos, sem novo upload e sem tocar personagens ou jogadores.
+
+Saude e sanidade usam `adjustCharacterVital`, uma transacao dedicada no documento
+do personagem. Cada clique altera somente `health` ou `sanity`, e os cliques do
+mesmo atributo sao serializados na interface. Esse caminho nao regrava campanha,
+login, jogador, vinculo, inventario ou os demais campos do personagem.
 
 As regras em `firestore.rules` permitem ao jogador alterar somente presenca,
 saude, sanidade, habilidades, mensagens, rolagens e solicitacoes pertencentes a
@@ -167,9 +223,46 @@ O arquivo `script.js` ainda concentra a UI atual para preservar todas as telas e
 
 ## Imagens
 
-O app usa Cloudinary para imagens quando `window.CDI_CLOUDINARY_CONFIG.cloudName`
-e `uploadPreset` estao preenchidos. Se nao estiverem configurados, o app usa
-Base64 comprimido como fallback para nao quebrar o jogo. Personagens, jogadores,
-itens, inventarios, registros, criaturas, evidencias e marcas sempre exibem uma
-area visual; entidades antigas sem foto recebem uma imagem de RPG com inicial ate
-que o Mestre envie a imagem definitiva.
+O Cloudinary e a fonte de verdade para os arquivos. O Firestore e o cache local
+guardam somente a URL HTTPS e metadados do ativo. Nao existe fallback persistente
+para Base64: se o upload falhar, a entidade permanece inalterada e o usuario pode
+tentar novamente.
+
+O original e enviado sem rasterizacao destrutiva, preservando formato, resolucao,
+transparencia e proporcao. Na entrega, URLs Cloudinary com `c_limit` geram versoes
+adequadas para miniaturas, palco e tabuleiro sem cortar nem deformar. Se uma
+transformacao nao carregar, a interface tenta automaticamente a URL original.
+Cenas e tabuleiros trocam temporariamente para o original durante a tela cheia;
+se o navegador nao suportar o formato original, restauram imediatamente a
+derivada compativel.
+
+Uma cena movida para a lixeira continua apontando para o mesmo original no
+Cloudinary, portanto pode ser restaurada integralmente. A exclusao fisica do
+arquivo remoto nao e executada pelo navegador: ela exige um backend assinado e
+uma politica de retencao para nao tornar a recuperacao impossivel.
+
+Imagens antigas fora do Cloudinary (Base64, URLs externas ou caminhos relativos)
+sao migradas por uma operacao explicita nas Configuracoes. Antes da migracao o
+app salva um backup JSON completo, com manifesto de progresso e SHA-256 do
+snapshot. A tela permite reler o arquivo e recalcular tanto a assinatura quanto
+o manifesto sem gravar nada no Firebase. A migracao somente continua depois da
+confirmacao do arquivo.
+
+Antes de qualquer upload, um preflight somente leitura compara cada referencia
+local com o documento remoto e confirma que o usuario autenticado ainda e o
+Mestre. Documento, entrada de lista ou imagem removida/alterada causa cancelamento
+com zero gravacoes; a migracao nunca recria dados ausentes. Campanhas que ainda
+guardam colecoes com imagens dentro do documento principal passam antes por uma
+transacao de compatibilidade separada: os valores remotos exatos sao movidos para
+subdocumentos e os arrays antigos sao retirados no mesmo commit. Se o Firebase
+contiver simultaneamente os dois formatos, IDs ausentes/repetidos ou qualquer
+mudanca concorrente, a operacao inteira e bloqueada em vez de escolher uma versao
+por suposicao. Operacoes acima da margem segura de 450 documentos tambem sao
+recusadas antes da transacao.
+
+Depois do preflight, cada imagem unica e enviada uma vez e uma unica transacao
+substitui somente propriedades `image` correspondentes. A transacao repete as
+mesmas verificacoes para impedir uma corrida entre o preflight e o commit. Depois
+do commit, uma leitura autoritativa confirma que nao restou referencia antiga; a
+reconciliacao de tres vias preserva tanto edicoes locais feitas durante o upload
+quanto campos alterados remotamente por outro participante.

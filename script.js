@@ -34,6 +34,7 @@ state.campaigns?.forEach(c => {
   c.evidence ??= [];
   c.itemTransfers ??= [];
   c.gameBoard ??= { image: "", updatedAt: null };
+  c.previousGameBoard ??= { image: "", updatedAt: null };
 });
 
 let session = { role: null, campaign: null, player: null, currentMaster: null, view: "home" };
@@ -41,12 +42,11 @@ let firebaseUser = null;
 let firebaseProfile = null;
 let firebaseReady = false;
 let unsubscribeCampaigns = null;
-let saveTimer = null;
 let isApplyingRemoteState = false;
 let lastSavedCampaignJson = "";
 let lastRemoteCampaignJson = "";
-let isCampaignSaveInFlight = false;
-let saveAgainAfterCurrent = false;
+const campaignSaveStates = new Map();
+const campaignRemoteBaselines = new Map();
 let syncStatus = "Carregando Firebase...";
 let presenceTimer = null;
 let presenceContext = null;
@@ -55,6 +55,11 @@ const resolvingTransfers = new Set();
 const linkingPlayers = new Set();
 const selectedSceneIds = new Map();
 let sceneUploadInProgress = false;
+let sceneMutationInProgress = false;
+let sceneUploadProgress = { total: 0, completed: 0, failed: 0, phase: "" };
+const pendingSceneCommits = new Map();
+const sceneOutboxLoads = new Set();
+const sceneOutboxErrors = new Map();
 let boardUploadInProgress = false;
 let chatSendInProgress = false;
 let privateMessages = [];
@@ -72,7 +77,13 @@ let activeTraumaAudioSource = null;
 const traumaMutations = new Set();
 const expressionMutations = new Set();
 const evidenceMutations = new Set();
+const vitalMutationStates = new Map();
+const fullscreenImageErrorHandlers = new WeakMap();
 let renderDeferredByModal = false;
+let imageMigrationInProgress = false;
+let imageMigrationProgress = { total: 0, completed: 0, phase: "" };
+let localStorageWarningShown = false;
+const uploadedImageMetadata = new Map();
 
 const SESSION_STORAGE_KEY = "cdi_session_context_v2";
 const TRAUMA_ALERT_SOUND_URL = "assets/audio/trauma-alert-dark-fantasy.mp3";
@@ -82,6 +93,17 @@ const DICE_ROLL_SEEN_STORAGE_KEY = "cdi_seen_dice_rolls_v1";
 const DICE_ROLL_EVENT_MAX_AGE_MS = 60 * 1000;
 const CHAT_MESSAGE_LIMIT = 100;
 const PRIVATE_CHAT_STORAGE_KEY = "cdi_private_messages_v1";
+const MEDIA_OUTBOX_DB_NAME = "cdi_media_outbox_v1";
+const MEDIA_OUTBOX_STORE = "sceneCommitsV2";
+const LEGACY_MEDIA_OUTBOX_STORE = "sceneCommits";
+const CAMPAIGN_SAVE_OUTBOX_STORE = "campaignSaves";
+const MEDIA_MUTATION_OUTBOX_STORE = "mediaMutations";
+const CAMPAIGN_SAVE_MARKERS_KEY = "cdi_pending_campaign_saves_v1";
+const CAMPAIGN_SAVE_FALLBACK_KEY = "cdi_pending_campaign_payloads_v1";
+const MEDIA_MUTATION_FALLBACK_KEY = "cdi_pending_media_mutations_v1";
+const MAX_IMAGE_FILE_BYTES = 25 * 1024 * 1024;
+const IMAGE_UPLOAD_CONCURRENCY = 3;
+const MAX_ACTIVE_SCENES = 40;
 const MASTER_VIEWS = new Set([
   "messages", "room", "scenes", "home", "campaigns", "campaign", "characters",
   "expressions", "traumas", "skills", "diceLogs", "cases", "creatures", "items", "evidence", "marks",
@@ -91,14 +113,100 @@ const PLAYER_VIEWS = new Set(["messages", "room", "scenes", "sheet", "traumas", 
 
 const root = document.getElementById("root");
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+const campaignSaveClientId = uid();
 const usingFirebase = () => Boolean(window.CDIFirebase?.enabled);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
 const jsArg = value => esc(JSON.stringify(String(value ?? "")));
 
+function isBase64Image(value) {
+  return typeof value === "string" && /^data:image\//i.test(value);
+}
+
+function isCloudinaryImage(value) {
+  try {
+    const url = new URL(String(value || ""));
+    if (url.protocol !== "https:" || url.hostname.toLowerCase() !== "res.cloudinary.com") return false;
+    const expectedCloudName = String(window.CDI_CLOUDINARY_CONFIG?.cloudName || "").trim().toLowerCase();
+    if (!expectedCloudName) return true;
+    return String(url.pathname.split("/").filter(Boolean)[0] || "").toLowerCase() === expectedCloudName;
+  } catch {
+    return false;
+  }
+}
+
+function isUnmanagedImage(value) {
+  const image = String(value || "").trim();
+  return Boolean(image) && !isCloudinaryImage(image);
+}
+
+const CLOUDINARY_DELIVERY_PRESETS = {
+  thumb: "c_limit,w_360,h_360/f_auto,fl_preserve_transparency/q_auto:good",
+  icon: "c_limit,w_1000,h_1000/f_auto,fl_preserve_transparency/q_auto:good",
+  stage: "c_limit,w_1920,h_1920/f_auto,fl_preserve_transparency/q_auto:best",
+  board: "c_limit,w_2400,h_2400/f_auto,fl_preserve_transparency/q_auto:best",
+  full: "c_limit,w_2560,h_2560/f_auto,fl_preserve_transparency/q_auto:best"
+};
+
+function cloudinaryDeliveryUrl(src, preset = "icon") {
+  const value = String(src || "");
+  const transformation = CLOUDINARY_DELIVERY_PRESETS[preset];
+  if (!transformation || !isCloudinaryImage(value)) return value;
+  const uploadSuffix = value.split("/image/upload/")[1] || "";
+  const versionIndex = uploadSuffix.split("/").findIndex(segment => /^v\d+$/.test(segment));
+  const deliveryPrefix = versionIndex >= 0
+    ? uploadSuffix.split("/").slice(0, versionIndex)
+    : [];
+  const alreadyTransformed = deliveryPrefix.some(segment => segment.split(",").some(token => (
+    /^(?:c|w|h|f|fl|ar|g|e|dpr|x|y|r|a|b|bo|co)_/.test(token) || /^q_auto(?::|$)/.test(token)
+  )));
+  if (alreadyTransformed) return value;
+  return value.replace("/image/upload/", `/image/upload/${transformation}/`);
+}
+
+function imageSourceAttrs(src, preset = "icon") {
+  const original = String(src || "");
+  const delivered = cloudinaryDeliveryUrl(original, preset);
+  const fallback = delivered !== original
+    ? ` data-original-image="${esc(original)}" onerror="if(this.dataset.originalImage){this.onerror=null;this.src=this.dataset.originalImage;delete this.dataset.originalImage}"`
+    : "";
+  return `src="${esc(delivered)}"${fallback}`;
+}
+
+function imageMetadataFor(url) {
+  return uploadedImageMetadata.get(String(url || "")) || null;
+}
+
+function applyImageAsset(target, url, field = "image") {
+  if (!target || !url) return target;
+  target[field] = url;
+  const metadata = imageMetadataFor(url);
+  if (metadata) target[`${field}Meta`] = { ...metadata };
+  return target;
+}
+
+async function commitCampaignMediaMutation(campaignId, mutation) {
+  const normalizedId = String(campaignId || "");
+  if (!usingFirebase()) return { status: "local", verified: true };
+  if (typeof window.CDIFirebase?.commitCampaignMediaMutation !== "function") {
+    throw new Error("O servico de persistencia atomica de imagens ainda nao esta disponivel.");
+  }
+  const releaseSnapshotProtection = protectCampaignFromSnapshots(normalizedId);
+  try {
+    await flushBeforeAtomicCampaignMutation(normalizedId);
+    const result = await window.CDIFirebase.commitCampaignMediaMutation(normalizedId, mutation);
+    if (result?.verified !== true || result?.status !== "committed") {
+      throw new Error("O Firebase nao confirmou integralmente a vinculacao da imagem.");
+    }
+    return result;
+  } finally {
+    releaseSnapshotProtection();
+  }
+}
+
 function entityVisual(src, label, className = "avatar") {
   const name = String(label || "Imagem");
   if (src) {
-    return `<img class="${className} entity-visual-image" src="${esc(src)}" alt="${esc(name)}" loading="lazy" style="cursor:pointer;" onclick="openImageModal(${jsArg(src)}, ${jsArg(name)})">`;
+    return `<img class="${className} entity-visual-image" ${imageSourceAttrs(src, "icon")} alt="${esc(name)}" loading="lazy" decoding="async" style="cursor:pointer;" onclick="openImageModal(${jsArg(src)}, ${jsArg(name)})">`;
   }
   const initial = name.trim().slice(0, 1).toUpperCase() || "?";
   return `<div class="${className} entity-visual-fallback" role="img" aria-label="${esc(name)}"><span>${esc(initial)}</span></div>`;
@@ -117,15 +225,18 @@ function previewImageInput(input, previewId) {
   const file = input?.files?.[0];
   const preview = document.getElementById(previewId);
   if (!file || !preview) return;
-  const reader = new FileReader();
-  reader.onload = event => {
-    const image = document.createElement("img");
-    image.className = "image-preview-visual entity-visual-image";
-    image.alt = "Previa da imagem selecionada";
-    image.src = event.target.result;
-    preview.replaceChildren(image);
+  if (preview.dataset?.objectUrl) URL.revokeObjectURL(preview.dataset.objectUrl);
+  const objectUrl = URL.createObjectURL(file);
+  if (preview.dataset) preview.dataset.objectUrl = objectUrl;
+  const image = document.createElement("img");
+  image.className = "image-preview-visual entity-visual-image";
+  image.alt = "Previa da imagem selecionada";
+  image.onload = () => {
+    URL.revokeObjectURL(objectUrl);
+    if (preview.dataset?.objectUrl === objectUrl) delete preview.dataset.objectUrl;
   };
-  reader.readAsDataURL(file);
+  image.src = objectUrl;
+  preview.replaceChildren(image);
 }
 
 function readSessionContext() {
@@ -266,11 +377,13 @@ function normalizeCampaign(c) {
   c.marks ??= [];
   c.diceLogs ??= [];
   c.scenes ??= [];
+  c.sceneTrash ??= [];
   c.messages ??= [];
   c.traumaCatalog ??= [];
   c.customSkills ??= [...OFFICIAL_SKILLS];
   c.itemTransfers ??= [];
   c.gameBoard ??= { image: "", updatedAt: null };
+  c.previousGameBoard ??= { image: "", updatedAt: null };
   c.members ??= [c.masterId, ...c.players.map(p => p.authUid).filter(Boolean)];
   ["players", "characters", "cases", "creatures", "items", "evidence", "marks", "diceLogs", "messages", "itemTransfers"].forEach(key => {
     c[key].forEach(item => item.id ??= uid());
@@ -285,7 +398,21 @@ function normalizeState() {
 }
 
 function persistLocal() {
-  localStorage.setItem("cdi_fase1_full", JSON.stringify(state));
+  try {
+    localStorage.setItem("cdi_fase1_full", JSON.stringify(state));
+    localStorageWarningShown = false;
+    return true;
+  } catch (err) {
+    console.error("Nao foi possivel atualizar o cache local.", err);
+    setSyncStatus(usingFirebase() ? "Online; cache local cheio" : "Armazenamento local cheio");
+    if (!localStorageWarningShown) {
+      localStorageWarningShown = true;
+      toast(usingFirebase()
+        ? "O cache local esta cheio. A sincronizacao online continuara; migre as imagens antigas nas Configuracoes."
+        : "O armazenamento local esta cheio. Migre as imagens antigas antes de continuar.");
+    }
+    return false;
+  }
 }
 
 function setSyncStatus(status) {
@@ -294,65 +421,683 @@ function setSyncStatus(status) {
   if (el) el.textContent = status;
 }
 
-async function flushCampaignSave() {
-  if (!usingFirebase() || isApplyingRemoteState || !session.campaign?.id) return;
-  normalizeCampaign(session.campaign);
-  const payload = JSON.stringify(session.campaign);
-  if (payload === lastSavedCampaignJson) return;
+function campaignSaveState(campaignId) {
+  const normalizedId = String(campaignId || "");
+  if (!campaignSaveStates.has(normalizedId)) {
+    campaignSaveStates.set(normalizedId, {
+      timer: null,
+      queued: null,
+      inFlight: null,
+      flushPromise: null,
+      durabilityPromise: Promise.resolve(),
+      revision: 0,
+      deferredRemote: null,
+      atomicDepth: 0,
+      retryCount: 0,
+      baseCampaign: null
+    });
+  }
+  return campaignSaveStates.get(normalizedId);
+}
 
-  if (isCampaignSaveInFlight) {
-    saveAgainAfterCurrent = true;
-    return;
+function campaignHasPendingSave(campaignId) {
+  const pending = campaignSaveStates.get(String(campaignId || ""));
+  return Boolean(pending?.queued || pending?.inFlight || pending?.flushPromise || pending?.atomicDepth);
+}
+
+function protectCampaignFromSnapshots(campaignId) {
+  const normalizedId = String(campaignId || "");
+  const pending = campaignSaveState(normalizedId);
+  pending.atomicDepth += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    pending.atomicDepth = Math.max(0, pending.atomicDepth - 1);
+    if (!pending.atomicDepth && pending.queued && !pending.flushPromise && !pending.timer) {
+      pending.timer = setTimeout(() => {
+        pending.timer = null;
+        flushCampaignSave(normalizedId).catch(reportBackgroundSaveFailure);
+      }, 150);
+    }
+    if (!pending.atomicDepth && !pending.queued && !pending.inFlight && !pending.flushPromise && pending.deferredRemote) {
+      refreshCampaignAfterDeferredSnapshot(normalizedId, pending);
+    }
+  };
+}
+
+function cloneCampaignForSave(campaign) {
+  return JSON.parse(JSON.stringify(campaign));
+}
+
+function sameJsonValue(left, right) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mergeLocalChangesOntoRemote(base, local, remote) {
+  if (sameJsonValue(local, base)) return remote === undefined ? undefined : cloneCampaignForSave(remote);
+  if (local === undefined) return undefined;
+  if (base === null || local === null || remote === null
+    || typeof base !== "object" || typeof local !== "object" || typeof remote !== "object") {
+    return cloneCampaignForSave(local);
   }
 
-  isCampaignSaveInFlight = true;
-  setSyncStatus("Sincronizando...");
-  try {
-    await window.CDIFirebase.saveCampaign(session.campaign, {
-      role: session.role,
-      playerId: session.player?.id || null
+  if (Array.isArray(base) || Array.isArray(local) || Array.isArray(remote)) {
+    if (!Array.isArray(base) || !Array.isArray(local) || !Array.isArray(remote)) return cloneCampaignForSave(local);
+    const combinedEntries = [...base, ...local, ...remote];
+    const hasStableIds = combinedEntries.length > 0 && combinedEntries.every(entry => (
+      entry && typeof entry === "object" && !Array.isArray(entry) && entry.id !== undefined && entry.id !== null
+    ));
+    if (!hasStableIds) {
+      return cloneCampaignForSave(local);
+    }
+
+    const baseById = new Map(base.map(entry => [String(entry.id), entry]));
+    const localById = new Map(local.map(entry => [String(entry.id), entry]));
+    const remoteById = new Map(remote.map(entry => [String(entry.id), entry]));
+    const orderedIds = [...new Set([
+      ...local.map(entry => String(entry.id)),
+      ...remote.map(entry => String(entry.id))
+    ])];
+    return orderedIds.flatMap(id => {
+      const baseEntry = baseById.get(id);
+      const localEntry = localById.get(id);
+      const remoteEntry = remoteById.get(id);
+      if (baseEntry && !localEntry) return [];
+      if (!localEntry) return remoteEntry ? [cloneCampaignForSave(remoteEntry)] : [];
+      if (!baseEntry) {
+        return [remoteEntry
+          ? mergeLocalChangesOntoRemote({}, localEntry, remoteEntry)
+          : cloneCampaignForSave(localEntry)];
+      }
+      if (!remoteEntry) {
+        return sameJsonValue(localEntry, baseEntry) ? [] : [cloneCampaignForSave(localEntry)];
+      }
+      return [mergeLocalChangesOntoRemote(baseEntry, localEntry, remoteEntry)];
     });
-    lastSavedCampaignJson = payload;
-    setSyncStatus("Online em tempo real");
+  }
+
+  const output = {};
+  const keys = new Set([...Object.keys(base), ...Object.keys(local), ...Object.keys(remote)]);
+  keys.forEach(key => {
+    const merged = mergeLocalChangesOntoRemote(base[key], local[key], remote[key]);
+    if (merged !== undefined) output[key] = merged;
+  });
+  return output;
+}
+
+function campaignSaveOutboxKey(authUid, campaignId) {
+  return `${String(authUid || "anonymous")}:${String(campaignId || "")}`;
+}
+
+function isNewerCampaignSaveRecord(candidate, current) {
+  if (!current) return true;
+  const candidateRevision = Number(candidate?.revision || 0);
+  const currentRevision = Number(current?.revision || 0);
+  if (String(candidate?.clientId || "") && String(candidate?.clientId || "") === String(current?.clientId || "")) {
+    if (candidateRevision !== currentRevision) return candidateRevision > currentRevision;
+  }
+  const candidateTime = Date.parse(candidate?.queuedAt || candidate?.updatedAt || "") || 0;
+  const currentTime = Date.parse(current?.queuedAt || current?.updatedAt || "") || 0;
+  if (candidateTime !== currentTime) return candidateTime > currentTime;
+  if (candidateRevision !== currentRevision) return candidateRevision > currentRevision;
+  return String(candidate?.mutationId || "") > String(current?.mutationId || "");
+}
+
+function readCampaignSaveMarkers() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CAMPAIGN_SAVE_MARKERS_KEY) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeCampaignSaveMarkers(markers) {
+  try {
+    localStorage.setItem(CAMPAIGN_SAVE_MARKERS_KEY, JSON.stringify([...markers]));
+    return true;
   } catch (err) {
-    console.error(err);
-    setSyncStatus("Falha de sincronizacao");
-    toast("Nao foi possivel sincronizar com o Firebase.");
-  } finally {
-    isCampaignSaveInFlight = false;
-    if (saveAgainAfterCurrent) {
-      saveAgainAfterCurrent = false;
-      queueCampaignSave();
+    console.warn("Nao foi possivel atualizar o marcador da fila de campanhas.", err);
+    return false;
+  }
+}
+
+function readCampaignSaveFallbacks() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(CAMPAIGN_SAVE_FALLBACK_KEY) || "[]");
+    return new Map((Array.isArray(parsed) ? parsed : [])
+      .filter(record => record?.key && record?.campaign?.id)
+      .map(record => [String(record.key), record]));
+  } catch {
+    return new Map();
+  }
+}
+
+function writeCampaignSaveFallbacks(records) {
+  try {
+    if (records.size) localStorage.setItem(CAMPAIGN_SAVE_FALLBACK_KEY, JSON.stringify([...records.values()]));
+    else localStorage.removeItem(CAMPAIGN_SAVE_FALLBACK_KEY);
+    return true;
+  } catch (err) {
+    console.warn("Nao foi possivel preservar o conteudo da fila de campanhas no fallback local.", err);
+    return false;
+  }
+}
+
+async function persistCampaignSaveJob(job) {
+  const key = campaignSaveOutboxKey(job.authUid, job.campaign.id);
+  const record = {
+    key,
+    authUid: String(job.authUid || ""),
+    campaignId: String(job.campaign.id),
+    campaign: cloneCampaignForSave(job.campaign),
+    role: job.role || null,
+    playerId: job.playerId || null,
+    revision: Number(job.revision || 0),
+    mutationId: String(job.mutationId || ""),
+    baseCampaign: job.baseCampaign ? cloneCampaignForSave(job.baseCampaign) : null,
+    clientId: String(job.clientId || ""),
+    queuedAt: String(job.queuedAt || ""),
+    isCreation: job.isCreation === true,
+    updatedAt: new Date().toISOString()
+  };
+
+  const db = await openMediaOutboxDb();
+  let storedInIndexedDb = false;
+  let indexedDbRecord = null;
+  if (db) {
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction(CAMPAIGN_SAVE_OUTBOX_STORE, "readwrite");
+        const store = transaction.objectStore(CAMPAIGN_SAVE_OUTBOX_STORE);
+        const request = store.get(key);
+        request.onsuccess = () => {
+          const stored = request.result;
+          if (!stored || isNewerCampaignSaveRecord(record, stored)) {
+            indexedDbRecord = record;
+            store.put(record);
+          } else {
+            indexedDbRecord = stored;
+          }
+        };
+        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error || new Error("A fila local abortou a gravacao da campanha."));
+      });
+      storedInIndexedDb = true;
+    } catch (err) {
+      console.warn("O IndexedDB falhou ao preservar a campanha; usando o fallback local.", err);
+    } finally {
+      db.close();
     }
   }
+
+  const fallbacks = readCampaignSaveFallbacks();
+  if (storedInIndexedDb) {
+    const fallback = fallbacks.get(key);
+    if (fallback && !isNewerCampaignSaveRecord(fallback, indexedDbRecord)) {
+      fallbacks.delete(key);
+      if (!writeCampaignSaveFallbacks(fallbacks)) {
+        throw new Error("Nao foi possivel consolidar a fila duravel da campanha.");
+      }
+    }
+  } else {
+    const fallback = fallbacks.get(key);
+    if (!fallback || isNewerCampaignSaveRecord(record, fallback)) fallbacks.set(key, record);
+    if (!writeCampaignSaveFallbacks(fallbacks)) {
+      throw new Error("O navegador nao disponibilizou armazenamento duravel para preservar a campanha.");
+    }
+  }
+  const markers = readCampaignSaveMarkers();
+  markers.add(key);
+  writeCampaignSaveMarkers(markers);
 }
 
-function queueCampaignSave() {
-  if (!usingFirebase() || isApplyingRemoteState || !session.campaign?.id) return;
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(flushCampaignSave, 150);
+async function clearPersistedCampaignSave(authUid, campaignId, mutationId) {
+  const key = campaignSaveOutboxKey(authUid, campaignId);
+  const db = await openMediaOutboxDb();
+  let indexedDbHasAnotherMutation = false;
+  if (db) {
+    try {
+      await new Promise((resolve, reject) => {
+        const transaction = db.transaction(CAMPAIGN_SAVE_OUTBOX_STORE, "readwrite");
+        const store = transaction.objectStore(CAMPAIGN_SAVE_OUTBOX_STORE);
+        const request = store.get(key);
+        request.onsuccess = () => {
+          const stored = request.result;
+          if (!stored) return;
+          if (String(stored.mutationId || "") === String(mutationId || "")) store.delete(key);
+          else indexedDbHasAnotherMutation = true;
+        };
+        request.onerror = () => reject(request.error);
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => reject(transaction.error);
+        transaction.onabort = () => reject(transaction.error || new Error("A fila local abortou a limpeza da campanha."));
+      });
+    } finally {
+      db.close();
+    }
+  } else if (window.indexedDB) {
+    throw new Error("Nao foi possivel conferir a fila duravel antes de limpar a campanha.");
+  }
+  const fallbacks = readCampaignSaveFallbacks();
+  const fallback = fallbacks.get(key);
+  let fallbackHasAnotherMutation = false;
+  if (fallback && String(fallback.mutationId || "") === String(mutationId || "")) {
+    fallbacks.delete(key);
+    if (!writeCampaignSaveFallbacks(fallbacks)) {
+      throw new Error("Nao foi possivel limpar o fallback duravel da campanha.");
+    }
+  } else if (fallback) {
+    fallbackHasAnotherMutation = true;
+  }
+  const markers = readCampaignSaveMarkers();
+  if (!indexedDbHasAnotherMutation && !fallbackHasAnotherMutation) {
+    markers.delete(key);
+    writeCampaignSaveMarkers(markers);
+  }
 }
 
-async function flushBeforeAtomicCampaignMutation() {
-  clearTimeout(saveTimer);
-  saveTimer = null;
-  while (isCampaignSaveInFlight) {
-    await new Promise(resolve => setTimeout(resolve, 25));
+async function readPersistedCampaignSaves(authUid) {
+  const normalizedUid = String(authUid || "");
+  const recordsByKey = new Map();
+  const db = await openMediaOutboxDb();
+  if (db) {
+    let stored = [];
+    try {
+      stored = await new Promise((resolve, reject) => {
+        const transaction = db.transaction(CAMPAIGN_SAVE_OUTBOX_STORE, "readonly");
+        const request = transaction.objectStore(CAMPAIGN_SAVE_OUTBOX_STORE).getAll();
+        request.onsuccess = () => resolve(request.result || []);
+        request.onerror = () => reject(request.error);
+        transaction.onabort = () => reject(transaction.error || new Error("A fila local abortou a leitura das campanhas."));
+      });
+    } catch (err) {
+      console.warn("O IndexedDB falhou ao ler campanhas pendentes; tentando o fallback local.", err);
+    } finally {
+      db.close();
+    }
+    stored
+      .filter(record => String(record.authUid || "") === normalizedUid)
+      .forEach(record => recordsByKey.set(String(record.key), record));
   }
-  saveAgainAfterCurrent = false;
-  await flushCampaignSave();
-  while (isCampaignSaveInFlight) {
-    await new Promise(resolve => setTimeout(resolve, 25));
+
+  readCampaignSaveFallbacks().forEach((record, key) => {
+    if (String(record.authUid || "") !== normalizedUid) return;
+    const prior = recordsByKey.get(key);
+    if (isNewerCampaignSaveRecord(record, prior)) recordsByKey.set(key, record);
+  });
+
+  const knownKeys = new Set(recordsByKey.keys());
+  readCampaignSaveMarkers().forEach(key => {
+    if (!key.startsWith(`${normalizedUid}:`) || knownKeys.has(key)) return;
+    const campaignId = key.slice(normalizedUid.length + 1);
+    const campaign = findCampaign(campaignId);
+    if (campaign) recordsByKey.set(key, {
+      key,
+      authUid: normalizedUid,
+      campaignId,
+      campaign: cloneCampaignForSave(campaign),
+      role: campaign.masterId === normalizedUid ? "master" : "player",
+      playerId: null,
+      revision: 1,
+      mutationId: "",
+      baseCampaign: null,
+      clientId: "legacy",
+      queuedAt: "",
+      isCreation: false
+    });
+  });
+  return [...recordsByKey.values()];
+}
+
+async function hydrateCampaignSaveOutbox(authUid) {
+  const records = await readPersistedCampaignSaves(authUid);
+  records.forEach(record => {
+    if (!record?.campaign?.id) return;
+    const campaign = normalizeCampaign(record.campaign);
+    const campaignId = String(campaign.id);
+    state.campaigns = [campaign, ...state.campaigns.filter(entry => String(entry.id) !== campaignId)];
+    if (String(session.campaign?.id || "") === campaignId) session.campaign = campaign;
+    const pending = campaignSaveState(campaignId);
+    pending.revision = Math.max(pending.revision, Number(record.revision || 0));
+    pending.baseCampaign = record.baseCampaign ? cloneCampaignForSave(record.baseCampaign) : null;
+    pending.queued = {
+      campaign: cloneCampaignForSave(campaign),
+      role: record.role || (campaign.masterId === authUid ? "master" : "player"),
+      playerId: record.playerId || null,
+      revision: pending.revision,
+      authUid: String(authUid || ""),
+      mutationId: String(record.mutationId || `${campaignId}:${uid()}`),
+      baseCampaign: pending.baseCampaign ? cloneCampaignForSave(pending.baseCampaign) : null,
+      clientId: String(record.clientId || "legacy"),
+      queuedAt: String(record.queuedAt || record.updatedAt || ""),
+      isCreation: record.isCreation === true,
+      needsRebase: true
+    };
+  });
+  if (records.length) persistLocal();
+  return records.map(record => String(record.campaignId || record.campaign?.id || "")).filter(Boolean);
+}
+
+function applyReplayAuthoritativeCampaign(campaignId, authoritative) {
+  const normalizedId = String(campaignId || "");
+  if (!authoritative) {
+    campaignRemoteBaselines.delete(normalizedId);
+    state.campaigns = state.campaigns.filter(campaign => String(campaign.id) !== normalizedId);
+    if (String(session.campaign?.id || "") === normalizedId) {
+      session.campaign = null;
+      session.player = null;
+      session.view = session.role === "master" ? "campaigns" : "home";
+    }
+    persistLocal();
+    return;
   }
-  clearTimeout(saveTimer);
-  saveTimer = null;
-  saveAgainAfterCurrent = false;
+  const normalized = normalizeCampaign(authoritative);
+  campaignRemoteBaselines.set(normalizedId, cloneCampaignForSave(normalized));
+  state.campaigns = [normalized, ...state.campaigns.filter(campaign => String(campaign.id) !== normalizedId)];
+  if (String(session.campaign?.id || "") === normalizedId) session.campaign = normalized;
+  persistLocal();
+}
+
+async function prepareReplayedCampaignSave(job, pending) {
+  if (!job.needsRebase || typeof window.CDIFirebase?.getCampaign !== "function") return { skip: false };
+  const authoritative = await withOperationTimeout(
+    window.CDIFirebase.getCampaign(job.campaign.id),
+    30000,
+    "O Firebase demorou demais para reconciliar a campanha pendente."
+  );
+  const acknowledged = authoritative?.lastClientMutation
+    && String(authoritative.lastClientMutation.id || "") === String(job.mutationId || "")
+    && String(authoritative.lastClientMutation.authUid || "") === String(job.authUid || "");
+  if (acknowledged || (!authoritative && job.baseCampaign)) {
+    applyReplayAuthoritativeCampaign(job.campaign.id, authoritative);
+    return { skip: true };
+  }
+
+  if (!job.baseCampaign) {
+    if (!authoritative && job.isCreation) {
+      job.needsRebase = false;
+      return { skip: false };
+    }
+    const error = new Error("A alteracao pendente e de uma versao antiga e nao possui uma base segura para reconciliacao. Ela foi preservada neste navegador e nao sera reaplicada automaticamente.");
+    error.code = "campaign/replay-baseline-missing";
+    throw error;
+  }
+
+  if (authoritative) {
+    job.campaign = normalizeCampaign(mergeLocalChangesOntoRemote(
+      job.baseCampaign,
+      job.campaign,
+      authoritative
+    ));
+    job.baseCampaign = cloneCampaignForSave(authoritative);
+    pending.baseCampaign = cloneCampaignForSave(authoritative);
+    campaignRemoteBaselines.set(String(job.campaign.id), cloneCampaignForSave(authoritative));
+    if (!pending.queued || Number(pending.queued.revision || 0) <= Number(job.revision || 0)) {
+      pending.durabilityPromise = pending.durabilityPromise
+        .catch(() => null)
+        .then(() => persistCampaignSaveJob(job));
+      job.durabilityPromise = pending.durabilityPromise;
+      await job.durabilityPromise;
+    }
+  }
+  job.needsRebase = false;
+  return { skip: false };
+}
+
+async function refreshCampaignAfterDeferredSnapshot(campaignId, pending) {
+  if (!pending.deferredRemote || pending.queued || pending.inFlight || pending.flushPromise || pending.atomicDepth) return;
+  const deferred = pending.deferredRemote;
+  lastRemoteCampaignJson = "";
+  if (typeof window.CDIFirebase?.getCampaign !== "function") return;
+  try {
+    const authoritative = await withOperationTimeout(
+      window.CDIFirebase.getCampaign(campaignId),
+      30000,
+      "O Firebase demorou demais para atualizar a campanha adiada."
+    );
+    if (campaignHasPendingSave(campaignId)) return;
+    if (!authoritative) {
+      if (deferred.present !== false) return;
+      state.campaigns = state.campaigns.filter(campaign => String(campaign.id) !== String(campaignId));
+      if (String(session.campaign?.id || "") === String(campaignId)) {
+        session.campaign = null;
+        session.player = null;
+        session.view = session.role === "master" ? "campaigns" : "home";
+      }
+      if (pending.deferredRemote === deferred) pending.deferredRemote = null;
+      persistLocal();
+      requestPassiveRender();
+      return;
+    }
+    const normalized = normalizeCampaign(authoritative);
+    campaignRemoteBaselines.set(String(campaignId), cloneCampaignForSave(normalized));
+    state.campaigns = state.campaigns.map(campaign => String(campaign.id) === String(campaignId) ? normalized : campaign);
+    if (String(session.campaign?.id || "") === String(campaignId)) session.campaign = normalized;
+    if (pending.deferredRemote === deferred) pending.deferredRemote = null;
+    persistLocal();
+    requestPassiveRender();
+  } catch (err) {
+    console.warn("Nao foi possivel atualizar o snapshot adiado da campanha.", err);
+  }
+}
+
+function reportBackgroundSaveFailure(err) {
+  console.error(err);
+  setSyncStatus("Falha de sincronizacao");
+  toast("Nao foi possivel sincronizar com o Firebase. A alteracao continua pendente para uma nova tentativa.");
+}
+
+function withOperationTimeout(promise, timeoutMs, message, code = "operation/timeout") {
+  let timeout;
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise((_, reject) => {
+      timeout = setTimeout(() => {
+        const error = new Error(message);
+        error.code = code;
+        reject(error);
+      }, timeoutMs);
+    })
+  ]).finally(() => clearTimeout(timeout));
+}
+
+function scheduleCampaignSaveRetry(campaignId, pending = campaignSaveState(campaignId)) {
+  if (!pending.queued || pending.timer || pending.flushPromise || pending.atomicDepth) return;
+  const delay = Math.min(1000 * (2 ** Math.min(pending.retryCount, 5)), 30000);
+  pending.timer = setTimeout(() => {
+    pending.timer = null;
+    flushCampaignSave(campaignId).catch(reportBackgroundSaveFailure);
+  }, delay);
+}
+
+async function flushCampaignSave(campaignId = session.campaign?.id) {
+  const normalizedId = String(campaignId || "");
+  if (!usingFirebase() || !normalizedId) return;
+  const pending = campaignSaveState(normalizedId);
+  if (pending.timer) {
+    clearTimeout(pending.timer);
+    pending.timer = null;
+  }
+
+  if (pending.flushPromise) {
+    await pending.flushPromise;
+    if (pending.queued) return flushCampaignSave(normalizedId);
+    return;
+  }
+  if (!pending.queued) return;
+
+  const flushPromise = (async () => {
+    let lastCompletedJob = null;
+    while (pending.queued) {
+      const job = pending.queued;
+      pending.queued = null;
+      pending.inFlight = job;
+      setSyncStatus("Sincronizando...");
+      try {
+        await job.durabilityPromise;
+        const preparation = await prepareReplayedCampaignSave(job, pending);
+        if (preparation.skip) {
+          lastCompletedJob = job;
+          pending.retryCount = 0;
+          continue;
+        }
+        await window.CDIFirebase.saveCampaign(job.campaign, {
+          role: job.role,
+          playerId: job.playerId,
+        baseCampaign: job.baseCampaign,
+        mutationId: job.mutationId,
+        mutationRevision: job.revision,
+        isCreation: job.isCreation === true
+        });
+        lastCompletedJob = job;
+        pending.retryCount = 0;
+        campaignRemoteBaselines.set(normalizedId, cloneCampaignForSave(job.campaign));
+        if (String(session.campaign?.id || "") === normalizedId) {
+          lastSavedCampaignJson = JSON.stringify(job.campaign);
+        }
+        setSyncStatus("Online em tempo real");
+      } catch (err) {
+        job.needsRebase = true;
+        const queuedRevision = Number(pending.queued?.revision || 0);
+        if (!pending.queued || queuedRevision < job.revision) {
+          pending.durabilityPromise = pending.durabilityPromise
+            .catch(() => null)
+            .then(() => persistCampaignSaveJob(job));
+          job.durabilityPromise = pending.durabilityPromise;
+          pending.queued = job;
+        }
+        pending.retryCount += 1;
+        throw err;
+      } finally {
+        pending.inFlight = null;
+      }
+    }
+    if (lastCompletedJob && !pending.queued) {
+      pending.durabilityPromise = pending.durabilityPromise
+        .catch(() => null)
+        .then(() => clearPersistedCampaignSave(
+          lastCompletedJob.authUid,
+          normalizedId,
+          lastCompletedJob.mutationId
+        ));
+      try {
+        await pending.durabilityPromise;
+        pending.baseCampaign = null;
+      } catch (err) {
+        if (!pending.queued || Number(pending.queued.revision || 0) < lastCompletedJob.revision) {
+          lastCompletedJob.needsRebase = true;
+          pending.queued = lastCompletedJob;
+        }
+        pending.retryCount += 1;
+        throw err;
+      }
+    }
+  })();
+  pending.flushPromise = flushPromise;
+  let failed = false;
+  let failure = null;
+  try {
+    await flushPromise;
+  } catch (err) {
+    failed = true;
+    failure = err;
+    throw err;
+  } finally {
+    if (pending.flushPromise === flushPromise) pending.flushPromise = null;
+    if (failed && failure?.code !== "campaign/replay-baseline-missing") {
+      scheduleCampaignSaveRetry(normalizedId, pending);
+    }
+  }
+  if (pending.queued) return flushCampaignSave(normalizedId);
+  await refreshCampaignAfterDeferredSnapshot(normalizedId, pending);
+}
+
+function queueCampaignSave(campaign = session.campaign, context = {}) {
+  if (!usingFirebase() || isApplyingRemoteState || !campaign?.id) return;
+  normalizeCampaign(campaign);
+  const normalizedId = String(campaign.id);
+  const pending = campaignSaveState(normalizedId);
+  pending.revision += 1;
+  const hasExplicitBase = Object.prototype.hasOwnProperty.call(context, "baseCampaign");
+  const explicitBase = hasExplicitBase && context.baseCampaign
+    ? cloneCampaignForSave(context.baseCampaign)
+    : null;
+  const inheritedBase = hasExplicitBase
+    ? explicitBase
+    : (pending.queued?.baseCampaign
+      || pending.inFlight?.baseCampaign
+      || pending.baseCampaign
+      || campaignRemoteBaselines.get(normalizedId)
+      || null);
+  if (hasExplicitBase) pending.baseCampaign = explicitBase;
+  else if (!pending.baseCampaign && inheritedBase) pending.baseCampaign = cloneCampaignForSave(inheritedBase);
+  const job = {
+    campaign: cloneCampaignForSave(campaign),
+    role: context.role ?? session.role,
+    playerId: context.playerId ?? session.player?.id ?? null,
+    revision: pending.revision,
+    authUid: String(window.CDIFirebase?.currentUser?.uid || firebaseUser?.uid || ""),
+    mutationId: `${normalizedId}:${uid()}`,
+    baseCampaign: inheritedBase ? cloneCampaignForSave(inheritedBase) : null,
+    clientId: campaignSaveClientId,
+    queuedAt: new Date().toISOString(),
+    isCreation: context.isCreation === true,
+    needsRebase: false
+  };
+  pending.durabilityPromise = pending.durabilityPromise
+    .catch(() => null)
+    .then(() => persistCampaignSaveJob(job));
+  job.durabilityPromise = pending.durabilityPromise;
+  pending.queued = job;
+  if (pending.timer) clearTimeout(pending.timer);
+  if (pending.atomicDepth > 0) {
+    pending.timer = null;
+    return;
+  }
+  pending.timer = setTimeout(() => {
+    pending.timer = null;
+    flushCampaignSave(normalizedId).catch(reportBackgroundSaveFailure);
+  }, 150);
+}
+
+async function flushBeforeAtomicCampaignMutation(campaignId = session.campaign?.id) {
+  const normalizedId = String(campaignId || "");
+  if (!usingFirebase() || !normalizedId) return;
+  await withOperationTimeout(
+    flushCampaignSave(normalizedId),
+    15000,
+    "Uma alteracao anterior continua pendente no Firebase. Ela esta preservada e seguira sincronizando; tente esta operacao novamente quando a conexao estabilizar.",
+    "campaign/pending-save-timeout"
+  );
+}
+
+function clearCampaignSaveStates() {
+  campaignSaveStates.forEach(pending => {
+    if (pending.timer) clearTimeout(pending.timer);
+  });
+  campaignSaveStates.clear();
+  campaignRemoteBaselines.clear();
+}
+
+async function ensurePendingCampaignSavesAreDurable() {
+  const durabilityPromises = new Set();
+  campaignSaveStates.forEach(pending => {
+    if (pending.durabilityPromise) durabilityPromises.add(pending.durabilityPromise);
+    if (pending.queued?.durabilityPromise) durabilityPromises.add(pending.queued.durabilityPromise);
+    if (pending.inFlight?.durabilityPromise) durabilityPromises.add(pending.inFlight.durabilityPromise);
+  });
+  await Promise.all([...durabilityPromises].map(promise => Promise.resolve(promise)));
 }
 
 const save = () => {
   normalizeState();
-  persistLocal();
-  queueCampaignSave();
+  const persisted = persistLocal();
+  queueCampaignSave(session.campaign);
+  return persisted;
 };
 
 function firebaseStatusText() {
@@ -770,6 +1515,14 @@ window.addEventListener("keydown", (e) => {
 });
 
 window.addEventListener("cdi-firebase-ready", initFirebaseBridge);
+window.addEventListener("online", () => {
+  campaignSaveStates.forEach((pending, campaignId) => {
+    if (!pending.queued || pending.flushPromise || pending.atomicDepth) return;
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.timer = null;
+    flushCampaignSave(campaignId).catch(reportBackgroundSaveFailure);
+  });
+});
 
 function applyRemoteCampaignSnapshot(campaigns, meta = {}, user = firebaseUser) {
   const syncText = meta.hasPendingWrites
@@ -789,7 +1542,32 @@ function applyRemoteCampaignSnapshot(campaigns, meta = {}, user = firebaseUser) 
   isApplyingRemoteState = true;
 
   try {
-    state.campaigns = campaigns.map(normalizeCampaign);
+    const localById = new Map(state.campaigns.map(campaign => [String(campaign.id), campaign]));
+    const nextCampaigns = campaigns.map(remoteCampaign => {
+      const normalizedId = String(remoteCampaign.id || "");
+      if (!meta.hasPendingWrites) {
+        campaignRemoteBaselines.set(normalizedId, cloneCampaignForSave(remoteCampaign));
+      }
+      const localCampaign = localById.get(normalizedId);
+      if (localCampaign && campaignHasPendingSave(normalizedId)) {
+        campaignSaveState(normalizedId).deferredRemote = { present: true, campaign: remoteCampaign };
+        localById.delete(normalizedId);
+        return localCampaign;
+      }
+      localById.delete(normalizedId);
+      const pending = campaignSaveStates.get(normalizedId);
+      if (pending) pending.deferredRemote = null;
+      return normalizeCampaign(remoteCampaign);
+    });
+    localById.forEach((localCampaign, campaignId) => {
+      if (campaignHasPendingSave(campaignId)) {
+        campaignSaveState(campaignId).deferredRemote = { present: false, campaign: null };
+        nextCampaigns.push(localCampaign);
+      } else if (!meta.hasPendingWrites) {
+        campaignRemoteBaselines.delete(String(campaignId));
+      }
+    });
+    state.campaigns = nextCampaigns;
     persistLocal();
 
     if (!session.role) restoreFirebaseSession(user, firebaseProfile);
@@ -860,6 +1638,18 @@ async function initFirebaseBridge() {
       return render();
     }
 
+    try {
+      const pendingCampaignIds = await hydrateCampaignSaveOutbox(user.uid);
+      await Promise.all(pendingCampaignIds.map(campaignId => (
+        flushCampaignSave(campaignId).catch(err => {
+          reportBackgroundSaveFailure(err);
+          return null;
+        })
+      )));
+    } catch (err) {
+      console.warn("Nao foi possivel restaurar integralmente a fila local de campanhas.", err);
+    }
+
     unsubscribeCampaigns = window.CDIFirebase.watchCampaigns(user.uid, (campaigns, meta = {}) => {
       applyRemoteCampaignSnapshot(campaigns, meta, user);
     }, err => {
@@ -872,42 +1662,70 @@ async function initFirebaseBridge() {
   });
 }
 
-function readImg(file, maxSize = 800) {
-  return new Promise(resolve => {
-    if (!file) return resolve("");
-    const fr = new FileReader();
-    fr.onload = (e) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement("canvas");
-        let width = img.width, height = img.height;
-        if (width > height && width > maxSize) { height *= maxSize / width; width = maxSize; }
-        else if (height > maxSize) { width *= maxSize / height; height = maxSize; }
-        canvas.width = width; canvas.height = height;
-        canvas.getContext("2d").drawImage(img, 0, 0, width, height);
-        if (usingFirebase()) {
-          canvas.toBlob(async blob => {
-            try {
-              const campaignId = session.campaign?.id || "shared";
-              const path = `campaign-images/${campaignId}/${uid()}.jpg`;
-              const url = await window.CDIFirebase.uploadImage(path, blob);
-              resolve(url || canvas.toDataURL("image/jpeg", 0.8));
-            } catch (err) {
-              console.error(err);
-              toast("Nao foi possivel enviar a imagem. Salvando localmente.");
-              resolve(canvas.toDataURL("image/jpeg", 0.8));
-            }
-          }, "image/jpeg", 0.8);
-        } else {
-          resolve(canvas.toDataURL("image/jpeg", 0.8));
-        }
-      };
-      img.onerror = () => resolve("");
-      img.src = e.target.result;
-    };
-    fr.onerror = () => resolve("");
-    fr.readAsDataURL(file);
+function validateImageFile(file) {
+  if (!file) return Promise.resolve(null);
+  if (!String(file.type || "").startsWith("image/")) {
+    return Promise.reject(new Error("O arquivo selecionado nao e uma imagem valida."));
+  }
+  if (Number(file.size || 0) > MAX_IMAGE_FILE_BYTES) {
+    return Promise.reject(new Error("A imagem ultrapassa o limite de 25 MB por arquivo."));
+  }
+  if (Number(file.size || 0) <= 0) {
+    return Promise.reject(new Error("A imagem selecionada esta vazia."));
+  }
+  return Promise.resolve(true);
+}
+
+async function uploadImageAsset(blob, options = {}) {
+  if (!blob) return null;
+  if (!window.CDIFirebase?.uploadImage) {
+    throw new Error("O servico de imagens ainda nao esta pronto. Aguarde alguns segundos e tente novamente.");
+  }
+  if (window.CDIFirebase.mediaConfigured === false) {
+    throw new Error("Cloudinary nao configurado. O arquivo nao foi salvo para evitar perda de dados.");
+  }
+
+  const campaignId = String(options.campaignId || session.campaign?.id || "shared");
+  const kind = String(options.kind || "images").replace(/[^a-z0-9_-]/gi, "-").toLowerCase();
+  const entityId = String(options.entityId || uid()).replace(/[^a-z0-9_-]/gi, "-");
+  const path = `site-rpg/${campaignId}/${kind}/${entityId}`;
+  const result = await window.CDIFirebase.uploadImage(path, blob, {
+    folder: "",
+    assetFolder: `site-rpg/${campaignId}/${kind}`,
+    tags: ["site-rpg", kind],
+    context: { campaignId, kind, entityId }
   });
+  const asset = typeof result === "string" ? { secureUrl: result } : result;
+  if (!asset?.secureUrl || !isCloudinaryImage(asset.secureUrl)) {
+    throw new Error("O Cloudinary nao confirmou uma URL valida. Nenhuma alteracao foi salva.");
+  }
+  const metadata = {
+    provider: "cloudinary",
+    assetId: asset.assetId || null,
+    publicId: asset.publicId || null,
+    version: asset.version || null,
+    versionId: asset.versionId || null,
+    format: asset.format || null,
+    width: Number(asset.width || options.width || 0) || null,
+    height: Number(asset.height || options.height || 0) || null,
+    bytes: Number(asset.bytes || blob.size || 0) || null,
+    etag: asset.etag || null
+  };
+  uploadedImageMetadata.set(asset.secureUrl, metadata);
+  return { ...asset, secureUrl: asset.secureUrl, metadata };
+}
+
+async function readImg(file, maxSize = 800, options = {}) {
+  if (!file) return "";
+  if (imageMigrationInProgress && options.kind !== "legacy-migration") {
+    throw new Error("Aguarde a migracao de imagens terminar antes de iniciar outro envio.");
+  }
+  await validateImageFile(file);
+  const asset = await uploadImageAsset(file, {
+    ...options,
+    displayMaxSize: maxSize
+  });
+  return asset.secureUrl;
 }
 
 function openImageModal(imgSrc, title = "Visualizar Imagem") {
@@ -916,7 +1734,7 @@ function openImageModal(imgSrc, title = "Visualizar Imagem") {
     <div class="modal" onclick="this.remove()">
       <div class="modalbox" style="text-align:center; max-width:90vw;" onclick="event.stopPropagation()">
         <h3>${esc(title)}</h3>
-        <img src="${esc(imgSrc)}" alt="${esc(title)}" style="max-width:100%; max-height:70vh; border-radius:8px; object-fit:contain; margin-top:10px; cursor:pointer;" onclick="this.closest('.modal').remove()">
+        <img ${imageSourceAttrs(imgSrc, "full")} alt="${esc(title)}" style="max-width:100%; max-height:70vh; border-radius:8px; object-fit:contain; margin-top:10px; cursor:pointer;" onclick="this.closest('.modal').remove()">
         <br><br>
         <button class="secondary" onclick="this.closest('.modal').remove()">Fechar</button>
       </div>
@@ -1206,13 +2024,22 @@ async function logout() {
     updateLocalPlayerPresence(false);
     save();
   }
+  if (usingFirebase()) {
+    try {
+      await ensurePendingCampaignSavesAreDurable();
+    } catch (err) {
+      console.error("Nao foi possivel preservar as alteracoes pendentes antes de sair.", err);
+      alert("Nao foi possivel preservar as alteracoes pendentes neste navegador. A sessao continuara aberta para evitar perda de progresso.");
+      return;
+    }
+  }
   await stopPlayerPresence(true);
   stopPrivateMessageSubscription();
   if (unsubscribeCampaigns) unsubscribeCampaigns();
   unsubscribeCampaigns = null;
   lastSavedCampaignJson = "";
   lastRemoteCampaignJson = "";
-  saveAgainAfterCurrent = false;
+  clearCampaignSaveStates();
   clearSessionContext();
   if (usingFirebase()) {
     await window.CDIFirebase.signOut();
@@ -1238,6 +2065,7 @@ function render() {
     c.evidence ??= [];
     c.itemTransfers ??= [];
     c.gameBoard ??= { image: "", updatedAt: null };
+    c.previousGameBoard ??= { image: "", updatedAt: null };
     c.chatSettings = tabletop?.normalizeChatSettings
       ? tabletop.normalizeChatSettings(c.chatSettings)
       : {
@@ -1262,6 +2090,7 @@ function render() {
       </section>
     </div>`;
   if (session.view === "messages") restoreChatViewState();
+  if (session.view === "scenes" && session.role === "master") setTimeout(() => preloadAdjacentSceneImages(c), 0);
 }
 
 // --- PAINEL DO MESTRE ---
@@ -1494,9 +2323,446 @@ function clearAllMastersDiceLogs() {
   }
 }
 
+function collectLegacyImageReferences(value, path = [], output = [], seen = new WeakSet()) {
+  if (!value || typeof value !== "object") return output;
+  if (seen.has(value)) return output;
+  seen.add(value);
+  Object.entries(value).forEach(([key, child]) => {
+    const nextPath = [...path, key];
+    if (key === "image" && isUnmanagedImage(child)) {
+      output.push({ parent: value, key, source: child, path: nextPath.join(".") });
+      return;
+    }
+    if (child && typeof child === "object") collectLegacyImageReferences(child, nextPath, output, seen);
+  });
+  return output;
+}
+
+function legacyImageSummary(campaigns = getMasterCampaigns()) {
+  const references = campaigns.flatMap(campaign => collectLegacyImageReferences(campaign, [`campaigns.${campaign.id}`]));
+  return {
+    references: references.length,
+    unique: new Set(references.map(reference => reference.source)).size,
+    campaigns: new Set(references.map(reference => reference.path.split(".")[1])).size
+  };
+}
+
+function dataUriToBlob(dataUri) {
+  const match = String(dataUri || "").match(/^data:([^;,]+);base64,(.+)$/i);
+  if (!match || !match[1].startsWith("image/")) throw new Error("Imagem Base64 invalida encontrada na campanha.");
+  const binary = atob(match[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return new Blob([bytes], { type: match[1] });
+}
+
+async function mediaFingerprint(blob) {
+  const payload = typeof blob === "string"
+    ? new TextEncoder().encode(blob).buffer
+    : await blob.arrayBuffer();
+  if (globalThis.crypto?.subtle) {
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", payload);
+    return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, "0")).join("");
+  }
+  return uid();
+}
+
+async function imageMigrationUploadSource(source) {
+  const value = String(source || "").trim();
+  if (isBase64Image(value)) return dataUriToBlob(value);
+
+  let url;
+  try {
+    url = new URL(value, window.location?.href || document.baseURI);
+  } catch {
+    throw new Error(`Referencia de imagem invalida: ${value.slice(0, 120)}`);
+  }
+  if (!/^https?:$/.test(url.protocol)) {
+    throw new Error(`A imagem ${value.slice(0, 120)} nao usa um endereco HTTP valido.`);
+  }
+
+  const currentOrigin = window.location?.origin || "";
+  if (currentOrigin && url.origin !== currentOrigin) return url.href;
+  const response = await fetch(url.href, { credentials: "same-origin" });
+  if (!response.ok) throw new Error(`Nao foi possivel abrir a imagem antiga (${response.status}).`);
+  const blob = await response.blob();
+  if (!String(blob.type || "").startsWith("image/")) throw new Error("Uma referencia antiga nao devolveu um arquivo de imagem.");
+  if (Number(blob.size || 0) > MAX_IMAGE_FILE_BYTES) throw new Error("Uma imagem antiga ultrapassa o limite de 25 MB.");
+  return blob;
+}
+
+async function backupSha256(value) {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("Este navegador nao oferece verificacao SHA-256 para confirmar o backup.");
+  }
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
+  return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function campaignProgressManifest(campaign) {
+  const characters = campaign.characters || [];
+  return {
+    id: String(campaign.id || ""),
+    name: String(campaign.name || ""),
+    players: (campaign.players || []).length,
+    characters: characters.length,
+    scenes: (campaign.scenes || []).length,
+    sceneTrash: (campaign.sceneTrash || []).length,
+    items: (campaign.items || []).length,
+    evidence: (campaign.evidence || []).length,
+    traumaCatalog: (campaign.traumaCatalog || []).length,
+    inventoryEntries: characters.reduce((total, character) => total + (character.inventory || []).length, 0),
+    assignedEvidence: characters.reduce((total, character) => total + (character.evidence || []).length, 0),
+    assignedTraumas: characters.reduce((total, character) => total + (character.traumas || []).length, 0),
+    legacyImageReferences: collectLegacyImageReferences(campaign).length
+  };
+}
+
+async function buildMasterImageBackup(campaigns = getMasterCampaigns()) {
+  const snapshot = JSON.parse(JSON.stringify(campaigns || []));
+  const snapshotJson = JSON.stringify(snapshot);
+  return {
+    format: "site-rpg-cloudinary-migration-backup",
+    version: 2,
+    exportedAt: new Date().toISOString(),
+    reason: "backup-before-cloudinary-migration",
+    masterId: session.currentMaster?.id || null,
+    integrity: {
+      algorithm: "SHA-256",
+      campaignsDigest: await backupSha256(snapshotJson)
+    },
+    manifest: snapshot.map(campaignProgressManifest),
+    campaigns: snapshot
+  };
+}
+
+async function verifyMasterImageBackupPayload(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+    || payload.format !== "site-rpg-cloudinary-migration-backup"
+    || Number(payload.version) !== 2
+    || !Array.isArray(payload.campaigns)
+    || !Array.isArray(payload.manifest)) {
+    throw new Error("Este arquivo nao e um backup de migracao compativel com o site.");
+  }
+  if (payload.integrity?.algorithm !== "SHA-256" || !/^[a-f0-9]{64}$/i.test(String(payload.integrity?.campaignsDigest || ""))) {
+    throw new Error("O backup nao possui uma assinatura SHA-256 valida.");
+  }
+  const actualDigest = await backupSha256(JSON.stringify(payload.campaigns));
+  if (actualDigest !== String(payload.integrity.campaignsDigest).toLowerCase()) {
+    throw new Error("A integridade do backup falhou: o conteudo foi alterado ou esta incompleto.");
+  }
+  const expectedManifest = payload.campaigns.map(campaignProgressManifest);
+  if (!sameJsonValue(expectedManifest, payload.manifest)) {
+    throw new Error("O manifesto do backup nao corresponde ao progresso armazenado.");
+  }
+  return {
+    verified: true,
+    campaigns: payload.campaigns.length,
+    references: expectedManifest.reduce((total, campaign) => total + campaign.legacyImageReferences, 0),
+    digest: actualDigest
+  };
+}
+
+async function verifyMasterImageBackupFile(file) {
+  if (!file) return;
+  try {
+    const payload = JSON.parse(await file.text());
+    const result = await verifyMasterImageBackupPayload(payload);
+    toast(`Backup verificado: ${result.campaigns} campanha(s), assinatura SHA-256 valida.`);
+  } catch (err) {
+    console.error(err);
+    alert(`O backup nao passou na verificacao.\n\n${firebaseErrorMessage(err)}`);
+  } finally {
+    const input = document.getElementById("imageMigrationBackupFile");
+    if (input) input.value = "";
+  }
+}
+
+async function saveMasterImageBackup(campaigns = getMasterCampaigns(), { requireConfirmation = false } = {}) {
+  const payload = await buildMasterImageBackup(campaigns);
+  const fileName = `site-rpg-backup-imagens-${payload.exportedAt.replace(/[:.]/g, "-")}.json`;
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+
+  if (typeof window.showSaveFilePicker === "function") {
+    const handle = await window.showSaveFilePicker({
+      suggestedName: fileName,
+      types: [{ description: "Backup JSON da campanha", accept: { "application/json": [".json"] } }]
+    });
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+  } else {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = fileName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    if (requireConfirmation && !confirm(`Confirme que o arquivo ${fileName} apareceu na pasta Downloads. Sem essa confirmacao a migracao nao continuara.`)) {
+      throw new Error("A migracao foi cancelada porque o backup nao foi confirmado.");
+    }
+  }
+  toast("Backup JSON salvo e identificado por SHA-256.");
+  return payload;
+}
+
+async function downloadMasterImageBackup() {
+  try {
+    await saveMasterImageBackup(getMasterCampaigns());
+  } catch (err) {
+    if (err?.name === "AbortError") return toast("O backup foi cancelado.");
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  }
+}
+
+function replaceLegacyImagesLocally(target, replacementBySource) {
+  const references = collectLegacyImageReferences(target);
+  let replaced = 0;
+  references.forEach(reference => {
+    const replacement = replacementBySource.get(reference.source);
+    if (!replacement) return;
+    reference.parent[reference.key] = replacement.url;
+    if (reference.path === "liveScene.image") delete reference.parent.imageMeta;
+    else reference.parent.imageMeta = { ...replacement.metadata };
+    replaced += 1;
+  });
+  return replaced;
+}
+
+function updateImageMigrationProgress() {
+  const text = document.getElementById("imageMigrationProgressText");
+  const bar = document.getElementById("imageMigrationProgressBar");
+  const lockText = document.getElementById("imageMigrationLockText");
+  const lockBar = document.getElementById("imageMigrationLockBar");
+  const phase = imageMigrationProgress.phase || `Migrando ${imageMigrationProgress.completed} de ${imageMigrationProgress.total}`;
+  const percentage = imageMigrationProgress.total ? Math.round((imageMigrationProgress.completed / imageMigrationProgress.total) * 100) : 0;
+  if (text) text.textContent = phase;
+  if (lockText) lockText.textContent = phase;
+  if (bar) bar.style.width = `${percentage}%`;
+  if (lockBar) lockBar.style.width = `${percentage}%`;
+}
+
+async function migrateLegacyImages() {
+  if (imageMigrationInProgress) return;
+  const campaigns = getMasterCampaigns();
+  const summary = legacyImageSummary(campaigns);
+  if (!summary.references) return toast("Todas as imagens ja estao vinculadas ao Cloudinary.");
+  if (!window.CDIFirebase?.uploadImage || window.CDIFirebase.mediaConfigured === false) {
+    return alert("Cloudinary nao configurado. A migracao nao foi iniciada.");
+  }
+  if (!confirm(`Migrar ${summary.unique} imagem${summary.unique === 1 ? "" : "s"} do Mestre para o Cloudinary? Um backup JSON sera baixado antes e os dados antigos so serao substituidos depois da confirmacao do Firebase.`)) return;
+
+  try {
+    await saveMasterImageBackup(campaigns, { requireConfirmation: true });
+  } catch (err) {
+    if (err?.name === "AbortError") return toast("Migracao cancelada: nenhum dado foi alterado.");
+    return alert(firebaseErrorMessage(err));
+  }
+  imageMigrationInProgress = true;
+  imageMigrationProgress = { total: summary.unique, completed: 0, phase: "Preparando migracao segura..." };
+  render();
+
+  try {
+    for (const campaignId of campaigns.map(campaign => String(campaign.id))) {
+      if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+      const releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+      try {
+        const pendingSave = campaignSaveState(campaignId);
+        const initial = findCampaign(campaignId);
+        if (!initial) continue;
+        if (usingFirebase()) {
+          if (typeof window.CDIFirebase.upgradeLegacyCampaignStorageLayout !== "function") {
+            throw new Error("O servico de compatibilidade das campanhas antigas ainda nao esta disponivel.");
+          }
+          imageMigrationProgress.phase = `Preparando com seguranca ${initial.name || "campanha"}...`;
+          updateImageMigrationProgress();
+          await window.CDIFirebase.upgradeLegacyCampaignStorageLayout(campaignId);
+        }
+        const remoteBaseline = usingFirebase()
+          ? await withOperationTimeout(
+            window.CDIFirebase.getCampaign(campaignId),
+            30000,
+            "O Firebase demorou demais para preparar a migracao."
+          )
+          : cloneCampaignForSave(initial);
+        if (!remoteBaseline) throw new Error("O Firebase nao devolveu a campanha antes da migracao.");
+        if (usingFirebase()) {
+          if (typeof window.CDIFirebase.preflightCampaignImageMigration !== "function") {
+            throw new Error("O servico de preflight da migracao ainda nao esta disponivel.");
+          }
+          imageMigrationProgress.phase = `Auditando ${initial.name || "campanha"} sem alterar dados...`;
+          updateImageMigrationProgress();
+          const preflight = await window.CDIFirebase.preflightCampaignImageMigration(campaignId, initial);
+          const localReferenceCount = collectLegacyImageReferences(initial).length;
+          if (preflight?.verified !== true || Number(preflight.expectedCount) !== localReferenceCount) {
+            throw new Error(`O preflight confirmou ${Number(preflight?.expectedCount || 0)} de ${localReferenceCount} referencias. Nenhum upload foi iniciado.`);
+          }
+        }
+        const sources = [...new Set(collectLegacyImageReferences(initial).map(reference => reference.source))];
+        if (!sources.length) continue;
+        const replacementBySource = new Map();
+        const uploads = await mapWithConcurrency(sources, IMAGE_UPLOAD_CONCURRENCY, async source => {
+          const uploadSource = await imageMigrationUploadSource(source);
+          const fingerprint = await mediaFingerprint(uploadSource);
+          imageMigrationProgress.phase = `Migrando imagens de ${initial.name || "campanha"}...`;
+          updateImageMigrationProgress();
+          const asset = await uploadImageAsset(uploadSource, {
+            campaignId,
+            kind: "legacy-migration",
+            entityId: `legacy-${fingerprint.slice(0, 32)}`
+          });
+          const replacement = { source, url: asset.secureUrl, metadata: asset.metadata };
+          replacementBySource.set(source, replacement);
+          imageMigrationProgress.completed += 1;
+          updateImageMigrationProgress();
+          return replacement;
+        });
+        const failed = uploads.find(result => result?.status === "rejected");
+        if (failed) throw failed.reason;
+
+        const latest = findCampaign(campaignId);
+        if (!latest) throw new Error("Campanha nao encontrada ao confirmar a migracao.");
+        const expectedCampaign = cloneCampaignForSave(latest);
+        const expectedReferences = collectLegacyImageReferences(expectedCampaign);
+        const expectedSources = new Set(expectedReferences.map(reference => reference.source));
+        const replacements = [...replacementBySource.values()].filter(replacement => expectedSources.has(replacement.source));
+        const expectedCount = expectedReferences.length;
+        imageMigrationProgress.phase = `Confirmando ${expectedCampaign.name || "campanha"} no Firebase...`;
+        updateImageMigrationProgress();
+
+        if (usingFirebase()) {
+          if (typeof window.CDIFirebase.migrateCampaignImages !== "function") {
+            throw new Error("O servico de migracao segura ainda nao esta disponivel.");
+          }
+          const migrationResult = await window.CDIFirebase.migrateCampaignImages(campaignId, replacements, {
+            expectedCampaign,
+            expectedCount
+          });
+          if (migrationResult?.verified !== true || Number(migrationResult.count) !== expectedCount) {
+            throw new Error(`O Firebase confirmou ${Number(migrationResult?.count || 0)} de ${expectedCount} referencias.`);
+          }
+        }
+
+        if (usingFirebase()) {
+          let authoritative = await withOperationTimeout(
+            window.CDIFirebase.getCampaign(campaignId),
+            30000,
+            "O Firebase demorou demais para verificar a migracao."
+          );
+          if (!authoritative) throw new Error("O Firebase nao devolveu a campanha para verificacao final.");
+          const latestLocal = findCampaign(campaignId);
+          if (!latestLocal) throw new Error("A campanha local desapareceu durante a verificacao.");
+          let reconciled = mergeLocalChangesOntoRemote(remoteBaseline, latestLocal, authoritative);
+          replaceLegacyImagesLocally(reconciled, replacementBySource);
+          reconciled.imageMigration = {
+            ...(authoritative.imageMigration || {}),
+            provider: "cloudinary",
+            migratedReferences: expectedCount,
+            verified: true
+          };
+          const remainingReconciled = collectLegacyImageReferences(reconciled).length;
+          if (remainingReconciled) {
+            throw new Error(`A reconciliacao encontrou ${remainingReconciled} referencia(s) nova(s) fora do Cloudinary. Execute a migracao novamente.`);
+          }
+          state.campaigns = state.campaigns.map(campaign => String(campaign.id) === campaignId ? normalizeCampaign(reconciled) : campaign);
+          if (String(session.campaign?.id) === campaignId) session.campaign = findCampaign(campaignId);
+          if (!persistLocal()) throw new Error("Nao foi possivel preservar a campanha reconciliada no cache local.");
+
+          if (!sameJsonValue(reconciled, authoritative)) {
+            queueCampaignSave(reconciled, {
+              role: "master",
+              playerId: null,
+              baseCampaign: authoritative
+            });
+            await flushBeforeAtomicCampaignMutation(campaignId);
+            authoritative = await withOperationTimeout(
+              window.CDIFirebase.getCampaign(campaignId),
+              30000,
+              "O Firebase demorou demais para verificar a reconciliacao."
+            );
+            if (!authoritative) throw new Error("O Firebase nao devolveu a campanha depois da reconciliacao.");
+          }
+          const normalizedAuthoritative = normalizeCampaign(authoritative);
+          const remainingRemote = collectLegacyImageReferences(normalizedAuthoritative).length;
+          if (remainingRemote) throw new Error(`O Firebase ainda devolveu ${remainingRemote} referencia(s) fora do Cloudinary.`);
+          state.campaigns = state.campaigns.map(campaign => String(campaign.id) === campaignId ? normalizedAuthoritative : campaign);
+          if (String(session.campaign?.id) === campaignId) session.campaign = normalizedAuthoritative;
+          pendingSave.deferredRemote = null;
+          if (!persistLocal()) throw new Error("Nao foi possivel atualizar o cache local depois da verificacao.");
+        } else {
+          const convertedCampaign = cloneCampaignForSave(expectedCampaign);
+          replaceLegacyImagesLocally(convertedCampaign, replacementBySource);
+          convertedCampaign.imageMigration = {
+            provider: "cloudinary",
+            completedAt: new Date().toISOString(),
+            migratedReferences: expectedCount,
+            verified: true
+          };
+          if (collectLegacyImageReferences(convertedCampaign).length) {
+            throw new Error("A verificacao local ainda encontrou imagens fora do Cloudinary.");
+          }
+          state.campaigns = state.campaigns.map(campaign => String(campaign.id) === campaignId ? convertedCampaign : campaign);
+          if (String(session.campaign?.id) === campaignId) session.campaign = convertedCampaign;
+          if (!persistLocal()) throw new Error("Nao foi possivel preservar a campanha migrada no cache local.");
+        }
+      } finally {
+        releaseSnapshotProtection();
+      }
+    }
+
+    const remaining = legacyImageSummary().references;
+    if (remaining) throw new Error(`A verificacao final encontrou ${remaining} imagem(ns) ainda fora do Cloudinary. Nenhum dado restante foi removido.`);
+    toast("Migracao concluida: todas as imagens agora usam URLs do Cloudinary.");
+  } catch (err) {
+    console.error(err);
+    alert(`A migracao foi interrompida com seguranca. O backup permanece disponivel e nenhum arquivo foi excluido.\n\n${firebaseErrorMessage(err)}`);
+  } finally {
+    imageMigrationInProgress = false;
+    imageMigrationProgress = { total: 0, completed: 0, phase: "" };
+    render();
+  }
+}
+
 function masterSettingsPage() {
+  const legacy = legacyImageSummary();
+  const cloudinaryReady = window.CDIFirebase?.mediaConfigured !== false && Boolean(window.CDI_CLOUDINARY_CONFIG?.cloudName && window.CDI_CLOUDINARY_CONFIG?.uploadPreset);
   return `
     <h2>⚙️ Configurações</h2>
+    ${imageMigrationInProgress ? `
+      <div class="image-migration-lock" role="alert" aria-live="assertive">
+        <div class="image-migration-lock-card">
+          <strong>Migracao segura em andamento</strong>
+          <span id="imageMigrationLockText">${esc(imageMigrationProgress.phase)}</span>
+          <div class="scene-upload-track"><span id="imageMigrationLockBar" style="width:${imageMigrationProgress.total ? Math.round((imageMigrationProgress.completed / imageMigrationProgress.total) * 100) : 0}%"></span></div>
+          <small>Nao feche esta aba. As edicoes ficam pausadas ate a verificacao terminar.</small>
+        </div>
+      </div>` : ""}
+    <div class="card media-migration-card" style="margin-bottom:20px;">
+      <div class="media-migration-heading">
+        <div><h3>☁️ Imagens no Cloudinary</h3><p class="muted">Arquivos originais preservados; o site entrega versões leves sem cortar ou deformar.</p></div>
+        <span class="status-chip ${cloudinaryReady ? "status-online" : "status-offline"}">${cloudinaryReady ? "Configurado" : "Nao configurado"}</span>
+      </div>
+      <div class="media-migration-summary">
+        <div><strong>${legacy.references}</strong><span>referencias fora do Cloudinary</span></div>
+        <div><strong>${legacy.unique}</strong><span>imagens unicas</span></div>
+        <div><strong>${legacy.campaigns}</strong><span>campanhas afetadas</span></div>
+      </div>
+      ${imageMigrationInProgress ? `
+        <div class="media-migration-progress" role="status" aria-live="polite">
+          <strong id="imageMigrationProgressText">${esc(imageMigrationProgress.phase)}</strong>
+          <div class="scene-upload-track"><span id="imageMigrationProgressBar" style="width:${imageMigrationProgress.total ? Math.round((imageMigrationProgress.completed / imageMigrationProgress.total) * 100) : 0}%"></span></div>
+        </div>` : `
+        <p class="muted">A migracao cria um backup antes de substituir referencias. Nenhuma imagem antiga e removida do Cloudinary durante este processo.</p>`}
+      <div class="row-actions">
+        <button class="secondary" onclick="downloadMasterImageBackup()" ${imageMigrationInProgress ? "disabled" : ""}>Baixar backup JSON</button>
+        <input id="imageMigrationBackupFile" type="file" accept="application/json,.json" hidden onchange="verifyMasterImageBackupFile(this.files?.[0])">
+        <button class="secondary" onclick="document.getElementById('imageMigrationBackupFile')?.click()" ${imageMigrationInProgress ? "disabled" : ""}>Verificar backup JSON</button>
+        <button onclick="migrateLegacyImages()" ${!legacy.references || !cloudinaryReady || imageMigrationInProgress ? "disabled" : ""}>Migrar imagens antigas</button>
+      </div>
+    </div>
     <div class="card" style="margin-bottom:20px;">
       <h3>🔑 Alterar Senha</h3>
       <label>Nova Senha</label><input id="newMasterPass" type="password">
@@ -1642,12 +2908,18 @@ async function createCampaign() {
 
   if (usingFirebase()) {
     try {
-      await window.CDIFirebase.saveCampaign(c);
+      queueCampaignSave(c, {
+        role: "master",
+        playerId: null,
+        baseCampaign: null,
+        isCreation: true
+      });
+      await flushBeforeAtomicCampaignMutation(c.id);
       lastSavedCampaignJson = JSON.stringify(c);
     } catch (err) {
-      state.campaigns = state.campaigns.filter(x => x.id !== c.id);
-      session.campaign = null;
-      alert(firebaseErrorMessage(err));
+      document.querySelectorAll(".modal").forEach(m => m.remove());
+      render();
+      alert(`${firebaseErrorMessage(err)}\n\nA campanha e suas alteracoes continuam preservadas neste navegador e serao sincronizadas quando a conexao voltar.`);
       return;
     }
   } else {
@@ -1755,43 +3027,129 @@ function characterModal(index = null) {
       </div>
 
       <br><button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
-      <button onclick="saveCharacter(${index})">Salvar</button>
+      <button id="saveCharacterButton" onclick="saveCharacter(${index})">Salvar</button>
     </div></div>`);
 }
 
 async function saveCharacter(index) {
   const isNew = index === null;
-  const c = isNew ? { id: uid(), attrs: {}, res: {}, skills: [], expressions: [], activeExpression: "", inventory: [], appliedOriginLoadouts: [], controllerPlayerId: null } : session.campaign.characters[index];
-  
-  c.name = document.getElementById("cname").value || "Personagem";
-  c.origin = document.getElementById("origin").value;
-  c.healthMax = +document.getElementById("hm").value;
-  c.health = Math.max(0, Math.min(c.healthMax, +document.getElementById("hv").value));
-  c.sanityMax = +document.getElementById("sm").value;
-  c.sanity = Math.max(0, Math.min(c.sanityMax, +document.getElementById("sv").value));
-  c.defense = +document.getElementById("cdef").value || 10;
-  
-  ATTR.forEach(a => c.attrs[a] = +document.getElementById("a_" + a).value);
-  RES.forEach(a => c.res[a] = +document.getElementById("r_" + a).value);
-  
+  const campaignId = String(session.campaign?.id || "");
+  const initial = isNew ? null : session.campaign?.characters?.[index];
+  const characterId = String(initial?.id || uid());
+  const button = document.getElementById("saveCharacterButton");
+  const healthMax = +document.getElementById("hm").value;
+  const sanityMax = +document.getElementById("sm").value;
+  const attrs = {};
+  const res = {};
+  ATTR.forEach(attribute => { attrs[attribute] = +document.getElementById("a_" + attribute).value; });
+  RES.forEach(resistance => { res[resistance] = +document.getElementById("r_" + resistance).value; });
   const checked = Array.from(document.querySelectorAll('.master-sk-check:checked')).map(cb => cb.value);
-  c.skills = checked.map(name => c.skills.find(s => s.name === name) || { name, uses: 2, maxUses: 2, bonus: 0 });
-
-  c.skills.forEach((s, idx) => {
+  const skills = checked.map(name => ({ ...(initial?.skills?.find(skill => skill.name === name) || { name, uses: 2, maxUses: 2, bonus: 0 }) }));
+  skills.forEach((skill, idx) => {
     const maxInput = document.getElementById(`sk_max_${idx}`);
-    if (maxInput) { s.maxUses = parseInt(maxInput.value) || 0; if (s.uses > s.maxUses) s.uses = s.maxUses; }
+    if (maxInput) {
+      skill.maxUses = parseInt(maxInput.value) || 0;
+      if (skill.uses > skill.maxUses) skill.uses = skill.maxUses;
+    }
   });
-
-  const im = await readImg(document.getElementById("photo").files[0]);
-  if (im) c.image = im;
-
   const applyInitialLoadout = isNew && Boolean(document.getElementById("applyOriginKitOnCreate")?.checked);
-  if (isNew) {
-    session.campaign.characters.push(c);
-    if (applyInitialLoadout) tabletop.applyOriginLoadout(session.campaign, c.id, { origin: c.origin }, uid);
+  const changes = {
+    name: document.getElementById("cname").value || "Personagem",
+    origin: document.getElementById("origin").value,
+    healthMax,
+    health: Math.max(0, Math.min(healthMax, +document.getElementById("hv").value)),
+    sanityMax,
+    sanity: Math.max(0, Math.min(sanityMax, +document.getElementById("sv").value)),
+    defense: +document.getElementById("cdef").value || 10,
+    attrs,
+    res,
+    skills
+  };
+
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Salvando...";
   }
-  save(); document.querySelector(".modal").remove(); render();
-  toast(applyInitialLoadout ? "Personagem salvo com o kit inicial." : "Salvo!");
+  try {
+    const file = document.getElementById("photo")?.files?.[0];
+    const image = file ? await readImg(file, 1000, { campaignId, kind: "characters", entityId: characterId }) : "";
+    let campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("A campanha foi atualizada durante o envio. Tente novamente.");
+    let currentCharacter = campaign.characters.find(entry => String(entry.id) === characterId);
+    if (!isNew && !currentCharacter) throw new Error("Personagem nao encontrado.");
+
+    const workingCampaign = cloneCampaignForSave(campaign);
+    let nextCharacter = workingCampaign.characters.find(entry => String(entry.id) === characterId);
+    if (!nextCharacter) {
+      nextCharacter = {
+        id: characterId,
+        attrs: {}, res: {}, skills: [], expressions: [], activeExpression: "", inventory: [],
+        appliedOriginLoadouts: [], controllerPlayerId: null
+      };
+      workingCampaign.characters.push(nextCharacter);
+    }
+    Object.assign(nextCharacter, changes);
+    if (image) applyImageAsset(nextCharacter, image);
+    if (applyInitialLoadout) tabletop.applyOriginLoadout(workingCampaign, nextCharacter.id, { origin: nextCharacter.origin }, uid);
+
+    if (image) {
+      const characterPatch = {
+        id: characterId,
+        ...changes,
+        image: nextCharacter.image,
+        ...(nextCharacter.imageMeta ? { imageMeta: { ...nextCharacter.imageMeta } } : {}),
+        ...(isNew ? {
+          expressions: nextCharacter.expressions || [],
+          activeExpression: nextCharacter.activeExpression || "",
+          inventory: nextCharacter.inventory || [],
+          appliedOriginLoadouts: nextCharacter.appliedOriginLoadouts || [],
+          controllerPlayerId: nextCharacter.controllerPlayerId ?? null
+        } : {}),
+        ...(applyInitialLoadout ? {
+          inventory: nextCharacter.inventory || [],
+          appliedOriginLoadouts: nextCharacter.appliedOriginLoadouts || []
+        } : {})
+      };
+      await commitCampaignMediaMutation(campaignId, {
+        basePatch: {},
+        documents: [{
+          collection: "characters",
+          id: characterId,
+          data: {
+            ...characterPatch,
+            _order: isNew ? campaign.characters.length : Math.max(0, campaign.characters.findIndex(entry => String(entry.id) === characterId))
+          }
+        }],
+        cloudinaryUrls: [image]
+      });
+      campaign = findCampaign(campaignId);
+      if (!campaign) throw new Error("Campanha nao encontrada depois da confirmacao da imagem.");
+      currentCharacter = campaign.characters.find(entry => String(entry.id) === characterId);
+      if (!currentCharacter) {
+        currentCharacter = { id: characterId };
+        campaign.characters.push(currentCharacter);
+      }
+      Object.assign(currentCharacter, characterPatch);
+      persistLocal();
+    } else {
+      currentCharacter = currentCharacter || { id: characterId };
+      if (!campaign.characters.includes(currentCharacter)) campaign.characters.push(currentCharacter);
+      Object.assign(currentCharacter, changes);
+      if (applyInitialLoadout) tabletop.applyOriginLoadout(campaign, currentCharacter.id, { origin: currentCharacter.origin }, uid);
+      save();
+    }
+    session.campaign = campaign;
+    document.querySelector(".modal")?.remove();
+    render();
+    toast(applyInitialLoadout ? "Personagem salvo com o kit inicial." : "Salvo!");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+    if (button?.isConnected) {
+      button.disabled = false;
+      button.textContent = "Salvar";
+    }
+  }
 }
 
 function removeSkill(charId, idx) {
@@ -1909,6 +3267,7 @@ function expressionModal(characterId = "") {
 
 async function saveCharacterExpression() {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const characterId = String(document.getElementById("expressionCharacter")?.value || "");
   const title = String(document.getElementById("expressionTitle")?.value || "").trim().slice(0, 60);
   const file = document.getElementById("expressionImage")?.files?.[0];
@@ -1930,14 +3289,17 @@ async function saveCharacterExpression() {
   let previousExpressions = null;
   let previousActiveExpression = "";
   let previousUpdatedAt = null;
+  let releaseSnapshotProtection = null;
   expressionMutations.add(characterId);
 
   try {
-    const image = await readImg(file, 1000);
+    const expressionId = uid();
+    const image = await readImg(file, 1000, { campaignId, kind: "expressions", entityId: expressionId });
     if (!image) throw new Error("Nao foi possivel processar a foto da expressao.");
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
 
-    campaign = session.campaign;
+    campaign = findCampaign(campaignId);
     character = campaign?.characters.find(entry => String(entry.id) === characterId);
     if (!character) throw new Error("Personagem nao encontrado.");
     previousExpressions = [...(character.expressions || [])];
@@ -1945,8 +3307,9 @@ async function saveCharacterExpression() {
     previousUpdatedAt = character.expressionUpdatedAt || null;
 
     const expression = tabletop?.normalizeExpression
-      ? tabletop.normalizeExpression({ id: uid(), title, image, createdAt: new Date().toISOString() }, uid)
-      : { id: uid(), title, image, createdAt: new Date().toISOString() };
+      ? tabletop.normalizeExpression({ id: expressionId, title, image, createdAt: new Date().toISOString() }, uid)
+      : { id: expressionId, title, image, createdAt: new Date().toISOString() };
+    applyImageAsset(expression, image);
     character.expressions = [expression, ...previousExpressions];
     character.activeExpression = expression.id;
     character.expressionUpdatedAt = new Date().toISOString();
@@ -1981,12 +3344,14 @@ async function saveCharacterExpression() {
       button.textContent = "Adicionar e usar";
     }
   } finally {
+    releaseSnapshotProtection?.();
     expressionMutations.delete(characterId);
   }
 }
 
 async function selectCharacterExpression(characterId, expressionId = "") {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const normalizedCharacterId = String(characterId);
   const normalizedExpressionId = String(expressionId || "");
   const initialCharacter = session.campaign.characters.find(entry => String(entry.id) === normalizedCharacterId);
@@ -1998,11 +3363,14 @@ async function selectCharacterExpression(characterId, expressionId = "") {
   let character = null;
   let previousActiveExpression = "";
   let previousUpdatedAt = null;
+  let releaseSnapshotProtection = null;
   expressionMutations.add(normalizedCharacterId);
 
   try {
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
-    campaign = session.campaign;
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+    campaign = findCampaign(campaignId);
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
     character = campaign?.characters.find(entry => String(entry.id) === normalizedCharacterId);
     const freshExpressionExists = !normalizedExpressionId
       || character?.expressions?.some(expression => String(expression.id) === normalizedExpressionId);
@@ -2035,6 +3403,7 @@ async function selectCharacterExpression(characterId, expressionId = "") {
     }
     alert(firebaseErrorMessage(err));
   } finally {
+    releaseSnapshotProtection?.();
     expressionMutations.delete(normalizedCharacterId);
     render();
   }
@@ -2042,6 +3411,7 @@ async function selectCharacterExpression(characterId, expressionId = "") {
 
 async function removeCharacterExpression(characterId, expressionId) {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const normalizedCharacterId = String(characterId);
   const normalizedExpressionId = String(expressionId);
   const initialCharacter = session.campaign.characters.find(entry => String(entry.id) === normalizedCharacterId);
@@ -2054,11 +3424,14 @@ async function removeCharacterExpression(characterId, expressionId) {
   let previousExpressions = null;
   let previousActiveExpression = "";
   let previousUpdatedAt = null;
+  let releaseSnapshotProtection = null;
   expressionMutations.add(normalizedCharacterId);
 
   try {
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
-    campaign = session.campaign;
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+    campaign = findCampaign(campaignId);
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
     character = campaign?.characters.find(entry => String(entry.id) === normalizedCharacterId);
     const expression = character?.expressions?.find(entry => String(entry.id) === normalizedExpressionId);
     if (!character || !expression) throw new Error("Expressao nao encontrada.");
@@ -2093,6 +3466,7 @@ async function removeCharacterExpression(characterId, expressionId) {
     }
     alert(firebaseErrorMessage(err));
   } finally {
+    releaseSnapshotProtection?.();
     expressionMutations.delete(normalizedCharacterId);
     render();
   }
@@ -2108,7 +3482,7 @@ function traumaLoadoutItem(trauma, characterId = "", canRemove = false) {
   const acquiredAt = formatTraumaDate(trauma.acquiredAt);
   const removing = traumaMutations.has(String(characterId));
   const visual = trauma.image
-    ? `<img src="${esc(trauma.image)}" alt="${esc(trauma.title)}" loading="lazy">`
+    ? `<img ${imageSourceAttrs(trauma.image, "thumb")} alt="${esc(trauma.title)}" loading="lazy" decoding="async">`
     : `<span aria-hidden="true">&#9888;</span>`;
   return `
     <article class="trauma-loadout-item" data-trauma-id="${esc(trauma.id)}" title="${esc(trauma.title)}">
@@ -2126,7 +3500,7 @@ function traumaLoadoutItem(trauma, characterId = "", canRemove = false) {
 function traumaLibraryIcon(trauma) {
   const deleting = traumaMutations.has(`catalog:${String(trauma.id)}`);
   const visual = trauma.image
-    ? `<img src="${esc(trauma.image)}" alt="" loading="lazy">`
+    ? `<img ${imageSourceAttrs(trauma.image, "thumb")} alt="" loading="lazy" decoding="async">`
     : `<span aria-hidden="true">&#9888;</span>`;
   return `
     <div class="trauma-library-icon-shell" role="listitem">
@@ -2232,6 +3606,7 @@ function traumaCatalogModal() {
 
 async function saveTraumaCatalogEntry() {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const title = String(document.getElementById("traumaTitle")?.value || "").trim().slice(0, 80);
   const file = document.getElementById("traumaImage")?.files?.[0];
   const button = document.getElementById("saveTraumaCatalogButton");
@@ -2250,20 +3625,24 @@ async function saveTraumaCatalogEntry() {
 
   let campaign = null;
   let previousCatalog = null;
+  let releaseSnapshotProtection = null;
   try {
-    const image = await readImg(file, 480);
+    const traumaId = uid();
+    const image = await readImg(file, 480, { campaignId, kind: "traumas", entityId: traumaId });
     if (!image) throw new Error("Nao foi possivel processar a miniatura do trauma.");
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
 
-    campaign = session.campaign;
+    campaign = findCampaign(campaignId);
     campaign.traumaCatalog ??= [];
     if (campaign.traumaCatalog.some(trauma => String(trauma.title).trim().toLowerCase() === title.toLowerCase())) {
       throw new Error("Ja existe um trauma com este titulo na biblioteca.");
     }
     previousCatalog = [...campaign.traumaCatalog];
     const trauma = tabletop?.normalizeTraumaCatalogEntry
-      ? tabletop.normalizeTraumaCatalogEntry({ id: uid(), title, image, createdAt: new Date().toISOString() }, uid)
-      : { id: uid(), title, image, createdAt: new Date().toISOString() };
+      ? tabletop.normalizeTraumaCatalogEntry({ id: traumaId, title, image, createdAt: new Date().toISOString() }, uid)
+      : { id: traumaId, title, image, createdAt: new Date().toISOString() };
+    applyImageAsset(trauma, image);
     campaign.traumaCatalog = [trauma, ...campaign.traumaCatalog];
     persistLocal();
 
@@ -2286,11 +3665,14 @@ async function saveTraumaCatalogEntry() {
       button.disabled = false;
       button.textContent = "Cadastrar trauma";
     }
+  } finally {
+    releaseSnapshotProtection?.();
   }
 }
 
 async function deleteTraumaCatalogEntry(traumaCatalogId) {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const catalogId = String(traumaCatalogId || "");
   const mutationKey = `catalog:${catalogId}`;
   const initialTrauma = session.campaign.traumaCatalog?.find(entry => String(entry.id) === catalogId);
@@ -2307,11 +3689,14 @@ async function deleteTraumaCatalogEntry(traumaCatalogId) {
   let campaign = null;
   let previousCatalog = null;
   let previousCharacterTraumas = null;
+  let releaseSnapshotProtection = null;
   traumaMutations.add(mutationKey);
   render();
   try {
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
-    campaign = session.campaign;
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+    campaign = findCampaign(campaignId);
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
     const trauma = campaign?.traumaCatalog?.find(entry => String(entry.id) === catalogId);
     if (!trauma) throw new Error("Trauma da biblioteca nao encontrado.");
 
@@ -2354,6 +3739,7 @@ async function deleteTraumaCatalogEntry(traumaCatalogId) {
     }
     alert(firebaseErrorMessage(err));
   } finally {
+    releaseSnapshotProtection?.();
     traumaMutations.delete(mutationKey);
     render();
   }
@@ -2387,7 +3773,7 @@ function traumaAssignmentModal(characterId = "", traumaCatalogId = "") {
       <div class="trauma-picker-grid" role="listbox" aria-label="Traumas da biblioteca">
         ${catalog.map(trauma => `
           <button class="trauma-picker-option ${String(trauma.id) === selectedTraumaId ? "is-selected" : ""}" type="button" data-trauma-catalog-id="${esc(trauma.id)}" role="option" aria-selected="${String(trauma.id) === selectedTraumaId ? "true" : "false"}" onclick="selectTraumaForAssignment(${jsArg(trauma.id)})">
-            ${trauma.image ? `<img src="${esc(trauma.image)}" alt="" loading="lazy">` : `<span aria-hidden="true">&#9888;</span>`}
+            ${trauma.image ? `<img ${imageSourceAttrs(trauma.image, "thumb")} alt="" loading="lazy" decoding="async">` : `<span aria-hidden="true">&#9888;</span>`}
             <strong>${esc(trauma.title)}</strong>
           </button>`).join("")}
       </div>
@@ -2428,6 +3814,7 @@ function updateTraumaAssignmentAvailability() {
 
 async function applyTrauma() {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const characterId = String(document.getElementById("traumaCharacter")?.value || "");
   const traumaCatalogId = String(document.getElementById("traumaCatalogEntry")?.value || "");
   const button = document.getElementById("applyTraumaButton");
@@ -2449,11 +3836,14 @@ async function applyTrauma() {
   let character = null;
   let previousTraumas = null;
   let previousEvent;
+  let releaseSnapshotProtection = null;
   traumaMutations.add(characterId);
   try {
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
 
-    campaign = session.campaign;
+    campaign = findCampaign(campaignId);
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
     character = campaign?.characters.find(entry => String(entry.id) === characterId);
     const catalogTrauma = campaign?.traumaCatalog?.find(entry => String(entry.id) === traumaCatalogId);
     if (!character || !catalogTrauma) throw new Error("Trauma da biblioteca nao encontrado.");
@@ -2523,12 +3913,14 @@ async function applyTrauma() {
       button.textContent = "Vincular trauma";
     }
   } finally {
+    releaseSnapshotProtection?.();
     traumaMutations.delete(characterId);
   }
 }
 
 async function removeCharacterTrauma(characterId, traumaId) {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const normalizedCharacterId = String(characterId);
   const normalizedTraumaId = String(traumaId);
   const initialCharacter = session.campaign.characters.find(entry => String(entry.id) === normalizedCharacterId);
@@ -2539,10 +3931,13 @@ async function removeCharacterTrauma(characterId, traumaId) {
   let campaign = null;
   let character = null;
   let previousTraumas = null;
+  let releaseSnapshotProtection = null;
   traumaMutations.add(normalizedCharacterId);
   try {
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
-    campaign = session.campaign;
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+    campaign = findCampaign(campaignId);
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
     character = campaign?.characters.find(entry => String(entry.id) === normalizedCharacterId);
     const trauma = character?.traumas?.find(entry => String(entry.id) === normalizedTraumaId);
     if (!character || !trauma) throw new Error("Vinculo de trauma nao encontrado.");
@@ -2564,6 +3959,7 @@ async function removeCharacterTrauma(characterId, traumaId) {
     }
     alert(firebaseErrorMessage(err));
   } finally {
+    releaseSnapshotProtection?.();
     traumaMutations.delete(normalizedCharacterId);
     render();
   }
@@ -2749,7 +4145,7 @@ function chatContactVisual(character, extraClass = "") {
   const origin = String(character?.origin || character?.class || "Sem origem").trim() || "Sem origem";
   const image = gameCharacterImage(character);
   if (image) {
-    return `<img class="chat-contact-portrait ${extraClass}" src="${esc(image)}" alt="Retrato de ${esc(origin)}" loading="lazy">`;
+    return `<img class="chat-contact-portrait ${extraClass}" ${imageSourceAttrs(image, "thumb")} alt="Retrato de ${esc(origin)}" loading="lazy" decoding="async">`;
   }
   return `<span class="chat-contact-portrait chat-contact-fallback ${extraClass}" role="img" aria-label="Retrato de ${esc(origin)}">${esc(origin.slice(0, 1).toUpperCase() || "?")}</span>`;
 }
@@ -3189,6 +4585,7 @@ function roomPage() {
   const statusLabels = { online: "Online", away: "Ausente", offline: "Offline" };
   const claimedWithoutCharacter = c.players.filter(player => player.authUid && !player.characterId).length;
   const board = c.gameBoard || {};
+  const previousBoard = c.previousGameBoard || {};
   const boardImage = String(board.image || "");
   const isMaster = session.role === "master";
 
@@ -3202,6 +4599,7 @@ function roomPage() {
         ${isMaster ? `
           <input id="gameBoardFile" class="visually-hidden" type="file" accept="image/*" onchange="uploadGameBoard(this.files)">
           <label class="button-label ${boardUploadInProgress ? "is-disabled" : ""}" for="gameBoardFile">${boardUploadInProgress ? "Enviando..." : "Trocar tabuleiro"}</label>
+          ${previousBoard.image ? `<button class="secondary" onclick="restorePreviousGameBoard()" ${boardUploadInProgress ? "disabled" : ""}>Voltar ao tabuleiro anterior</button>` : ""}
         ` : ""}
         ${isMaster && claimedWithoutCharacter
           ? `<span class="notice-badge">${claimedWithoutCharacter} jogador${claimedWithoutCharacter === 1 ? "" : "es"} sem personagem</span>`
@@ -3213,7 +4611,7 @@ function roomPage() {
       <figure id="gameBoardStage" class="game-board-stage ${boardImage ? "" : "is-empty"}">
         ${boardImage
           ? `<div class="game-board-canvas">
-              <img class="game-board-image" src="${esc(boardImage)}" alt="Tabuleiro compartilhado pelo Mestre" onclick="toggleGameBoardFullscreen()">
+              <img class="game-board-image" ${imageSourceAttrs(boardImage, "board")} alt="Tabuleiro compartilhado pelo Mestre" decoding="async" onclick="toggleGameBoardFullscreen()">
               ${participants.length ? `
                 <section class="game-card-row" aria-label="Status dos personagens">
                   ${participants.map(({ character, presence }) => {
@@ -3255,42 +4653,524 @@ function roomPage() {
 async function uploadGameBoard(fileList) {
   const file = Array.from(fileList || []).find(entry => String(entry.type || "").startsWith("image/"));
   if (!file || boardUploadInProgress || session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
+  if (isUnmanagedImage(session.campaign.gameBoard?.image)) {
+    return alert("Migre o tabuleiro atual para o Cloudinary nas Configuracoes antes de troca-lo. Assim ele podera ser restaurado sem perda.");
+  }
 
   boardUploadInProgress = true;
   render();
   try {
-    const image = await readImg(file, 2400);
+    const image = await readImg(file, 2400, { campaignId, kind: "boards", entityId: `board-${uid()}` });
     if (!image) return alert("Nao foi possivel processar o tabuleiro selecionado.");
-    session.campaign.gameBoard = {
-      image,
-      updatedAt: new Date().toISOString()
-    };
-    save();
+    const gameBoard = { image, updatedAt: new Date().toISOString() };
+    applyImageAsset(gameBoard, image);
+    const previousGameBoard = session.campaign.gameBoard?.image
+      ? JSON.parse(JSON.stringify(session.campaign.gameBoard))
+      : null;
+    await commitCampaignMediaMutation(campaignId, {
+      basePatch: { gameBoard, ...(previousGameBoard ? { previousGameBoard } : {}) },
+      documents: [],
+      cloudinaryUrls: [image, previousGameBoard?.image].filter(Boolean)
+    });
+    const campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("Campanha nao encontrada depois do upload.");
+    campaign.gameBoard = gameBoard;
+    if (previousGameBoard) campaign.previousGameBoard = previousGameBoard;
+    session.campaign = campaign;
+    if (usingFirebase()) persistLocal();
+    else save();
   } catch (err) {
     console.error(err);
-    alert("Nao foi possivel enviar o tabuleiro.");
+    alert(firebaseErrorMessage(err));
   } finally {
     boardUploadInProgress = false;
     render();
   }
 }
 
+async function restorePreviousGameBoard() {
+  if (boardUploadInProgress || session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
+  const currentBoard = session.campaign.gameBoard || {};
+  const previousBoard = session.campaign.previousGameBoard || {};
+  if (!currentBoard.image || !previousBoard.image) return;
+  if (isUnmanagedImage(currentBoard.image) || isUnmanagedImage(previousBoard.image)) {
+    return alert("Migre os tabuleiros antigos para o Cloudinary antes de alternar entre eles.");
+  }
+
+  boardUploadInProgress = true;
+  render();
+  try {
+    const gameBoard = JSON.parse(JSON.stringify(previousBoard));
+    const previousGameBoard = JSON.parse(JSON.stringify(currentBoard));
+    const switchedAt = new Date().toISOString();
+    gameBoard.updatedAt = switchedAt;
+    previousGameBoard.updatedAt = switchedAt;
+    await commitCampaignMediaMutation(campaignId, {
+      basePatch: { gameBoard, previousGameBoard },
+      documents: [],
+      cloudinaryUrls: [gameBoard.image, previousGameBoard.image]
+    });
+    const campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("Campanha nao encontrada depois de restaurar o tabuleiro.");
+    campaign.gameBoard = gameBoard;
+    campaign.previousGameBoard = previousGameBoard;
+    session.campaign = campaign;
+    if (usingFirebase()) persistLocal();
+    else save();
+    toast("Tabuleiro anterior restaurado. O atual ficou disponivel para voltar.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    boardUploadInProgress = false;
+    render();
+  }
+}
+
+function vitalMutationKey(campaignId, characterId, key) {
+  return `${String(campaignId)}:${String(characterId)}:${String(key)}`;
+}
+
+function applyConfirmedCharacterVital(campaignId, characterId, key, value) {
+  const campaign = findCampaign(String(campaignId));
+  const character = campaign?.characters?.find(entry => String(entry.id) === String(characterId));
+  if (!character) return false;
+  character[key] = Number(value);
+  if (String(session.campaign?.id || "") === String(campaignId)) session.campaign = campaign;
+  persistLocal();
+  requestPassiveRender();
+  return true;
+}
+
+function adjustCharacterVitalFromUi(characterId, key, delta) {
+  const campaign = session.campaign;
+  if (!campaign || !["health", "sanity"].includes(key)) return Promise.resolve(null);
+  const normalizedCharacterId = String(characterId || "");
+  const character = campaign.characters.find(entry => String(entry.id) === normalizedCharacterId);
+  if (!character) return Promise.resolve(null);
+  const max = Math.max(1, Number(character[`${key}Max`]) || Number(character[key]) || 1);
+  const current = Math.max(0, Number(character[key]) || 0);
+  const next = Math.max(0, Math.min(max, current + Number(delta || 0)));
+  if (next === current) return Promise.resolve({ characterId: normalizedCharacterId, key, value: current, max });
+
+  character[key] = next;
+  if (!usingFirebase()) {
+    save();
+    render();
+    return Promise.resolve({ characterId: normalizedCharacterId, key, value: next, max });
+  }
+
+  const campaignId = String(campaign.id);
+  const mutationKey = vitalMutationKey(campaignId, normalizedCharacterId, key);
+  let mutation = vitalMutationStates.get(mutationKey);
+  if (!mutation) {
+    mutation = { promise: Promise.resolve(), revision: 0, confirmedValue: current };
+    vitalMutationStates.set(mutationKey, mutation);
+  }
+  const revision = ++mutation.revision;
+  const releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+  persistLocal();
+  render();
+  setSyncStatus("Sincronizando...");
+
+  const operation = mutation.promise
+    .catch(() => null)
+    .then(async () => {
+      await flushBeforeAtomicCampaignMutation(campaignId);
+      if (typeof window.CDIFirebase?.adjustCharacterVital !== "function") {
+        throw new Error("O servico de atualizacao de saude e sanidade ainda nao esta disponivel.");
+      }
+      const result = await window.CDIFirebase.adjustCharacterVital(
+        campaignId,
+        normalizedCharacterId,
+        key,
+        delta
+      );
+      mutation.confirmedValue = Number(result?.value);
+      if (!Number.isFinite(mutation.confirmedValue)) mutation.confirmedValue = next;
+      if (revision === mutation.revision) {
+        applyConfirmedCharacterVital(campaignId, normalizedCharacterId, key, mutation.confirmedValue);
+        setSyncStatus("Online em tempo real");
+      }
+      return result;
+    })
+    .catch(error => {
+      if (revision === mutation.revision) {
+        applyConfirmedCharacterVital(campaignId, normalizedCharacterId, key, mutation.confirmedValue);
+        setSyncStatus("Falha de sincronizacao");
+        toast("Nao foi possivel manter a alteracao no Firebase. O valor confirmado foi restaurado.");
+      }
+      throw error;
+    })
+    .finally(() => {
+      releaseSnapshotProtection();
+      if (revision === mutation.revision) vitalMutationStates.delete(mutationKey);
+    });
+  mutation.promise = operation.catch(() => null);
+  return operation;
+}
+
 function adjustGameCardStat(characterId, key, delta) {
   if (session.role !== "master" || !session.campaign) return;
   if (!["health", "sanity"].includes(key)) return;
-  const character = session.campaign.characters.find(entry => entry.id === String(characterId));
-  if (!character) return;
-  const max = Math.max(1, Number(character[`${key}Max`]) || 1);
-  character[key] = Math.max(0, Math.min(max, (Number(character[key]) || 0) + Number(delta || 0)));
-  save();
-  render();
+  return adjustCharacterVitalFromUi(characterId, key, delta);
+}
+
+function prepareOriginalForFullscreen(stage) {
+  const image = stage?.querySelector?.("img");
+  const original = String(image?.dataset?.originalImage || "");
+  if (!image || !original || image.dataset.standardImage) return;
+  image.dataset.standardImage = image.getAttribute("src") || image.src || "";
+  fullscreenImageErrorHandlers.set(image, image.onerror || null);
+  image.onerror = () => restoreImageAfterFullscreen(stage);
+  image.src = original;
+}
+
+function restoreImageAfterFullscreen(stage) {
+  const image = stage?.querySelector?.("img[data-standard-image]");
+  const standard = String(image?.dataset?.standardImage || "");
+  if (!image || !standard) return;
+  if (fullscreenImageErrorHandlers.has(image)) {
+    image.onerror = fullscreenImageErrorHandlers.get(image);
+    fullscreenImageErrorHandlers.delete(image);
+  }
+  delete image.dataset.standardImage;
+  image.src = standard;
+}
+
+function toggleImageStageFullscreen(stage) {
+  if (!stage) return;
+  const exiting = Boolean(document.fullscreenElement);
+  if (!exiting) prepareOriginalForFullscreen(stage);
+  const action = exiting ? document.exitFullscreen?.() : stage.requestFullscreen?.();
+  if (!action?.catch) {
+    if (exiting) restoreImageAfterFullscreen(stage);
+    return;
+  }
+  action
+    .catch(() => {
+      restoreImageAfterFullscreen(stage);
+      toast("O navegador nao permitiu abrir em tela cheia.");
+    })
+    .finally(() => {
+      if (!document.fullscreenElement) restoreImageAfterFullscreen(stage);
+    });
 }
 
 function toggleGameBoardFullscreen() {
-  const stage = document.getElementById("gameBoardStage");
-  if (!stage) return;
-  const action = document.fullscreenElement ? document.exitFullscreen?.() : stage.requestFullscreen?.();
-  action?.catch?.(() => toast("O navegador nao permitiu abrir em tela cheia."));
+  toggleImageStageFullscreen(document.getElementById("gameBoardStage"));
+}
+
+function openMediaOutboxDb() {
+  return new Promise(resolve => {
+    const indexedDb = window.indexedDB;
+    if (!indexedDb) return resolve(null);
+    let request;
+    let settled = false;
+    const finish = value => {
+      if (settled) {
+        try { value?.close?.(); } catch {}
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve(value);
+    };
+    const timeout = setTimeout(() => finish(null), 5000);
+    try {
+      request = indexedDb.open(MEDIA_OUTBOX_DB_NAME, 3);
+    } catch (err) {
+      console.warn("Nao foi possivel abrir a fila local de midia.", err);
+      finish(null);
+      return;
+    }
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(LEGACY_MEDIA_OUTBOX_STORE)) {
+        db.createObjectStore(LEGACY_MEDIA_OUTBOX_STORE, { keyPath: "campaignId" });
+      }
+      if (!db.objectStoreNames.contains(MEDIA_OUTBOX_STORE)) {
+        db.createObjectStore(MEDIA_OUTBOX_STORE, { keyPath: "key" });
+      }
+      if (!db.objectStoreNames.contains(CAMPAIGN_SAVE_OUTBOX_STORE)) {
+        db.createObjectStore(CAMPAIGN_SAVE_OUTBOX_STORE, { keyPath: "key" });
+      }
+    };
+    request.onsuccess = () => finish(request.result);
+    request.onblocked = () => {
+      console.warn("A fila local de midia esta bloqueada por outra aba.");
+      finish(null);
+    };
+    request.onerror = () => {
+      console.warn("Nao foi possivel abrir a fila local de cenas.", request.error);
+      finish(null);
+    };
+  });
+}
+
+async function writePendingSceneCommit(campaignId, scenes, liveScene = null) {
+  const ownerUid = String(window.CDIFirebase?.currentUser?.uid || firebaseUser?.uid || "local");
+  const record = {
+    key: campaignSaveOutboxKey(ownerUid, campaignId),
+    campaignId: String(campaignId),
+    ownerUid,
+    scenes: JSON.parse(JSON.stringify(scenes || [])),
+    liveScene: liveScene ? JSON.parse(JSON.stringify(liveScene)) : null,
+    createdAt: new Date().toISOString()
+  };
+  const db = await openMediaOutboxDb();
+  if (!db) throw new Error("O navegador nao disponibilizou a fila duravel necessaria para enviar cenas com seguranca.");
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction(MEDIA_OUTBOX_STORE, "readwrite");
+      transaction.objectStore(MEDIA_OUTBOX_STORE).put(record);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error || new Error("A fila local abortou o checkpoint das cenas."));
+    });
+  } finally {
+    db.close();
+  }
+  pendingSceneCommits.set(record.campaignId, record);
+}
+
+async function assertSceneOutboxAvailable() {
+  const db = await openMediaOutboxDb();
+  if (!db) throw new Error("O navegador nao disponibilizou a fila duravel necessaria para enviar cenas com seguranca.");
+  const ownerUid = String(window.CDIFirebase?.currentUser?.uid || firebaseUser?.uid || "local");
+  const probeKey = `__probe__:${ownerUid}:${uid()}`;
+  const transact = operation => new Promise((resolve, reject) => {
+    const transaction = db.transaction(MEDIA_OUTBOX_STORE, "readwrite");
+    operation(transaction.objectStore(MEDIA_OUTBOX_STORE));
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error);
+    transaction.onabort = () => reject(transaction.error || new Error("A fila local abortou o teste de gravacao das cenas."));
+  });
+  try {
+    await transact(store => store.put({
+      key: probeKey,
+      campaignId: "__probe__",
+      ownerUid,
+      scenes: [],
+      liveScene: null,
+      createdAt: new Date().toISOString()
+    }));
+    await transact(store => store.delete(probeKey));
+  } finally {
+    db.close();
+  }
+}
+
+async function readPendingSceneCommit(campaignId) {
+  const normalizedId = String(campaignId || "");
+  if (pendingSceneCommits.has(normalizedId)) return pendingSceneCommits.get(normalizedId);
+  const db = await openMediaOutboxDb();
+  if (!db) return null;
+  let record;
+  const expectedOwner = String(window.CDIFirebase?.currentUser?.uid || firebaseUser?.uid || "local");
+  const readRecord = (storeName, key) => new Promise((resolve, reject) => {
+    const transaction = db.transaction(storeName, "readonly");
+    const request = transaction.objectStore(storeName).get(key);
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+    transaction.onabort = () => reject(transaction.error || new Error("A fila local abortou a leitura das cenas."));
+  });
+  try {
+    record = await readRecord(MEDIA_OUTBOX_STORE, campaignSaveOutboxKey(expectedOwner, normalizedId));
+    if (!record) record = await readRecord(LEGACY_MEDIA_OUTBOX_STORE, normalizedId);
+  } finally {
+    db.close();
+  }
+  if (record && record.ownerUid && String(record.ownerUid) !== expectedOwner) return null;
+  if (record) {
+    if (!Array.isArray(record.scenes) || record.scenes.some(scene => !scene?.id || !isCloudinaryImage(scene.image))) {
+      throw new Error("A fila local de cenas esta corrompida e precisa ser descartada antes de continuar.");
+    }
+    pendingSceneCommits.set(normalizedId, record);
+  }
+  return record;
+}
+
+async function clearPendingSceneCommit(campaignId) {
+  const normalizedId = String(campaignId || "");
+  const db = await openMediaOutboxDb();
+  if (!db) throw new Error("Nao foi possivel confirmar a limpeza da fila local de cenas.");
+  try {
+    await new Promise((resolve, reject) => {
+      const transaction = db.transaction([MEDIA_OUTBOX_STORE, LEGACY_MEDIA_OUTBOX_STORE], "readwrite");
+      const ownerUid = String(window.CDIFirebase?.currentUser?.uid || firebaseUser?.uid || "local");
+      transaction.objectStore(MEDIA_OUTBOX_STORE).delete(campaignSaveOutboxKey(ownerUid, normalizedId));
+      transaction.objectStore(LEGACY_MEDIA_OUTBOX_STORE).delete(normalizedId);
+      transaction.oncomplete = () => resolve();
+      transaction.onerror = () => reject(transaction.error);
+      transaction.onabort = () => reject(transaction.error || new Error("A fila local abortou a limpeza das cenas."));
+    });
+  } finally {
+    db.close();
+  }
+  pendingSceneCommits.delete(normalizedId);
+}
+
+function ensureSceneOutboxLoaded(campaignId) {
+  const normalizedId = String(campaignId || "");
+  if (!normalizedId || pendingSceneCommits.has(normalizedId) || sceneOutboxLoads.has(normalizedId)) return;
+  sceneOutboxLoads.add(normalizedId);
+  setTimeout(async () => {
+    try {
+      const pending = await readPendingSceneCommit(normalizedId);
+      sceneOutboxErrors.delete(normalizedId);
+      if (pending && session.view === "scenes" && String(session.campaign?.id) === normalizedId) render();
+    } catch (err) {
+      console.error(err);
+      sceneOutboxErrors.set(normalizedId, firebaseErrorMessage(err));
+      toast(firebaseErrorMessage(err));
+      if (session.view === "scenes" && String(session.campaign?.id) === normalizedId) render();
+    }
+  }, 0);
+}
+
+function applySceneImageAsset(scene, image) {
+  applyImageAsset(scene, image);
+  const metadata = imageMetadataFor(image);
+  if (!metadata) return scene;
+  scene.imagePublicId = metadata.publicId || undefined;
+  scene.imageAssetId = metadata.assetId || undefined;
+  scene.imageFormat = metadata.format || undefined;
+  scene.imageWidth = metadata.width || undefined;
+  scene.imageHeight = metadata.height || undefined;
+  scene.imageBytes = metadata.bytes || undefined;
+  return scene;
+}
+
+function cloneSceneDeck(scenes) {
+  return JSON.parse(JSON.stringify(scenes || []));
+}
+
+function liveSceneForDeck(campaign, scenes, sceneId, active = true) {
+  const working = { ...campaign, scenes: cloneSceneDeck(scenes), liveScene: { ...(campaign.liveScene || {}) } };
+  if (!active) tabletop.setScenePresentationActive(working, false);
+  else tabletop.publishScene(working, String(sceneId), { active: true });
+  return working.liveScene;
+}
+
+async function commitSceneDeck(campaignId, scenes, options = {}) {
+  const normalizedId = String(campaignId || "");
+  const nextScenes = cloneSceneDeck(scenes);
+  if (nextScenes.length > MAX_ACTIVE_SCENES) {
+    throw new Error(`O roteiro aceita no maximo ${MAX_ACTIVE_SCENES} cenas ativas. Mova cenas para a lixeira antes de adicionar outras.`);
+  }
+  const hasLiveScene = Object.prototype.hasOwnProperty.call(options, "liveScene");
+  if (nextScenes.some(scene => isUnmanagedImage(scene.image)) || (hasLiveScene && isUnmanagedImage(options.liveScene?.image))) {
+    throw new Error("Existem cenas fora do Cloudinary. Migre as imagens nas Configuracoes antes de alterar o roteiro.");
+  }
+
+  const releaseSnapshotProtection = usingFirebase() ? protectCampaignFromSnapshots(normalizedId) : null;
+  try {
+    if (usingFirebase()) {
+      await flushBeforeAtomicCampaignMutation(normalizedId);
+      const result = await window.CDIFirebase.updateCampaignScenes(normalizedId, nextScenes, {
+        ...(hasLiveScene ? { liveScene: options.liveScene } : {})
+      });
+      const current = findCampaign(normalizedId);
+      if (current) {
+        current.scenes = cloneSceneDeck(result?.scenes || nextScenes);
+        if (hasLiveScene) current.liveScene = { ...(result?.liveScene || options.liveScene) };
+        if (String(session.campaign?.id) === normalizedId) session.campaign = current;
+        persistLocal();
+        lastSavedCampaignJson = JSON.stringify(current);
+      }
+      return current;
+    }
+
+    const current = findCampaign(normalizedId);
+    if (!current) throw new Error("Campanha nao encontrada.");
+    current.scenes = nextScenes;
+    if (hasLiveScene) current.liveScene = { ...options.liveScene };
+    if (String(session.campaign?.id) === normalizedId) session.campaign = current;
+    if (!save()) throw new Error("Nao foi possivel confirmar as cenas no armazenamento local.");
+    return current;
+  } finally {
+    releaseSnapshotProtection?.();
+  }
+}
+
+async function commitLiveScene(campaignId, liveScene) {
+  const normalizedId = String(campaignId || "");
+  if (isUnmanagedImage(liveScene?.image)) {
+    throw new Error("Esta cena ainda nao esta no Cloudinary. Migre as imagens nas Configuracoes antes de transmitir.");
+  }
+  const releaseSnapshotProtection = usingFirebase() ? protectCampaignFromSnapshots(normalizedId) : null;
+  try {
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(normalizedId);
+    const committed = usingFirebase()
+      ? await window.CDIFirebase.updateLiveScene(normalizedId, liveScene)
+      : { ...liveScene };
+    const current = findCampaign(normalizedId);
+    if (!current) throw new Error("Campanha nao encontrada.");
+    current.liveScene = { ...committed };
+    if (String(session.campaign?.id) === normalizedId) session.campaign = current;
+    if (usingFirebase()) {
+      persistLocal();
+      lastSavedCampaignJson = JSON.stringify(current);
+    } else {
+      save();
+    }
+    return current.liveScene;
+  } finally {
+    releaseSnapshotProtection?.();
+  }
+}
+
+function updateSceneUploadProgress() {
+  const text = document.getElementById("sceneUploadProgressText");
+  const bar = document.getElementById("sceneUploadProgressBar");
+  const done = sceneUploadProgress.completed + sceneUploadProgress.failed;
+  if (text) text.textContent = sceneUploadProgress.phase || `Enviando ${done} de ${sceneUploadProgress.total}`;
+  if (bar) bar.style.width = `${sceneUploadProgress.total ? Math.round((done / sceneUploadProgress.total) * 100) : 0}%`;
+}
+
+function preloadAdjacentSceneImages(campaign = session.campaign) {
+  if (!campaign?.scenes?.length || session.view !== "scenes" || session.role !== "master") return;
+  const selected = selectedMasterScene(campaign);
+  const index = campaign.scenes.findIndex(scene => scene.id === selected?.id);
+  [campaign.scenes[index - 1], campaign.scenes[index + 1]].filter(Boolean).forEach(scene => {
+    const image = new Image();
+    image.decoding = "async";
+    const delivered = cloudinaryDeliveryUrl(scene.image, "stage");
+    if (delivered !== scene.image) {
+      image.onerror = () => {
+        image.onerror = null;
+        image.src = scene.image;
+      };
+    }
+    image.src = delivered;
+  });
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  async function run() {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      try {
+        results[index] = { status: "fulfilled", value: await worker(items[index], index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
+
+function sceneUploadConcurrency(files) {
+  const largestFile = Math.max(0, ...Array.from(files || [], file => Number(file?.size || 0)));
+  if (largestFile > 16 * 1024 * 1024) return 1;
+  if (largestFile > 8 * 1024 * 1024) return Math.min(2, IMAGE_UPLOAD_CONCURRENCY);
+  return IMAGE_UPLOAD_CONCURRENCY;
 }
 
 function selectedMasterScene(campaign = session.campaign) {
@@ -3305,36 +5185,86 @@ function selectedMasterScene(campaign = session.campaign) {
   return scene;
 }
 
+function sceneTrashSection(campaign, sceneBusy) {
+  const trashedScenes = campaign.sceneTrash || [];
+  if (!trashedScenes.length) return "";
+  return `
+    <details class="scene-trash">
+      <summary>Lixeira privada (${trashedScenes.length})</summary>
+      <p class="muted">Somente o Mestre ve esta area. Restaurar nao envia a imagem novamente e preserva titulo, legenda e notas.</p>
+      <div class="scene-trash-grid">
+        ${trashedScenes.map(scene => `
+          <article class="scene-trash-item">
+            <img ${imageSourceAttrs(scene.image, "thumb")} alt="" loading="lazy" decoding="async" width="164" height="104">
+            <div>
+              <strong>${esc(scene.title || "Cena sem titulo")}</strong>
+              <button class="secondary" onclick="restoreSceneFromTrash(${jsArg(scene.id)})" ${sceneBusy ? "disabled" : ""}>Restaurar</button>
+            </div>
+          </article>`).join("")}
+      </div>
+    </details>`;
+}
+
 function masterScenesPage() {
   const campaign = session.campaign;
   const scenes = campaign.scenes || [];
+  ensureSceneOutboxLoaded(campaign.id);
   const selected = selectedMasterScene(campaign);
   const selectedIndex = selected ? scenes.findIndex(scene => scene.id === selected.id) : -1;
   const isPresenting = Boolean(campaign.liveScene?.active);
+  const pendingCommit = pendingSceneCommits.get(String(campaign.id));
+  const outboxError = sceneOutboxErrors.get(String(campaign.id));
+  const sceneOperationBusy = sceneUploadInProgress || sceneMutationInProgress;
+  const sceneBusy = sceneOperationBusy || Boolean(pendingCommit) || Boolean(outboxError);
+  const legacySceneCount = scenes.filter(scene => isUnmanagedImage(scene.image)).length;
 
   return `
     <div class="page-heading scenes-heading">
       <div>
         <h2>Cenas</h2>
-        <p class="muted">${scenes.length} imagem${scenes.length === 1 ? "" : "s"} no roteiro</p>
+        <p class="muted">${scenes.length} de ${MAX_ACTIVE_SCENES} imagens ativas no roteiro</p>
       </div>
       <div class="scene-heading-actions">
-        <input id="sceneImageFiles" class="visually-hidden" type="file" accept="image/*" multiple onchange="addSceneImages(this.files)">
-        <label class="button-label ${sceneUploadInProgress ? "is-disabled" : ""}" for="sceneImageFiles">${sceneUploadInProgress ? "Enviando..." : "Adicionar imagens"}</label>
+        <input id="sceneImageFiles" class="visually-hidden" type="file" accept="image/*" multiple onchange="addSceneImages(this.files)" ${sceneBusy ? "disabled" : ""}>
+        <label class="button-label ${sceneBusy ? "is-disabled" : ""}" for="sceneImageFiles">${sceneUploadInProgress ? "Enviando..." : "Adicionar imagens"}</label>
       </div>
     </div>
+
+    ${legacySceneCount ? `
+      <div class="scene-notice scene-notice-warning">
+        <div><strong>${legacySceneCount} cena${legacySceneCount === 1 ? " precisa" : "s precisam"} ser migrada${legacySceneCount === 1 ? "" : "s"}</strong><span>As imagens continuam preservadas, mas a transmissao fica bloqueada ate a migracao para o Cloudinary.</span></div>
+        <button class="secondary" onclick="session.view='settings';render()">Abrir migracao</button>
+      </div>` : ""}
+
+    ${sceneUploadInProgress ? `
+      <div class="scene-upload-status" role="status" aria-live="polite">
+        <div class="scene-upload-status-row"><strong id="sceneUploadProgressText">${esc(sceneUploadProgress.phase || `Enviando 0 de ${sceneUploadProgress.total}`)}</strong><span>${sceneUploadProgress.failed ? `${sceneUploadProgress.failed} falha${sceneUploadProgress.failed === 1 ? "" : "s"}` : "Cloudinary"}</span></div>
+        <div class="scene-upload-track"><span id="sceneUploadProgressBar" style="width:${sceneUploadProgress.total ? Math.round(((sceneUploadProgress.completed + sceneUploadProgress.failed) / sceneUploadProgress.total) * 100) : 0}%"></span></div>
+      </div>` : ""}
+
+    ${pendingCommit && !sceneUploadInProgress ? `
+      <div class="scene-notice">
+        <div><strong>${pendingCommit.scenes.length} cena${pendingCommit.scenes.length === 1 ? " pronta" : "s prontas"} para sincronizar</strong><span>Os uploads ja estao no Cloudinary; falta apenas confirmar o roteiro no Firebase.</span></div>
+        <button onclick="retryPendingSceneCommit()" ${sceneOperationBusy ? "disabled" : ""}>Tentar novamente</button>
+      </div>` : ""}
+
+    ${outboxError ? `
+      <div class="scene-notice scene-notice-warning">
+        <div><strong>Fila local de cenas indisponivel</strong><span>${esc(outboxError)}</span></div>
+        <button class="danger" onclick="discardSceneOutbox()" ${sceneOperationBusy ? "disabled" : ""}>Descartar fila corrompida</button>
+      </div>` : ""}
 
     ${selected ? `
       <div class="scene-workspace">
         <section class="scene-presentation-panel">
           <figure id="sceneStage" class="scene-stage">
-            <img src="${esc(selected.image)}" alt="${esc(selected.title)}">
+            <img ${imageSourceAttrs(selected.image, "stage")} alt="${esc(selected.title)}" decoding="async" fetchpriority="high">
           </figure>
           <div class="scene-controls" aria-label="Controles da apresentacao">
-            <button class="icon-button secondary" title="Cena anterior" aria-label="Cena anterior" onclick="stepMasterScene(-1)" ${selectedIndex <= 0 ? "disabled" : ""}>←</button>
+            <button class="icon-button secondary" title="Cena anterior" aria-label="Cena anterior" onclick="stepMasterScene(-1)" ${sceneBusy || selectedIndex <= 0 ? "disabled" : ""}>←</button>
             <span class="scene-counter">${selectedIndex + 1} / ${scenes.length}</span>
-            <button class="icon-button secondary" title="Proxima cena" aria-label="Proxima cena" onclick="stepMasterScene(1)" ${selectedIndex >= scenes.length - 1 ? "disabled" : ""}>→</button>
-            <button onclick="toggleScenePresentation()">${isPresenting ? "Ocultar dos jogadores" : "Iniciar apresentacao"}</button>
+            <button class="icon-button secondary" title="Proxima cena" aria-label="Proxima cena" onclick="stepMasterScene(1)" ${sceneBusy || selectedIndex >= scenes.length - 1 ? "disabled" : ""}>→</button>
+            <button onclick="toggleScenePresentation()" ${sceneBusy || legacySceneCount ? "disabled" : ""}>${isPresenting ? "Ocultar dos jogadores" : "Iniciar apresentacao"}</button>
             <button class="icon-button secondary" title="Tela cheia" aria-label="Tela cheia" onclick="toggleSceneFullscreen()">⛶</button>
             ${isPresenting ? `<span class="status-chip status-online"><span class="presence-dot"></span>Ao vivo</span>` : `<span class="status-chip status-offline">Oculta</span>`}
           </div>
@@ -3344,7 +5274,7 @@ function masterScenesPage() {
             <label>Titulo publico</label><input id="sceneTitle" value="${esc(selected.title)}">
             <label>Legenda publica</label><textarea id="sceneCaption">${esc(selected.caption)}</textarea>
             <label>Notas privadas do Mestre</label><textarea id="sceneMasterNotes">${esc(selected.masterNotes)}</textarea>
-            <div class="row-actions"><button onclick="saveSceneDetails()">Salvar cena</button></div>
+            <div class="row-actions"><button onclick="saveSceneDetails()" ${sceneBusy ? "disabled" : ""}>Salvar cena</button></div>
           </div>
         </section>
 
@@ -3352,16 +5282,16 @@ function masterScenesPage() {
           <div class="scene-deck-heading"><h3>Roteiro</h3><span class="muted">${scenes.length}</span></div>
           <div class="scene-deck-list">
             ${scenes.map((scene, index) => `
-              <article class="scene-deck-item ${scene.id === selected.id ? "is-selected" : ""} ${campaign.liveScene?.active && scene.id === campaign.liveScene.sceneId ? "is-live" : ""}" onclick="selectMasterScene(${jsArg(scene.id)})">
-                <img src="${esc(scene.image)}" alt="">
+              <article class="scene-deck-item ${scene.id === selected.id ? "is-selected" : ""} ${campaign.liveScene?.active && scene.id === campaign.liveScene.sceneId ? "is-live" : ""}" onclick="${sceneBusy ? "" : `selectMasterScene(${jsArg(scene.id)})`}">
+                <img ${imageSourceAttrs(scene.image, "thumb")} alt="" loading="lazy" decoding="async" width="164" height="104">
                 <div class="scene-deck-info">
                   <strong>${esc(scene.title)}</strong>
                   <span>${index + 1} / ${scenes.length}</span>
                 </div>
                 <div class="scene-deck-actions">
-                  <button class="icon-button secondary" title="Mover para cima" aria-label="Mover para cima" onclick="event.stopPropagation();moveScene(${jsArg(scene.id)}, -1)" ${index === 0 ? "disabled" : ""}>↑</button>
-                  <button class="icon-button secondary" title="Mover para baixo" aria-label="Mover para baixo" onclick="event.stopPropagation();moveScene(${jsArg(scene.id)}, 1)" ${index === scenes.length - 1 ? "disabled" : ""}>↓</button>
-                  <button class="icon-button danger" title="Excluir cena" aria-label="Excluir cena" onclick="event.stopPropagation();deleteScene(${jsArg(scene.id)})">×</button>
+                  <button class="icon-button secondary" title="Mover para cima" aria-label="Mover para cima" onclick="event.stopPropagation();moveScene(${jsArg(scene.id)}, -1)" ${sceneBusy || index === 0 ? "disabled" : ""}>↑</button>
+                  <button class="icon-button secondary" title="Mover para baixo" aria-label="Mover para baixo" onclick="event.stopPropagation();moveScene(${jsArg(scene.id)}, 1)" ${sceneBusy || index === scenes.length - 1 ? "disabled" : ""}>↓</button>
+                  <button class="icon-button danger" title="Excluir cena" aria-label="Excluir cena" onclick="event.stopPropagation();deleteScene(${jsArg(scene.id)})" ${sceneBusy ? "disabled" : ""}>×</button>
                 </div>
               </article>`).join("")}
           </div>
@@ -3370,7 +5300,8 @@ function masterScenesPage() {
       <div class="scene-empty-state">
         <h3>Nenhuma cena adicionada</h3>
         <p class="muted">Adicione uma ou mais imagens para montar o roteiro.</p>
-      </div>`}`;
+      </div>`}
+    ${sceneTrashSection(campaign, sceneBusy)}`;
 }
 
 function playerScenesPage() {
@@ -3391,7 +5322,7 @@ function playerScenesPage() {
     </div>
     <section class="player-scene-view">
       <figure id="sceneStage" class="scene-stage player-scene-stage" onclick="toggleSceneFullscreen()">
-        <img src="${esc(live.image)}" alt="Cena apresentada pelo Mestre">
+        <img ${imageSourceAttrs(live.image, "stage")} alt="Cena apresentada pelo Mestre" decoding="async" fetchpriority="high">
       </figure>
       <div class="player-scene-caption player-scene-toolbar">
         <div class="scene-player-actions">
@@ -3404,53 +5335,198 @@ function playerScenesPage() {
 
 async function addSceneImages(fileList) {
   const files = Array.from(fileList || []).filter(file => String(file.type || "").startsWith("image/"));
-  if (!files.length || sceneUploadInProgress) return;
-  const campaign = session.campaign;
+  if (!files.length || sceneUploadInProgress || sceneMutationInProgress || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
+  const remainingSlots = Math.max(0, MAX_ACTIVE_SCENES - (session.campaign.scenes || []).length);
+  if (files.length > remainingSlots) {
+    return alert(`Voce pode adicionar ate ${remainingSlots} cena${remainingSlots === 1 ? "" : "s"} agora. O limite seguro e ${MAX_ACTIVE_SCENES} cenas ativas; mova as demais para a lixeira.`);
+  }
+  if ((session.campaign.scenes || []).some(scene => isUnmanagedImage(scene.image))) {
+    return alert("Migre as cenas antigas para o Cloudinary nas Configuracoes antes de adicionar um novo lote.");
+  }
+  let pendingCommit;
+  try {
+    pendingCommit = await readPendingSceneCommit(campaignId);
+  } catch (err) {
+    sceneOutboxErrors.set(campaignId, firebaseErrorMessage(err));
+    render();
+    return alert(firebaseErrorMessage(err));
+  }
+  if (pendingCommit?.scenes?.length) {
+    if (String(session.campaign?.id) === campaignId) render();
+    return alert("Ja existem cenas enviadas aguardando sincronizacao. Use 'Tentar novamente' antes de adicionar outro lote.");
+  }
+  if (sceneUploadInProgress || sceneMutationInProgress || String(session.campaign?.id) !== campaignId) return;
+  try {
+    await assertSceneOutboxAvailable();
+  } catch (err) {
+    return alert(firebaseErrorMessage(err));
+  }
   sceneUploadInProgress = true;
+  sceneUploadProgress = { total: files.length, completed: 0, failed: 0, phase: `Preparando ${files.length} imagens...` };
   render();
-  let added = 0;
+  const uploadedScenes = new Array(files.length);
+  let outboxWrite = Promise.resolve();
+  let checkpointError = null;
 
   try {
-    for (const file of files) {
-      const image = await readImg(file, 1600);
-      if (!image) continue;
+    const results = await mapWithConcurrency(files, sceneUploadConcurrency(files), async (file, index) => {
+      if (checkpointError) throw checkpointError;
+      const sceneId = uid();
+      sceneUploadProgress.phase = `Enviando ${sceneUploadProgress.completed + sceneUploadProgress.failed + 1} de ${files.length}`;
+      updateSceneUploadProgress();
+      let image;
+      try {
+        image = await readImg(file, 1920, { campaignId, kind: "scenes", entityId: sceneId });
+      } catch (err) {
+        sceneUploadProgress.failed += 1;
+        sceneUploadProgress.phase = `Enviando ${sceneUploadProgress.completed + sceneUploadProgress.failed} de ${files.length}`;
+        updateSceneUploadProgress();
+        throw err;
+      }
       const title = String(file.name || "")
         .replace(/\.[^.]+$/, "")
         .replace(/[_-]+/g, " ")
-        .trim() || `Cena ${campaign.scenes.length + 1}`;
-      const scene = tabletop.normalizeScene({ id: uid(), title, image, caption: "", masterNotes: "" }, uid);
-      campaign.scenes.push(scene);
-      if (!selectedSceneIds.has(campaign.id)) selectedSceneIds.set(campaign.id, scene.id);
-      added += 1;
-    }
-    if (added) {
-      if (campaign.liveScene?.active && campaign.liveScene.sceneId) {
-        tabletop.publishScene(campaign, campaign.liveScene.sceneId, { active: true });
+        .trim() || `Cena ${index + 1}`;
+      const scene = tabletop.normalizeScene({ id: sceneId, title, image, caption: "", masterNotes: "", createdAt: new Date().toISOString() }, uid);
+      applySceneImageAsset(scene, image);
+      uploadedScenes[index] = scene;
+      sceneUploadProgress.completed += 1;
+      sceneUploadProgress.phase = `Enviando ${sceneUploadProgress.completed + sceneUploadProgress.failed} de ${files.length}`;
+      updateSceneUploadProgress();
+      outboxWrite = outboxWrite
+        .then(() => writePendingSceneCommit(campaignId, uploadedScenes.filter(Boolean)));
+      try {
+        await outboxWrite;
+      } catch (err) {
+        checkpointError = err;
+        throw err;
       }
-      save();
-      toast(`${added} cena${added === 1 ? " adicionada" : "s adicionadas"}.`);
-    } else {
-      alert("Nao foi possivel processar as imagens selecionadas.");
+      return scene;
+    });
+    await outboxWrite;
+    if (checkpointError) throw checkpointError;
+    await writePendingSceneCommit(campaignId, uploadedScenes.filter(Boolean));
+
+    const failures = results
+      .map((result, index) => ({ ...result, fileName: files[index]?.name || `arquivo ${index + 1}` }))
+      .filter(result => result?.status === "rejected");
+    sceneUploadProgress.failed = failures.length;
+    const addedScenes = uploadedScenes.filter(Boolean);
+    if (!addedScenes.length) {
+      const detail = failures[0]?.reason?.message || "Nao foi possivel processar as imagens selecionadas.";
+      throw new Error(detail);
     }
+
+    sceneUploadProgress.phase = "Confirmando roteiro no Firebase...";
+    updateSceneUploadProgress();
+    const current = findCampaign(campaignId);
+    if (!current) throw new Error("Campanha nao encontrada depois dos uploads.");
+    const knownIds = new Set((current.scenes || []).map(scene => String(scene.id)));
+    const nextScenes = [...cloneSceneDeck(current.scenes), ...addedScenes.filter(scene => !knownIds.has(String(scene.id)))];
+    const liveScene = current.liveScene?.active
+      ? liveSceneForDeck(current, nextScenes, current.liveScene.sceneId, true)
+      : null;
+    await commitSceneDeck(campaignId, nextScenes, {
+      ...(liveScene ? { liveScene } : {})
+    });
+    await clearPendingSceneCommit(campaignId);
+    if (!selectedSceneIds.has(campaignId) && addedScenes[0]) selectedSceneIds.set(campaignId, addedScenes[0].id);
+
+    toast(`${addedScenes.length} cena${addedScenes.length === 1 ? " adicionada" : "s adicionadas"} e sincronizada${addedScenes.length === 1 ? "" : "s"}.`);
+    if (failures.length) {
+      const failedNames = failures.slice(0, 5).map(result => `${result.fileName}: ${result.reason?.message || "arquivo invalido"}`).join("\n");
+      alert(`${failures.length} imagem${failures.length === 1 ? " nao foi enviada" : "s nao foram enviadas"}. As demais foram preservadas.\n\n${failedNames}`);
+    }
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
   } finally {
     sceneUploadInProgress = false;
+    sceneUploadProgress = { total: 0, completed: 0, failed: 0, phase: "" };
     render();
   }
 }
 
-function selectMasterScene(sceneId) {
+async function retryPendingSceneCommit() {
+  if (!session.campaign || sceneMutationInProgress || sceneUploadInProgress) return;
+  const campaignId = String(session.campaign.id);
+  let pending;
+  try {
+    pending = await readPendingSceneCommit(campaignId);
+  } catch (err) {
+    sceneOutboxErrors.set(campaignId, firebaseErrorMessage(err));
+    render();
+    return alert(firebaseErrorMessage(err));
+  }
+  if (!pending?.scenes?.length) return;
+  sceneMutationInProgress = true;
+  render();
+  try {
+    const current = findCampaign(campaignId);
+    if (!current) throw new Error("Campanha nao encontrada.");
+    const knownIds = new Set((current.scenes || []).map(scene => String(scene.id)));
+    const nextScenes = [...cloneSceneDeck(current.scenes), ...pending.scenes.filter(scene => !knownIds.has(String(scene.id)))];
+    if (nextScenes.length > MAX_ACTIVE_SCENES) {
+      throw new Error(`A fila ultrapassaria o limite de ${MAX_ACTIVE_SCENES} cenas ativas. Mova cenas para a lixeira e tente novamente.`);
+    }
+    const liveScene = current.liveScene?.active
+      ? liveSceneForDeck(current, nextScenes, current.liveScene.sceneId, true)
+      : null;
+    await commitSceneDeck(campaignId, nextScenes, { ...(liveScene ? { liveScene } : {}) });
+    await clearPendingSceneCommit(campaignId);
+    toast("Cenas pendentes sincronizadas.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    sceneMutationInProgress = false;
+    render();
+  }
+}
+
+async function discardSceneOutbox() {
+  if (!session.campaign || sceneMutationInProgress || sceneUploadInProgress) return;
+  const campaignId = String(session.campaign.id);
+  if (!confirm("Descartar somente a fila local corrompida desta campanha? As cenas ja confirmadas no Firebase nao serao removidas.")) return;
+  sceneMutationInProgress = true;
+  render();
+  try {
+    await clearPendingSceneCommit(campaignId);
+    sceneOutboxErrors.delete(campaignId);
+    toast("Fila local de cenas descartada.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    sceneMutationInProgress = false;
+    render();
+  }
+}
+
+async function selectMasterScene(sceneId) {
+  if (sceneMutationInProgress || sceneUploadInProgress) return;
   const campaign = session.campaign;
   const scene = campaign.scenes.find(entry => entry.id === String(sceneId));
   if (!scene) return;
   selectedSceneIds.set(campaign.id, scene.id);
-  if (campaign.liveScene?.active) {
-    tabletop.publishScene(campaign, scene.id, { active: true });
-    save();
-  }
+  if (!campaign.liveScene?.active) return render();
+  sceneMutationInProgress = true;
   render();
+  try {
+    const liveScene = liveSceneForDeck(campaign, campaign.scenes, scene.id, true);
+    await commitLiveScene(campaign.id, liveScene);
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    sceneMutationInProgress = false;
+    render();
+  }
 }
 
-function stepMasterScene(delta) {
+async function stepMasterScene(delta) {
+  if (sceneMutationInProgress || sceneUploadInProgress) return;
   const campaign = session.campaign;
   const selected = selectedMasterScene(campaign);
   if (!selected) return;
@@ -3458,88 +5534,182 @@ function stepMasterScene(delta) {
   const nextIndex = Math.max(0, Math.min(campaign.scenes.length - 1, index + Number(delta || 0)));
   if (nextIndex === index) return;
   const nextScene = campaign.scenes[nextIndex];
-  selectedSceneIds.set(campaign.id, nextScene.id);
-  if (campaign.liveScene?.active) {
-    tabletop.publishScene(campaign, nextScene.id, { active: true });
-    save();
-  }
-  render();
+  await selectMasterScene(nextScene.id);
 }
 
-function toggleScenePresentation() {
+async function toggleScenePresentation() {
+  if (sceneMutationInProgress || sceneUploadInProgress) return;
   const campaign = session.campaign;
-  if (campaign.liveScene?.active) {
-    tabletop.setScenePresentationActive(campaign, false);
-    save();
-    render();
-    toast("Apresentacao ocultada.");
-    return;
-  }
-
   const selected = selectedMasterScene(campaign);
-  if (!selected) return alert("Adicione uma cena antes de iniciar a apresentacao.");
-  tabletop.publishScene(campaign, selected.id, { active: true });
-  save();
+  if (!campaign.liveScene?.active && !selected) return alert("Adicione uma cena antes de iniciar a apresentacao.");
+  if (selected && isUnmanagedImage(selected.image)) return alert("Migre esta cena para o Cloudinary antes de transmitir.");
+  const nextLiveScene = campaign.liveScene?.active
+    ? liveSceneForDeck(campaign, campaign.scenes, null, false)
+    : liveSceneForDeck(campaign, campaign.scenes, selected.id, true);
+  sceneMutationInProgress = true;
   render();
-  toast("Apresentacao iniciada.");
+  try {
+    await commitLiveScene(campaign.id, nextLiveScene);
+    toast(nextLiveScene.active ? "Apresentacao iniciada e sincronizada." : "Apresentacao ocultada.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    sceneMutationInProgress = false;
+    render();
+  }
 }
 
-function saveSceneDetails() {
+async function saveSceneDetails() {
+  if (sceneMutationInProgress || sceneUploadInProgress) return;
   const campaign = session.campaign;
   const sceneId = document.getElementById("sceneEditorId")?.value;
-  const scene = campaign.scenes.find(entry => entry.id === sceneId);
+  const nextScenes = cloneSceneDeck(campaign.scenes);
+  const scene = nextScenes.find(entry => entry.id === sceneId);
   if (!scene) return;
   scene.title = document.getElementById("sceneTitle").value.trim() || "Cena";
   scene.caption = document.getElementById("sceneCaption").value.trim();
   scene.masterNotes = document.getElementById("sceneMasterNotes").value.trim();
-  if (campaign.liveScene?.active && campaign.liveScene.sceneId === scene.id) {
-    tabletop.publishScene(campaign, scene.id, { active: true });
-  }
-  save();
+  const liveScene = campaign.liveScene?.active && campaign.liveScene.sceneId === scene.id
+    ? liveSceneForDeck(campaign, nextScenes, scene.id, true)
+    : null;
+  sceneMutationInProgress = true;
   render();
-  toast("Cena salva.");
+  try {
+    await commitSceneDeck(campaign.id, nextScenes, { ...(liveScene ? { liveScene } : {}) });
+    toast("Cena salva e sincronizada.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    sceneMutationInProgress = false;
+    render();
+  }
 }
 
-function moveScene(sceneId, direction) {
+async function moveScene(sceneId, direction) {
+  if (sceneMutationInProgress || sceneUploadInProgress) return;
   const campaign = session.campaign;
-  const index = campaign.scenes.findIndex(scene => scene.id === String(sceneId));
+  const nextScenes = cloneSceneDeck(campaign.scenes);
+  const index = nextScenes.findIndex(scene => scene.id === String(sceneId));
   const nextIndex = index + Number(direction || 0);
-  if (index < 0 || nextIndex < 0 || nextIndex >= campaign.scenes.length) return;
-  const [scene] = campaign.scenes.splice(index, 1);
-  campaign.scenes.splice(nextIndex, 0, scene);
-  if (campaign.liveScene?.active && campaign.liveScene.sceneId) {
-    tabletop.publishScene(campaign, campaign.liveScene.sceneId, { active: true });
-  }
-  save();
+  if (index < 0 || nextIndex < 0 || nextIndex >= nextScenes.length) return;
+  const [scene] = nextScenes.splice(index, 1);
+  nextScenes.splice(nextIndex, 0, scene);
+  const liveScene = campaign.liveScene?.active
+    ? liveSceneForDeck(campaign, nextScenes, campaign.liveScene.sceneId, true)
+    : null;
+  sceneMutationInProgress = true;
   render();
+  try {
+    await commitSceneDeck(campaign.id, nextScenes, { ...(liveScene ? { liveScene } : {}) });
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    sceneMutationInProgress = false;
+    render();
+  }
 }
 
-function deleteScene(sceneId) {
+async function deleteScene(sceneId) {
+  if (sceneMutationInProgress || sceneUploadInProgress) return;
   const campaign = session.campaign;
-  const index = campaign.scenes.findIndex(scene => scene.id === String(sceneId));
-  if (index < 0 || !confirm("Excluir esta cena do roteiro?")) return;
+  const normalizedSceneId = String(sceneId);
+  const nextScenes = cloneSceneDeck(campaign.scenes);
+  const index = nextScenes.findIndex(scene => scene.id === normalizedSceneId);
+  if (index < 0 || !confirm("Mover esta cena para a lixeira privada? Ela podera ser restaurada sem novo upload.")) return;
+  const removedScene = nextScenes[index];
   const wasLive = campaign.liveScene?.active && campaign.liveScene.sceneId === String(sceneId);
-  campaign.scenes.splice(index, 1);
-  const fallback = campaign.scenes[Math.min(index, campaign.scenes.length - 1)] || null;
-  if (fallback) selectedSceneIds.set(campaign.id, fallback.id);
-  else selectedSceneIds.delete(campaign.id);
-
-  if (!campaign.scenes.length) {
-    tabletop.setScenePresentationActive(campaign, false);
-  } else if (wasLive) {
-    tabletop.publishScene(campaign, fallback.id, { active: true });
-  } else if (campaign.liveScene?.active) {
-    tabletop.publishScene(campaign, campaign.liveScene.sceneId, { active: true });
-  }
-  save();
+  nextScenes.splice(index, 1);
+  const fallback = nextScenes[Math.min(index, nextScenes.length - 1)] || null;
+  sceneMutationInProgress = true;
   render();
+  const releaseSnapshotProtection = usingFirebase() ? protectCampaignFromSnapshots(campaign.id) : null;
+  try {
+    if (usingFirebase()) {
+      await flushBeforeAtomicCampaignMutation(campaign.id);
+      const result = await window.CDIFirebase.trashCampaignScene(campaign.id, normalizedSceneId);
+      const current = findCampaign(campaign.id);
+      if (!current) throw new Error("Campanha nao encontrada depois de mover a cena.");
+      current.scenes = nextScenes;
+      current.sceneTrash = [
+        result?.scene || removedScene,
+        ...(current.sceneTrash || []).filter(scene => String(scene.id) !== normalizedSceneId)
+      ];
+      if (result?.wasLive || wasLive) current.liveScene = { ...(result?.liveScene || liveSceneForDeck(current, nextScenes, null, false)) };
+      session.campaign = current;
+      persistLocal();
+      lastSavedCampaignJson = JSON.stringify(current);
+    } else {
+      campaign.scenes = nextScenes;
+      campaign.sceneTrash = [
+        { ...removedScene, deletedAt: new Date().toISOString(), previousOrder: index },
+        ...(campaign.sceneTrash || []).filter(scene => String(scene.id) !== normalizedSceneId)
+      ];
+      if (wasLive) campaign.liveScene = liveSceneForDeck(campaign, nextScenes, null, false);
+      if (!save()) throw new Error("Nao foi possivel salvar a lixeira local.");
+    }
+    if (fallback) selectedSceneIds.set(campaign.id, fallback.id);
+    else selectedSceneIds.delete(campaign.id);
+    toast("Cena movida para a lixeira privada.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    releaseSnapshotProtection?.();
+    sceneMutationInProgress = false;
+    render();
+  }
+}
+
+async function restoreSceneFromTrash(sceneId) {
+  if (sceneMutationInProgress || sceneUploadInProgress || !session.campaign) return;
+  const campaign = session.campaign;
+  const normalizedSceneId = String(sceneId);
+  const trashedScene = (campaign.sceneTrash || []).find(scene => String(scene.id) === normalizedSceneId);
+  if (!trashedScene) return;
+  if ((campaign.scenes || []).length >= MAX_ACTIVE_SCENES) {
+    return alert(`O roteiro ja possui ${MAX_ACTIVE_SCENES} cenas ativas. Mova uma delas para a lixeira antes de restaurar.`);
+  }
+
+  sceneMutationInProgress = true;
+  render();
+  const releaseSnapshotProtection = usingFirebase() ? protectCampaignFromSnapshots(campaign.id) : null;
+  try {
+    let restoredScene;
+    if (usingFirebase()) {
+      await flushBeforeAtomicCampaignMutation(campaign.id);
+      const result = await window.CDIFirebase.restoreCampaignScene(campaign.id, normalizedSceneId);
+      restoredScene = result?.scene || trashedScene;
+      const current = findCampaign(campaign.id);
+      if (!current) throw new Error("Campanha nao encontrada depois da restauracao.");
+      current.sceneTrash = (current.sceneTrash || []).filter(scene => String(scene.id) !== normalizedSceneId);
+      current.scenes = [...(current.scenes || []).filter(scene => String(scene.id) !== normalizedSceneId), restoredScene];
+      session.campaign = current;
+      persistLocal();
+      lastSavedCampaignJson = JSON.stringify(current);
+    } else {
+      const { deletedAt, deletedBy, previousOrder, ...cleanScene } = trashedScene;
+      restoredScene = cleanScene;
+      campaign.sceneTrash = (campaign.sceneTrash || []).filter(scene => String(scene.id) !== normalizedSceneId);
+      campaign.scenes = [...(campaign.scenes || []), restoredScene];
+      if (!save()) throw new Error("Nao foi possivel restaurar a cena no armazenamento local.");
+    }
+    selectedSceneIds.set(campaign.id, restoredScene.id);
+    toast("Cena restaurada sem novo upload.");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+  } finally {
+    releaseSnapshotProtection?.();
+    sceneMutationInProgress = false;
+    render();
+  }
 }
 
 function toggleSceneFullscreen() {
-  const stage = document.getElementById("sceneStage");
-  if (!stage) return;
-  const action = document.fullscreenElement ? document.exitFullscreen?.() : stage.requestFullscreen?.();
-  action?.catch?.(() => toast("O navegador nao permitiu abrir em tela cheia."));
+  toggleImageStageFullscreen(document.getElementById("sceneStage"));
 }
 
 // --- PAINEL DO JOGADOR ---
@@ -3750,11 +5920,8 @@ function changeSkillUses(charId, idx, delta) {
 }
 
 function changeStatDirect(key, delta) {
-  const ch = session.campaign.characters.find(x => x.id === session.player.characterId);
-  ch[key] = Math.max(0, Math.min(ch[key + "Max"], ch[key] + delta));
-  save();
-  document.getElementById(`val-${key}`).textContent = `${ch[key]}/${ch[key + "Max"]}`;
-  document.getElementById(`bar-${key}`).style.width = `${(ch[key] / ch[key + "Max"]) * 100}%`;
+  if (session.role !== "player" || !session.player?.characterId) return;
+  return adjustCharacterVitalFromUi(session.player.characterId, key, delta);
 }
 
 // --- ITENS, CASOS E EVIDÊNCIAS ---
@@ -3850,6 +6017,8 @@ function itemModal(index = null) {
 async function saveItemModal(index, button) {
   const isNew = index === null;
   const current = isNew ? null : session.campaign.items[index];
+  const campaignId = String(session.campaign.id);
+  const itemId = String(current?.id || uid());
   const name = document.getElementById("itname").value.trim();
   const description = document.getElementById("itdesc").value.trim();
   const imageFile = document.getElementById("itimg").files[0];
@@ -3862,21 +6031,47 @@ async function saveItemModal(index, button) {
     button.textContent = "Salvando...";
   }
   try {
-    const uploadedImage = imageFile ? await readImg(imageFile) : "";
+    const uploadedImage = imageFile ? await readImg(imageFile, 1200, { campaignId, kind: "items", entityId: itemId }) : "";
+    const campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("Campanha nao encontrada depois do upload.");
+    const latest = isNew ? null : campaign.items.find(entry => String(entry.id) === itemId);
+    if (!isNew && !latest) throw new Error("Item nao encontrado depois do upload.");
     const item = {
-      ...(current || {}),
-      id: current?.id || uid(),
+      ...(latest || {}),
+      id: itemId,
       name,
       description,
-      image: uploadedImage || current?.image || "",
-      createdAt: current?.createdAt || new Date().toISOString()
+      image: uploadedImage || latest?.image || current?.image || "",
+      createdAt: latest?.createdAt || current?.createdAt || new Date().toISOString()
     };
+    if (uploadedImage) applyImageAsset(item, uploadedImage);
     delete item.revealed;
     requireCompleteItemPresentation(item);
 
-    if (isNew) session.campaign.items.push(item);
-    else Object.assign(current, item);
-    save();
+    if (usingFirebase()) {
+      if (!isCloudinaryImage(item.image)) throw new Error("Migre a imagem antiga do item para o Cloudinary antes de salva-lo.");
+      await commitCampaignMediaMutation(campaignId, {
+        basePatch: {},
+        documents: [{
+          collection: "items",
+          id: itemId,
+          data: { ...item, _order: isNew ? campaign.items.length : Math.max(0, campaign.items.findIndex(entry => String(entry.id) === itemId)) }
+        }],
+        cloudinaryUrls: [item.image]
+      });
+      const confirmedCampaign = findCampaign(campaignId);
+      if (!confirmedCampaign) throw new Error("Campanha nao encontrada depois da confirmacao do item.");
+      const confirmedItem = confirmedCampaign.items.find(entry => String(entry.id) === itemId);
+      if (confirmedItem) Object.assign(confirmedItem, item);
+      else confirmedCampaign.items.push(item);
+      session.campaign = confirmedCampaign;
+      persistLocal();
+    } else {
+      if (isNew) campaign.items.push(item);
+      else Object.assign(latest, item);
+      session.campaign = campaign;
+      save();
+    }
     (button?.closest(".modal") || document.querySelector(".modal"))?.remove();
     render();
     toast("Item salvo!");
@@ -3986,8 +6181,9 @@ function deliverItemModal(itemIndex) {
     </div></div>`);
 }
 
-async function persistCharacterInventoryNow(characterId, options = {}) {
-  const character = session.campaign?.characters.find(entry => entry.id === characterId);
+async function persistCharacterInventoryNow(campaignId, characterId, options = {}) {
+  const campaign = findCampaign(String(campaignId || ""));
+  const character = campaign?.characters.find(entry => entry.id === characterId);
   if (!character) throw new Error("Personagem nao encontrado.");
   normalizeState();
   persistLocal();
@@ -3996,7 +6192,7 @@ async function persistCharacterInventoryNow(characterId, options = {}) {
   setSyncStatus("Sincronizando inventario...");
   try {
     const result = await window.CDIFirebase.updateCharacterInventory(
-      session.campaign.id,
+      campaign.id,
       character.id,
       character.inventory || [],
       options.includeOriginLoadouts
@@ -4014,20 +6210,32 @@ async function persistCharacterInventoryNow(characterId, options = {}) {
 }
 
 async function commitCharacterInventoryMutation(characterId, mutation, options = {}) {
-  const character = session.campaign?.characters.find(entry => entry.id === characterId);
-  if (!character) throw new Error("Personagem nao encontrado.");
-  if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
-  const previousInventory = JSON.parse(JSON.stringify(character.inventory || []));
-  const previousAppliedOriginLoadouts = [...(character.appliedOriginLoadouts || [])];
+  const campaignId = String(options.campaignId || session.campaign?.id || "");
+  if (!campaignId) throw new Error("Campanha nao encontrada.");
+  const releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+  let character = null;
+  let previousInventory = null;
+  let previousAppliedOriginLoadouts = null;
   try {
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+    const campaign = findCampaign(campaignId);
+    character = campaign?.characters.find(entry => entry.id === characterId);
+    if (!character) throw new Error("Personagem nao encontrado.");
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
+    previousInventory = JSON.parse(JSON.stringify(character.inventory || []));
+    previousAppliedOriginLoadouts = [...(character.appliedOriginLoadouts || [])];
     const result = mutation(character);
-    await persistCharacterInventoryNow(characterId, options);
+    await persistCharacterInventoryNow(campaignId, characterId, options);
     return result;
   } catch (err) {
-    character.inventory = previousInventory;
-    character.appliedOriginLoadouts = previousAppliedOriginLoadouts;
-    persistLocal();
+    if (character && previousInventory && previousAppliedOriginLoadouts) {
+      character.inventory = previousInventory;
+      character.appliedOriginLoadouts = previousAppliedOriginLoadouts;
+      persistLocal();
+    }
     throw err;
+  } finally {
+    releaseSnapshotProtection();
   }
 }
 
@@ -4194,10 +6402,13 @@ async function applyOriginLoadoutToCharacter(characterId) {
 
 async function grantCustomItemToCharacter(characterId, button) {
   if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
+  const campaignId = String(session.campaign?.id || "");
   const name = document.getElementById("inventoryCustomName")?.value.trim();
   const description = document.getElementById("inventoryCustomDescription")?.value.trim();
   const quantity = Number.parseInt(document.getElementById("inventoryCustomQuantity")?.value, 10);
   const imageFile = document.getElementById("inventoryCustomImage")?.files?.[0];
+  const equipped = Boolean(document.getElementById("inventoryCustomEquipped")?.checked);
+  const notes = document.getElementById("inventoryCustomNotes")?.value.trim() || "";
   if (!name) return alert("Informe o nome do item.");
   if (!description) return alert("Informe a descricao do item.");
   if (!Number.isFinite(quantity) || quantity < 1) return alert("Informe uma quantidade valida.");
@@ -4208,19 +6419,22 @@ async function grantCustomItemToCharacter(characterId, button) {
     button.textContent = "Adicionando...";
   }
   try {
-    const image = await readImg(imageFile);
+    const inventoryEntryId = uid();
+    const image = await readImg(imageFile, 1200, { campaignId, kind: "inventory", entityId: inventoryEntryId });
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante o envio.");
     const item = {
       name,
       description,
       image
     };
+    applyImageAsset(item, image);
     requireCompleteItemPresentation(item);
     await commitCharacterInventoryMutation(characterId, () => tabletop.grantItem(session.campaign, characterId, item, {
         quantity,
-        equipped: Boolean(document.getElementById("inventoryCustomEquipped")?.checked),
-        notes: document.getElementById("inventoryCustomNotes")?.value.trim() || "",
+        equipped,
+        notes,
         stack: false
-      }, uid));
+      }, uid), { campaignId });
     reopenInventoryManager(characterId, "Item personalizado adicionado.");
   } catch (err) {
     console.error(err);
@@ -4235,6 +6449,7 @@ async function grantCustomItemToCharacter(characterId, button) {
 
 async function saveInventoryEntry(characterId, inventoryId, button) {
   if (session.role !== "master") return alert("Somente o Mestre pode gerenciar inventarios.");
+  const campaignId = String(session.campaign?.id || "");
   const character = session.campaign.characters.find(entry => entry.id === characterId);
   const item = character?.inventory.find(entry => entry.id === inventoryId);
   if (!item) return alert("Item do inventario nao encontrado.");
@@ -4243,6 +6458,7 @@ async function saveInventoryEntry(characterId, inventoryId, button) {
   const description = document.getElementById(`invDescription_${inventoryId}`)?.value.trim();
   const quantity = Number.parseInt(document.getElementById(`invQty_${inventoryId}`)?.value, 10);
   const imageFile = document.getElementById(`invImage_${inventoryId}`)?.files?.[0];
+  const notes = document.getElementById(`invNotes_${inventoryId}`)?.value.trim() || "";
   if (!name) return alert("Informe o titulo do item.");
   if (!description) return alert("Informe a descricao do item.");
   if (!Number.isFinite(quantity) || quantity < 1) return alert("Informe uma quantidade valida.");
@@ -4253,18 +6469,24 @@ async function saveInventoryEntry(characterId, inventoryId, button) {
     button.textContent = "Salvando...";
   }
   try {
-    const uploadedImage = imageFile ? await readImg(imageFile) : "";
+    const uploadedImage = imageFile ? await readImg(imageFile, 1200, { campaignId, kind: "inventory", entityId: `${inventoryId}-${uid()}` }) : "";
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante o envio.");
+    const latestCampaign = findCampaign(campaignId);
+    const latestCharacter = latestCampaign?.characters.find(entry => String(entry.id) === String(characterId));
+    const latestItem = latestCharacter?.inventory.find(entry => String(entry.id) === String(inventoryId));
+    if (!latestItem) throw new Error("Item do inventario nao encontrado depois do envio.");
     const changes = {
       name,
       description,
-      image: uploadedImage || item.image || "",
+      image: uploadedImage || latestItem.image || "",
       quantity,
-      notes: document.getElementById(`invNotes_${inventoryId}`).value.trim()
+      notes
     };
+    if (uploadedImage) applyImageAsset(changes, uploadedImage);
     requireCompleteItemPresentation(changes);
     await commitCharacterInventoryMutation(characterId, () => (
       tabletop.updateInventoryEntry(session.campaign, characterId, inventoryId, changes)
-    ));
+    ), { campaignId });
     reopenInventoryManager(characterId, "Inventario atualizado.");
   } catch (err) {
     console.error(err);
@@ -4331,21 +6553,60 @@ function recordModal(key, index = null) {
       ${imgInput("ri", "Foto / Documento", x.image)}
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
-      <button onclick="saveRecordModal('${key}', ${index})">Salvar</button>
+      <button id="saveRecordButton" onclick="saveRecordModal('${key}', ${index})">Salvar</button>
     </div></div>`);
 }
 
 async function saveRecordModal(key, index) {
   const isNew = index === null;
-  const x = isNew ? {} : session.campaign[key][index];
-  x.name = document.getElementById("rn").value || "Registro";
-  x.description = document.getElementById("rd").value || "";
-
-  const im = await readImg(document.getElementById("ri").files[0]);
-  if (im) x.image = im;
-
-  if (isNew) session.campaign[key].push(x);
-  save(); document.querySelector(".modal").remove(); render(); toast("Salvo!");
+  const campaignId = String(session.campaign.id);
+  const initial = isNew ? null : session.campaign[key][index];
+  const recordId = String(initial?.id || uid());
+  const name = document.getElementById("rn").value || "Registro";
+  const description = document.getElementById("rd").value || "";
+  const file = document.getElementById("ri")?.files?.[0];
+  const button = document.getElementById("saveRecordButton");
+  if (button) { button.disabled = true; button.textContent = "Salvando..."; }
+  try {
+    const image = file ? await readImg(file, 1600, { campaignId, kind: key, entityId: recordId }) : "";
+    const campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("Campanha nao encontrada depois do upload.");
+    const current = isNew ? null : campaign[key].find(entry => String(entry.id) === recordId);
+    if (!isNew && !current) throw new Error("Registro nao encontrado depois do upload.");
+    const record = { ...(current || {}), id: recordId, name, description, image: image || current?.image || initial?.image || "" };
+    if (image) applyImageAsset(record, image);
+    if (usingFirebase() && record.image) {
+      if (!isCloudinaryImage(record.image)) throw new Error("Migre a imagem antiga do registro para o Cloudinary antes de salva-lo.");
+      await commitCampaignMediaMutation(campaignId, {
+        basePatch: {},
+        documents: [{
+          collection: key,
+          id: recordId,
+          data: { ...record, _order: isNew ? campaign[key].length : Math.max(0, campaign[key].findIndex(entry => String(entry.id) === recordId)) }
+        }],
+        cloudinaryUrls: [record.image]
+      });
+      const confirmedCampaign = findCampaign(campaignId);
+      if (!confirmedCampaign) throw new Error("Campanha nao encontrada depois da confirmacao do registro.");
+      const confirmedRecord = confirmedCampaign[key].find(entry => String(entry.id) === recordId);
+      if (confirmedRecord) Object.assign(confirmedRecord, record);
+      else confirmedCampaign[key].push(record);
+      session.campaign = confirmedCampaign;
+      persistLocal();
+    } else {
+      if (isNew) campaign[key].push(record);
+      else Object.assign(current, record);
+      session.campaign = campaign;
+      save();
+    }
+    document.querySelector(".modal")?.remove();
+    render();
+    toast("Salvo!");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+    if (button?.isConnected) { button.disabled = false; button.textContent = "Salvar"; }
+  }
 }
 
 function creaturesPage() {
@@ -4374,21 +6635,60 @@ function creatureModal(index = null) {
       ${imgInput("crim", "Foto da Criatura", x.image)}
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
-      <button onclick="saveCreatureModal(${index})">Salvar</button>
+      <button id="saveCreatureButton" onclick="saveCreatureModal(${index})">Salvar</button>
     </div></div>`);
 }
 
 async function saveCreatureModal(index) {
   const isNew = index === null;
-  const x = isNew ? {} : session.campaign.creatures[index];
-  x.name = document.getElementById("crname").value || "Criatura";
-  x.appearance = document.getElementById("crapp").value || "";
-
-  const im = await readImg(document.getElementById("crim").files[0]);
-  if (im) x.image = im;
-
-  if (isNew) session.campaign.creatures.push(x);
-  save(); document.querySelector(".modal").remove(); render(); toast("Salvo!");
+  const campaignId = String(session.campaign.id);
+  const initial = isNew ? null : session.campaign.creatures[index];
+  const creatureId = String(initial?.id || uid());
+  const name = document.getElementById("crname").value || "Criatura";
+  const appearance = document.getElementById("crapp").value || "";
+  const file = document.getElementById("crim")?.files?.[0];
+  const button = document.getElementById("saveCreatureButton");
+  if (button) { button.disabled = true; button.textContent = "Salvando..."; }
+  try {
+    const image = file ? await readImg(file, 1600, { campaignId, kind: "creatures", entityId: creatureId }) : "";
+    const campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("Campanha nao encontrada depois do upload.");
+    const current = isNew ? null : campaign.creatures.find(entry => String(entry.id) === creatureId);
+    if (!isNew && !current) throw new Error("Criatura nao encontrada depois do upload.");
+    const creature = { ...(current || {}), id: creatureId, name, appearance, image: image || current?.image || initial?.image || "" };
+    if (image) applyImageAsset(creature, image);
+    if (usingFirebase() && creature.image) {
+      if (!isCloudinaryImage(creature.image)) throw new Error("Migre a imagem antiga da criatura para o Cloudinary antes de salva-la.");
+      await commitCampaignMediaMutation(campaignId, {
+        basePatch: {},
+        documents: [{
+          collection: "creatures",
+          id: creatureId,
+          data: { ...creature, _order: isNew ? campaign.creatures.length : Math.max(0, campaign.creatures.findIndex(entry => String(entry.id) === creatureId)) }
+        }],
+        cloudinaryUrls: [creature.image]
+      });
+      const confirmedCampaign = findCampaign(campaignId);
+      if (!confirmedCampaign) throw new Error("Campanha nao encontrada depois da confirmacao da criatura.");
+      const confirmedCreature = confirmedCampaign.creatures.find(entry => String(entry.id) === creatureId);
+      if (confirmedCreature) Object.assign(confirmedCreature, creature);
+      else confirmedCampaign.creatures.push(creature);
+      session.campaign = confirmedCampaign;
+      persistLocal();
+    } else {
+      if (isNew) campaign.creatures.push(creature);
+      else Object.assign(current, creature);
+      session.campaign = campaign;
+      save();
+    }
+    document.querySelector(".modal")?.remove();
+    render();
+    toast("Salvo!");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+    if (button?.isConnected) { button.disabled = false; button.textContent = "Salvar"; }
+  }
 }
 
 function evidencePage() {
@@ -4463,6 +6763,8 @@ async function saveEvidenceModal(evidenceId = "") {
   const current = normalizedId
     ? session.campaign.evidence.find(entry => String(entry.id) === normalizedId)
     : null;
+  const campaignId = String(session.campaign.id);
+  const targetEvidenceId = String(current?.id || uid());
   const button = document.getElementById("saveEvidenceButton");
   if (!title || !description || (!file && !current?.image)) {
     return alert("Preencha o título, a descrição e a imagem da evidência.");
@@ -4473,38 +6775,90 @@ async function saveEvidenceModal(evidenceId = "") {
     button.textContent = "Salvando...";
   }
   try {
-    const image = file ? await readImg(file) : current.image;
+    const image = file
+      ? await readImg(file, 1600, { campaignId, kind: "evidence", entityId: targetEvidenceId })
+      : current.image;
     if (!image) throw new Error("Não foi possível processar a imagem da evidência.");
-    const evidence = current || {};
-    Object.assign(evidence, tabletop?.normalizeEvidenceCatalogEntry
+    const campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("Campanha nao encontrada depois do upload.");
+    const latest = normalizedId
+      ? campaign.evidence.find(entry => String(entry.id) === normalizedId)
+      : null;
+    if (normalizedId && !latest) throw new Error("Evidencia nao encontrada depois do upload.");
+    const evidence = tabletop?.normalizeEvidenceCatalogEntry
       ? tabletop.normalizeEvidenceCatalogEntry({
-        ...evidence,
-        id: evidence.id || uid(),
+        ...(latest || {}),
+        id: targetEvidenceId,
         title,
         description,
         image,
-        createdAt: evidence.createdAt || new Date().toISOString()
+        createdAt: latest?.createdAt || new Date().toISOString()
       }, uid)
       : {
-        ...evidence,
-        id: evidence.id || uid(),
+        ...(latest || {}),
+        id: targetEvidenceId,
         title,
         name: title,
         description,
         image,
-        createdAt: evidence.createdAt || new Date().toISOString()
-      });
+        createdAt: latest?.createdAt || new Date().toISOString()
+      };
+    if (file) applyImageAsset(evidence, image);
     delete evidence.revealed;
-    if (!current) session.campaign.evidence.unshift(evidence);
-
-    session.campaign.characters.forEach(character => {
-      character.evidence = (character.evidence || []).map(entry => (
+    const characterEvidenceUpdates = campaign.characters.map(character => ({
+      characterId: character.id,
+      evidence: (character.evidence || []).map(entry => (
         String(entry.evidenceId) === String(evidence.id)
-          ? { ...entry, title, name: title, description, image }
+          ? { ...entry, title, name: title, description, image, ...(evidence.imageMeta ? { imageMeta: { ...evidence.imageMeta } } : {}) }
           : entry
-      ));
+      ))
+    })).filter(update => {
+      const character = campaign.characters.find(entry => String(entry.id) === String(update.characterId));
+      return JSON.stringify(character?.evidence || []) !== JSON.stringify(update.evidence);
     });
-    save();
+
+    if (usingFirebase()) {
+      if (!isCloudinaryImage(evidence.image)) throw new Error("Migre a imagem antiga da evidencia para o Cloudinary antes de salva-la.");
+      await commitCampaignMediaMutation(campaignId, {
+        basePatch: {},
+        documents: [
+          {
+            collection: "evidence",
+            id: targetEvidenceId,
+            data: {
+              ...evidence,
+              _order: latest ? Math.max(0, campaign.evidence.findIndex(entry => String(entry.id) === targetEvidenceId)) : -1
+            }
+          },
+          ...characterEvidenceUpdates.map(update => ({
+            collection: "characters",
+            id: update.characterId,
+            data: { evidence: update.evidence }
+          }))
+        ],
+        cloudinaryUrls: [evidence.image]
+      });
+      const confirmedCampaign = findCampaign(campaignId);
+      if (!confirmedCampaign) throw new Error("Campanha nao encontrada depois da confirmacao da evidencia.");
+      const confirmedEvidence = confirmedCampaign.evidence.find(entry => String(entry.id) === targetEvidenceId);
+      if (confirmedEvidence) Object.assign(confirmedEvidence, evidence);
+      else confirmedCampaign.evidence.unshift(evidence);
+      characterEvidenceUpdates.forEach(update => {
+        const character = confirmedCampaign.characters.find(entry => String(entry.id) === String(update.characterId));
+        if (character) character.evidence = update.evidence;
+      });
+      session.campaign = confirmedCampaign;
+      persistLocal();
+    } else {
+      if (latest) Object.assign(latest, evidence);
+      else campaign.evidence.unshift(evidence);
+      characterEvidenceUpdates.forEach(update => {
+        const character = campaign.characters.find(entry => String(entry.id) === String(update.characterId));
+        if (character) character.evidence = update.evidence;
+      });
+      session.campaign = campaign;
+      save();
+    }
     document.getElementById("evidenceModal")?.remove();
     render();
     toast("Evidência salva na biblioteca.");
@@ -4560,6 +6914,7 @@ async function unlinkEvidence(evidenceId) {
 
 async function updateEvidenceOwner(evidenceId, targetCharacterId = null, closeModal = false) {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const normalizedId = String(evidenceId || "");
   if (evidenceMutations.has(normalizedId)) return;
   const button = document.getElementById("saveEvidenceAssignmentButton");
@@ -4570,10 +6925,13 @@ async function updateEvidenceOwner(evidenceId, targetCharacterId = null, closeMo
 
   let campaign = null;
   let previousEvidence = null;
+  let releaseSnapshotProtection = null;
   evidenceMutations.add(normalizedId);
   try {
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
-    campaign = session.campaign;
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+    campaign = findCampaign(campaignId);
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
     previousEvidence = new Map(campaign.characters.map(character => [
       String(character.id),
       JSON.parse(JSON.stringify(character.evidence || []))
@@ -4607,6 +6965,7 @@ async function updateEvidenceOwner(evidenceId, targetCharacterId = null, closeMo
       button.textContent = "Salvar vínculo";
     }
   } finally {
+    releaseSnapshotProtection?.();
     evidenceMutations.delete(normalizedId);
     render();
   }
@@ -4614,6 +6973,7 @@ async function updateEvidenceOwner(evidenceId, targetCharacterId = null, closeMo
 
 async function deleteEvidenceCatalogEntry(evidenceId) {
   if (session.role !== "master" || !session.campaign) return;
+  const campaignId = String(session.campaign.id);
   const normalizedId = String(evidenceId || "");
   const evidence = session.campaign.evidence.find(entry => String(entry.id) === normalizedId);
   if (!evidence || evidenceMutations.has(normalizedId)) return;
@@ -4626,11 +6986,14 @@ async function deleteEvidenceCatalogEntry(evidenceId) {
   let campaign = null;
   let previousCatalog = null;
   let previousEvidence = null;
+  let releaseSnapshotProtection = null;
   evidenceMutations.add(normalizedId);
   render();
   try {
-    if (usingFirebase()) await flushBeforeAtomicCampaignMutation();
-    campaign = session.campaign;
+    releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
+    if (usingFirebase()) await flushBeforeAtomicCampaignMutation(campaignId);
+    campaign = findCampaign(campaignId);
+    if (String(session.campaign?.id || "") !== campaignId) throw new Error("A campanha ativa mudou durante a operacao.");
     previousCatalog = JSON.parse(JSON.stringify(campaign.evidence || []));
     previousEvidence = new Map(campaign.characters.map(character => [
       String(character.id),
@@ -4666,6 +7029,7 @@ async function deleteEvidenceCatalogEntry(evidenceId) {
     }
     alert(firebaseErrorMessage(err));
   } finally {
+    releaseSnapshotProtection?.();
     evidenceMutations.delete(normalizedId);
     render();
   }
@@ -4697,21 +7061,60 @@ function markModal(index = null) {
       ${imgInput("mkimg", "Foto da Marca", x.image)}
       <br><br>
       <button class="secondary" onclick="this.closest('.modal').remove()">Cancelar</button>
-      <button onclick="saveMarkModal(${index})">Salvar</button>
+      <button id="saveMarkButton" onclick="saveMarkModal(${index})">Salvar</button>
     </div></div>`);
 }
 
 async function saveMarkModal(index) {
   const isNew = index === null;
-  const x = isNew ? {} : session.campaign.marks[index];
-  x.name = document.getElementById("mkname").value || "Marca";
-  x.description = document.getElementById("mkdesc").value || "";
-
-  const im = await readImg(document.getElementById("mkimg").files[0]);
-  if (im) x.image = im;
-
-  if (isNew) session.campaign.marks.push(x);
-  save(); document.querySelector(".modal").remove(); render(); toast("Salvo!");
+  const campaignId = String(session.campaign.id);
+  const initial = isNew ? null : session.campaign.marks[index];
+  const markId = String(initial?.id || uid());
+  const name = document.getElementById("mkname").value || "Marca";
+  const description = document.getElementById("mkdesc").value || "";
+  const file = document.getElementById("mkimg")?.files?.[0];
+  const button = document.getElementById("saveMarkButton");
+  if (button) { button.disabled = true; button.textContent = "Salvando..."; }
+  try {
+    const image = file ? await readImg(file, 1200, { campaignId, kind: "marks", entityId: markId }) : "";
+    const campaign = findCampaign(campaignId);
+    if (!campaign) throw new Error("Campanha nao encontrada depois do upload.");
+    const current = isNew ? null : campaign.marks.find(entry => String(entry.id) === markId);
+    if (!isNew && !current) throw new Error("Marca nao encontrada depois do upload.");
+    const mark = { ...(current || {}), id: markId, name, description, image: image || current?.image || initial?.image || "" };
+    if (image) applyImageAsset(mark, image);
+    if (usingFirebase() && mark.image) {
+      if (!isCloudinaryImage(mark.image)) throw new Error("Migre a imagem antiga da marca para o Cloudinary antes de salva-la.");
+      await commitCampaignMediaMutation(campaignId, {
+        basePatch: {},
+        documents: [{
+          collection: "marks",
+          id: markId,
+          data: { ...mark, _order: isNew ? campaign.marks.length : Math.max(0, campaign.marks.findIndex(entry => String(entry.id) === markId)) }
+        }],
+        cloudinaryUrls: [mark.image]
+      });
+      const confirmedCampaign = findCampaign(campaignId);
+      if (!confirmedCampaign) throw new Error("Campanha nao encontrada depois da confirmacao da marca.");
+      const confirmedMark = confirmedCampaign.marks.find(entry => String(entry.id) === markId);
+      if (confirmedMark) Object.assign(confirmedMark, mark);
+      else confirmedCampaign.marks.push(mark);
+      session.campaign = confirmedCampaign;
+      persistLocal();
+    } else {
+      if (isNew) campaign.marks.push(mark);
+      else Object.assign(current, mark);
+      session.campaign = campaign;
+      save();
+    }
+    document.querySelector(".modal")?.remove();
+    render();
+    toast("Salvo!");
+  } catch (err) {
+    console.error(err);
+    alert(firebaseErrorMessage(err));
+    if (button?.isConnected) { button.disabled = false; button.textContent = "Salvar"; }
+  }
 }
 
 function toggleReveal(key, i, val) {
@@ -4828,6 +7231,7 @@ async function saveLinkPlayer(playerIndex, button) {
   const campaignId = session.campaign?.id;
   const linkKey = `${campaignId}:${player?.id || ""}`;
   if (!campaignId || !player || linkingPlayers.has(linkKey)) return;
+  const releaseSnapshotProtection = protectCampaignFromSnapshots(campaignId);
 
   linkingPlayers.add(linkKey);
   if (button) {
@@ -4836,7 +7240,7 @@ async function saveLinkPlayer(playerIndex, button) {
   }
   try {
     if (usingFirebase()) {
-      await flushBeforeAtomicCampaignMutation();
+      await flushBeforeAtomicCampaignMutation(campaignId);
       const result = await window.CDIFirebase.assignPlayerCharacter(campaignId, player.id, chId || null);
       const currentCampaign = findCampaign(campaignId)
         || (session.campaign?.id === campaignId ? session.campaign : null);
@@ -4867,6 +7271,7 @@ async function saveLinkPlayer(playerIndex, button) {
     console.error(err);
     alert(err.message);
   } finally {
+    releaseSnapshotProtection();
     linkingPlayers.delete(linkKey);
     if (button?.isConnected) {
       button.disabled = false;
@@ -4904,7 +7309,7 @@ const INVENTORY_COLUMNS = 6;
 
 function inventorySlotVisual(item) {
   if (item.image) {
-    return `<img class="inventory-slot-image" src="${esc(item.image)}" alt="" loading="lazy">`;
+    return `<img class="inventory-slot-image" ${imageSourceAttrs(item.image, "thumb")} alt="" loading="lazy" decoding="async">`;
   }
   const initial = String(item.name || "?").trim().slice(0, 1).toUpperCase() || "?";
   return `<span class="inventory-slot-fallback" aria-hidden="true">${esc(initial)}</span>`;
@@ -5203,6 +7608,10 @@ function rollAttribute(name, mod) { return rollDice(20, mod, `Atributo: ${name}`
 function rollSkill(name, mod) { return rollDice(20, mod, `Habilidade: ${name}`); }
 
 normalizeState();
+document.addEventListener("fullscreenchange", () => {
+  if (document.fullscreenElement) return;
+  document.querySelectorAll("#sceneStage, #gameBoardStage").forEach(restoreImageAfterFullscreen);
+});
 if (window.CDIFirebase) initFirebaseBridge();
 render();
             
